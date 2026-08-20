@@ -47,6 +47,7 @@ jobs:
           tests.test_release_identity
           tests.test_sqlite_checkpoint
           tests.test_failure_domain
+          tests.test_failure_domain_cli
           tests.test_vm_boundary
           tests.test_recovery_bundle
           tests.test_deployment_controller

@@ -7,6 +7,7 @@ import re
 import shutil
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from quant_hub.app import create_app
 from quant_hub.generic_research import (
@@ -290,15 +291,33 @@ class GenericCitationInteractionTests(SettingsTestCase):
             snapshot,
             {_sha256_bytes(source): source},
         )
-        app = create_app(
-            self.settings,
-            {
-                "TESTING": True,
-                "SECRET_KEY": "generic-citation-test-only",
-                "TRUSTED_ORIGINS": ("http://localhost",),
-                "GENERIC_RESEARCH_CATALOG": catalog,
-            },
-        )
+        # The public checkout deliberately excludes the private, generated
+        # legacy presentation bundle.  This test only exercises the isolated
+        # generic namespace, so inject empty legacy projections instead of
+        # accidentally making CI depend on ignored business content.
+        with (
+            patch(
+                "quant_hub.archive.catalog.ArchivePresentation.default",
+                return_value=Mock(research={}),
+            ),
+            patch(
+                "quant_hub.archive.catalog.ArchiveChapterManifests.default",
+                return_value=Mock(),
+            ),
+            patch(
+                "quant_hub.archive.catalog.ArchiveCatalog.archive_link_index",
+                return_value={},
+            ),
+        ):
+            app = create_app(
+                self.settings,
+                {
+                    "TESTING": True,
+                    "SECRET_KEY": "generic-citation-test-only",
+                    "TRUSTED_ORIGINS": ("http://localhost",),
+                    "GENERIC_RESEARCH_CATALOG": catalog,
+                },
+            )
         response = app.test_client().get(f"/knowledge/research/{document_id}/")
         self.assertEqual(200, response.status_code)
         html = response.get_data(as_text=True)
