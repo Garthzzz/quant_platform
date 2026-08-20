@@ -10,6 +10,7 @@ from quant_hub.ops.release_identity import (
     lint_state_only_transition,
     manifest_sha256,
     validate_receipt,
+    validate_checkpoint_manifest,
     validate_release_manifest,
 )
 
@@ -262,6 +263,22 @@ class ReleaseIdentityContractTests(unittest.TestCase):
 
     def test_release_allows_compatibility_schema_without_dynamic_checkpoint(self) -> None:
         validate_release_manifest(self.r1)
+
+    def test_checkpoint_allows_real_table_named_receipt_without_identity_edge(self) -> None:
+        value = deepcopy(self.c0)
+        value["state"]["databases"] = [
+            {
+                "logical_name": "workspace",
+                "relative_path": "state/workspace.sqlite3",
+                "logical_counts": {"command_receipt": 5},
+            }
+        ]
+        validate_checkpoint_manifest(value)
+
+        back_reference = deepcopy(value)
+        back_reference["state"]["recovery_manifest_sha256"] = H["state"]
+        with self.assertRaisesRegex(IdentityContractError, "forbidden back-reference"):
+            validate_checkpoint_manifest(back_reference)
 
     def test_activation_append_requires_real_post_switch_active_and_all_gates(self) -> None:
         with self.assertRaisesRegex(IdentityContractError, "observed post-switch"):

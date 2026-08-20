@@ -397,10 +397,24 @@ def validate_checkpoint_manifest(value: object) -> Mapping[str, object]:
     )
     for path, key, _ in _walk(checkpoint):
         normalized = key.casefold().replace("-", "_")
+        # ``logical_counts`` is a data map keyed by real SQLite table names,
+        # not a manifest schema namespace.  A legitimate table such as
+        # ``command_receipt`` cannot create an identity edge because its value
+        # is only a non-negative row count.  Contract-owned keys remain strict.
+        user_table_count_key = (
+            len(path) == 5
+            and path[0] == "state"
+            and path[1] == "databases"
+            and path[2].isdigit()
+            and path[3] == "logical_counts"
+        )
         if (
-            "recovery_manifest" in normalized
-            or normalized.endswith("_receipt")
-            or normalized in _RECEIPT_AUTHORITY_KEYS
+            not user_table_count_key
+            and (
+                "recovery_manifest" in normalized
+                or normalized.endswith("_receipt")
+                or normalized in _RECEIPT_AUTHORITY_KEYS
+            )
         ):
             raise IdentityContractError(
                 f"checkpoint_manifest contains forbidden back-reference at {'.'.join(path)}"
