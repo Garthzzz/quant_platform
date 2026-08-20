@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title }} · Paper Lab{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('paper_lab_web.static', filename='paper_lab.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="paper-lab-page" data-paper-lab-detail data-paper-id="{{ paper.paper_id }}" data-csrf-token="{{ csrf_token }}">
+  <a href="/paper-lab/">← 返回 Paper Lab</a>
+  <header class="paper-lab-header">
+    <div><p class="eyebrow">PAPER {{ paper.legacy_id or 'NEW' }}</p><h1>{{ paper.title }}</h1></div>
+    <a class="button-link" href="/api/v1/paper-lab/versions/{{ paper.paper_version_id }}/content" target="_blank" rel="noopener">打开本地 PDF</a>
+  </header>
+  <dl class="paper-meta-grid">
+    <div><dt>生命周期</dt><dd>{{ paper.lifecycle_status }}</dd></div>
+    <div><dt>精读审核</dt><dd>{{ paper.reading_status or '尚未建立' }}</dd></div>
+    <div><dt>模型</dt><dd>{{ paper.model_type or '—' }}</dd></div>
+    <div><dt>市场</dt><dd>{{ paper.asset_market or '—' }}</dd></div>
+    <div><dt>评级</dt><dd>{{ paper.rating or '—' }}</dd></div>
+  </dl>
+  {% if paper.reading_status == 'awaiting_review' %}<p class="boundary-note">以下内容为旧系统迁移记录，尚未通过新平台独立审核，不等同于已发布研究结论。</p>{% endif %}
+  <section><h2>核心结论</h2>{% if paper.presentation_html.main_findings %}<div class="preserve-lines paper-research-text">{{ paper.presentation_html.main_findings|safe }}</div>{% else %}<p class="preserve-lines">历史记录未提供。</p>{% endif %}</section>
+  {% set method_field = 'method_model' if paper.method_model else 'summary' %}
+  <section><h2>方法与架构</h2>{% if paper.presentation_html[method_field] %}<div class="preserve-lines paper-research-text">{{ paper.presentation_html[method_field]|safe }}</div>{% else %}<p class="preserve-lines">历史记录未提供。</p>{% endif %}</section>
+  <section><h2>迁移异常与待核验项</h2>
+    {% if paper.quarantine %}<ul>{% for item in paper.quarantine %}<li><code>{{ item.issue_code }}</code> · {{ item.severity }}</li>{% endfor %}</ul>{% else %}<p>无迁移异常。</p>{% endif %}
+  </section>
+  <section><h2>精读笔记版本</h2><ul>{% for note in paper.notes %}<li><a href="/api/v1/paper-lab/notes/{{ note.note_id }}/content">{{ note.template_status }}{% if note.is_canonical %} · canonical{% endif %}</a></li>{% endfor %}</ul></section>
+  <details class="paper-field-editor">
+    <summary>研究员字段修订（版本化覆盖层）</summary>
+    <h2 class="visually-hidden">研究员字段修订</h2>
+    <p>修订只写入独立、不可变的覆盖版本，不修改迁移原文、PDF 或历史 JSON。并发版本不一致时系统会拒绝覆盖。</p>
+    <label class="paper-editor-actor">修订者<input id="paper-editor-actor" name="actor_display_name" value="本地研究员" maxlength="160" autocomplete="name"></label>
+    <p id="paper-editor-status" role="status" aria-live="polite"></p>
+    <div class="paper-edit-grid">
+      {% for field in editable_fields %}
+      <section class="paper-edit-field" data-paper-edit-field="{{ field.name }}" data-version="{{ field.version }}">
+        <div><h3>{{ field.label }}</h3><small><code>{{ field.name }}</code> · overlay v{{ field.version }}</small></div>
+        <textarea name="{{ field.name }}" rows="3" maxlength="100000" autocomplete="off" aria-label="{{ field.label }}">{{ field.value or '' }}</textarea>
+        <label>修订说明<input class="paper-edit-reason" name="reason_{{ field.name }}" maxlength="2000" autocomplete="off" placeholder="可选：为何修订…"></label>
+        <button type="button" class="paper-edit-save">保存新版本</button>
+      </section>
+      {% endfor %}
+    </div>
+  </details>
+</main>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('paper_lab_web.static', filename='paper_lab.js') }}" defer></script>{% endblock %}

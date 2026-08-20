@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Archive Evidence · 论文证据库{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('evidence.static', filename='evidence.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell evidence-shell">
+  <section class="evidence-hero" aria-labelledby="evidence-title">
+    <div>
+      <p class="eyebrow">Archive Evidence</p>
+      <h1 id="evidence-title">论文证据库</h1>
+      <p>集中阅读 Archive 量化研究引用的论文原文、中文译文、核心结论及其在研究中的具体应用。</p>
+    </div>
+  </section>
+
+  <section class="evidence-coverage" aria-labelledby="evidence-coverage-title">
+    <div class="evidence-section-heading">
+      <div><p class="eyebrow">Library</p><h2 id="evidence-coverage-title">研究资料概览</h2></div>
+    </div>
+    <dl class="evidence-coverage-grid evidence-coverage-grid--researcher">
+      <div><dt>收录论文</dt><dd>{{ coverage.canonical_papers }}</dd><small>与 Archive 研究脉络联动</small></div>
+      <div><dt>可直接阅读 PDF</dt><dd>{{ coverage.papers_with_user_facing_local_pdfs }}</dd><small>点击论文页右上角即可打开</small></div>
+      <div><dt>研究引用位置</dt><dd>{{ coverage.resolved_citations }}</dd><small>可回到量化研究正文</small></div>
+      <div><dt>方法来源论文</dt><dd>{{ coverage.associated_method_origins }}</dd><small>覆盖模型、损失、优化与诊断方法</small></div>
+    </dl>
+  </section>
+
+  <form class="evidence-filter evidence-filter--researcher" method="get" action="/evidence/" role="search">
+    <label>
+      <span>检索题名或作者</span>
+      <input name="q" type="search" value="{{ query }}" maxlength="300" autocomplete="off" placeholder="例如：time series、normalization、backtesting…">
+    </label>
+    <button type="submit">检索</button>
+  </form>
+
+  <p class="evidence-result-count" aria-live="polite">显示 {{ papers|length }} 篇论文</p>
+  <section class="evidence-paper-grid" aria-label="论文列表">
+    {% for paper in papers %}
+    <article class="evidence-paper-card" data-dossier-complete="{{ 'true' if paper.dossier_coverage.complete else 'false' }}">
+      <div class="evidence-card-meta">
+        {% if paper.publication_date %}<time datetime="{{ paper.publication_date }}">{{ paper.publication_date }}</time>{% endif %}
+      </div>
+      <h2><a href="{{ paper.detail_url }}">{{ paper.title }}</a></h2>
+      {% if paper.authors %}
+      <p class="evidence-authors">{% for author in paper.authors %}{{ author.name }}{% if not loop.last %}、{% endif %}{% endfor %}</p>
+      {% else %}<p class="evidence-muted">作者信息暂缺。</p>{% endif %}
+      <div class="evidence-card-availability" aria-label="可阅读内容">
+        {% if paper.dossier_coverage.local_original %}<span>本地 PDF</span>{% endif %}
+        {% if paper.dossier_coverage.archive_relations %}<span>Archive 研究应用</span>{% endif %}
+      </div>
+      <div class="evidence-card-footer">
+        <a href="{{ paper.detail_url }}">阅读论文解读</a>
+      </div>
+    </article>
+    {% else %}
+    <div class="empty-state"><h2>没有匹配论文</h2><p>请调整检索关键词。</p></div>
+    {% endfor %}
+  </section>
+</main>
+{% endblock %}

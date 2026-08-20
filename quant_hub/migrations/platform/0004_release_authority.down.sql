@@ -1,0 +1,14 @@
+DELETE FROM outbox_event WHERE event_type = 'PlatformReleaseSnapshotIssued';
+DROP TRIGGER IF EXISTS release_snapshot_no_delete;
+DROP TRIGGER IF EXISTS release_snapshot_no_update;
+DROP TRIGGER IF EXISTS release_snapshot_validate_insert;
+DROP TABLE IF EXISTS release_snapshot;
+DROP TRIGGER IF EXISTS release_decision_no_delete;
+DROP TRIGGER IF EXISTS release_decision_no_update;
+DROP TRIGGER IF EXISTS release_decision_validate_insert;
+DROP TABLE IF EXISTS release_decision;
+DROP TRIGGER IF EXISTS release_candidate_no_delete;
+DROP TRIGGER IF EXISTS release_candidate_status_transition;
+DROP TRIGGER IF EXISTS release_candidate_material_immutable;
+DROP TRIGGER IF EXISTS release_candidate_insert_staging;
+DROP TABLE IF EXISTS release_candidate;

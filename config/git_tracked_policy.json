@@ -1,0 +1,66 @@
+{
+  "schema_version": "qrh.git-boundary/v1",
+  "tracked_exact": [
+    ".gitattributes",
+    ".gitignore",
+    "AGENTS.md",
+    "quant_hub/.gitignore",
+    "quant_hub/README.md",
+    "quant_hub/pyproject.toml",
+    "openspec/config.yaml",
+    "project_state/architecture/quant_platform_VM知识MCP总体设计_20260820.md"
+  ],
+  "tracked_prefixes": [
+    ".agents/",
+    ".codex/",
+    ".github/",
+    "config/",
+    "openspec/changes/design-vm-knowledge-mcp/",
+    "quant_hub/migrations/",
+    "quant_hub/paper_lab/pipeline/",
+    "quant_hub/paper_lab/tools/",
+    "quant_hub/src/",
+    "quant_hub/tests/",
+    "quant_hub/tools/",
+    "skills/",
+    "tools/",
+    "审核代理/"
+  ],
+  "excluded_prefixes": [
+    ".codegraph/",
+    ".pytest_cache/",
+    ".v9t-failed-attempt1/",
+    ".v9w-failed-attempt1/",
+    "deploy/",
+    "incoming/",
+    "objects/",
+    "project_state/",
+    "quant_hub/build/",
+    "quant_hub/data/",
+    "quant_hub/fixtures/",
+    "quant_hub/paper_lab/papers/",
+    "quant_hub/src/quant_hub/presentation/chapter_manifests/",
+    "quant_hub/src/quant_hub/presentation/supplements/",
+    "quant_hub/var/",
+    "recovery/",
+    "reference/",
+    "releases/",
+    "stage_evidence/",
+    "state/",
+    "研究修订工作区/"
+  ],
+  "excluded_exact": [
+    "Quant_Platform_整改建议.md",
+    "quant_hub/src/quant_hub/presentation/archive_presentation.json",
+    "quant_hub/src/quant_hub/presentation/citation_projection_overrides.json",
+    "quant_hub/src/quant_hub/presentation/evidence_zh_overlays.json",
+    "quant_hub/src/quant_hub/presentation/research_supplements.json"
+  ],
+  "allowed_extensions": [
+    "", ".bat", ".cfg", ".css", ".html", ".ini", ".js", ".json",
+    ".jsonl", ".md", ".ps1", ".py", ".sql", ".toml", ".tsv",
+    ".txt", ".yaml", ".yml"
+  ],
+  "large_file_block_bytes": 5242880
+}
+

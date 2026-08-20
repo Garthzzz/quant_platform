@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% macro actor_picker(prefix) -%}
+<fieldset class="actor-picker">
+  <legend>编辑者</legend>
+  <label for="{{ prefix }}-actor-zhang"><input id="{{ prefix }}-actor-zhang" name="actor_kind" type="radio" value="zhang_zhengze" checked> 张正泽</label>
+  <label for="{{ prefix }}-actor-song"><input id="{{ prefix }}-actor-song" name="actor_kind" type="radio" value="song_dingkun"> 宋定坤</label>
+  <label for="{{ prefix }}-actor-other"><input id="{{ prefix }}-actor-other" name="actor_kind" type="radio" value="other"> 其他</label>
+  <label class="other-name is-hidden" for="{{ prefix }}-actor-name">其他编辑者姓名
+    <input id="{{ prefix }}-actor-name" name="display_name" type="text" maxlength="80" autocomplete="name">
+  </label>
+</fieldset>
+{%- endmacro %}
+
+{% block title %}研究更新历史 · Quant Research Hub{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell research-updates-page">
+  <header class="research-updates-header">
+    <p class="eyebrow">Research release history</p>
+    <h1>研究更新历史</h1>
+    <p>这里按发布时间倒序记录每一次新的研究内容发布。发布事实由系统自动生成；研究员可以补充一条简短说明，帮助团队快速理解本次更新。</p>
+    <a href="{{ url_for('web.home_page') }}">返回研究首页</a>
+  </header>
+
+  <ol class="research-update-list research-update-list--full">
+    {% for update in updates %}
+    <li class="research-update-card research-update-card--full" data-research-update data-update-id="{{ update.update_id }}" data-update-revision="{{ update.annotation_revision }}">
+      <article>
+        <div class="research-update-card__meta">
+          <time datetime="{{ update.activated_at }}" data-local-datetime>{{ update.activated_at }}</time>
+          <span>第 {{ update.release_revision }} 次发布{% if update.release_key %} · {{ update.release_key }}{% endif %}</span>
+        </div>
+        <h2><a href="{{ update.page_url }}">{{ update.title }}</a></h2>
+        {% if update.annotation %}
+        <div class="research-update-note">
+          <strong>{{ update.annotation.actor.display_name }}</strong>
+          {% if update.annotation.note %}<p>{{ update.annotation.note }}</p>{% else %}<p>已确认本次更新。</p>{% endif %}
+          <time datetime="{{ update.annotation.occurred_at }}" data-local-datetime>{{ update.annotation.occurred_at }}</time>
+        </div>
+        {% endif %}
+        <details class="research-update-maintenance">
+          <summary>{% if update.annotation %}修订更新说明{% else %}补充更新说明{% endif %}</summary>
+          <form class="research-update-form" data-research-update-annotation>
+            <label for="update-{{ loop.index }}-note">更新了什么（选填，最多 500 字）</label>
+            <textarea id="update-{{ loop.index }}-note" name="note" rows="3" maxlength="500" autocomplete="off">{{ update.annotation.note if update.annotation and update.annotation.note else '' }}</textarea>
+            {{ actor_picker('update-' ~ loop.index) }}
+            <button type="submit">保存更新记录</button>
+            <p class="form-status" role="status" aria-live="polite"></p>
+          </form>
+        </details>
+      </article>
+    </li>
+    {% else %}
+    <li class="empty-state">尚无研究更新记录。首次激活研究 release 后会自动出现在这里。</li>
+    {% endfor %}
+  </ol>
+</main>
+{% endblock %}

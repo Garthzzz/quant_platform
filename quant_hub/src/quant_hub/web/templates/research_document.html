@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% macro toc_nodes(nodes, depth=1) -%}
+<ol>
+  {% for node in nodes %}
+  <li class="toc-entry toc-entry--{{ node.numbering_mode }}" data-toc-entry data-toc-depth="{{ depth }}"><a href="#{{ node.anchor_id }}">{{ node.title_text }}</a>{% if node.children %}{{ toc_nodes(node.children, depth + 1) }}{% endif %}</li>
+  {% endfor %}
+</ol>
+{%- endmacro %}
+{% block title %}{% if document.chapter %}{{ document.chapter.display_title }} · {% endif %}{{ document.display_title }} · {{ research.display_title }}{% endblock %}
+{% block body %}
+<main id="main-content" class="research-shell research-document-shell">
+  <header class="research-header document-page-header">
+    <nav class="breadcrumb" aria-label="面包屑">
+      <a href="{{ url_for('web.home_page') }}">研究首页</a>
+      <span aria-hidden="true">/</span>
+      <a href="{{ url_for('web.research_page', research_id=research.research_id) }}">{{ research.display_title }}</a>
+    </nav>
+    <p class="eyebrow">{% if document.is_supplement %}实证结果{% elif document.chapter %}研究章节{% else %}独立子专题{% endif %}</p>
+    <h1>{% if document.chapter %}{{ document.chapter.display_title }}{% else %}{{ document.display_title }}{% endif %}</h1>
+    {% if document.chapter %}<p class="document-context-title">{{ document.display_title }}</p>{% endif %}
+    <p class="boundary-note">{% if document.is_supplement %}本页是对内部实验报告与原始结果的研究整理；实验源文件保持只读，结论、复算结果与证据边界集中呈现于独立展示层。{% elif document.chapter %}本页只加载当前语义章节；章节顺序、公式、引用和来源位置均回到同一份不可变原文。{% else %}本页只呈现这一份 Markdown。专业标题、目录和解释性展示属于阅读层；原文、哈希与证据定位保持不变。{% endif %}</p>
+  </header>
+
+  <div class="reading-layout reading-layout--document">
+    <aside class="toc-panel document-toc-panel">
+      <nav aria-label="专题文档与当前子专题详细目录">
+        <a class="topic-back-link" href="{{ url_for('web.research_page', research_id=research.research_id) }}">← 返回专题综览</a>
+        {% if document.toc %}
+        <section class="current-document-toc" aria-labelledby="current-chapter-toc-title">
+          <h2 id="current-chapter-toc-title">当前章节目录</h2>
+          <div class="toc-tools" data-toc-tools>
+            <label for="toc-filter">筛选本页目录</label>
+            <input id="toc-filter" type="search" autocomplete="off" placeholder="输入章节关键词…" data-toc-filter aria-controls="document-toc-tree">
+            <div class="toc-tools__actions" role="group" aria-label="目录层级">
+              <button type="button" data-toc-level="2" aria-pressed="false">仅看主要章节</button>
+              <button type="button" data-toc-level="all" aria-pressed="true">展开全部</button>
+            </div>
+          </div>
+          <div id="document-toc-tree" class="document-toc-tree" data-document-toc>{{ toc_nodes(document.toc) }}</div>
+          <p class="toc-empty" data-toc-empty hidden>没有匹配的章节。</p>
+        </section>
+        {% endif %}
+        <h2>专题文档</h2>
+        {% for group in research.document_groups %}
+        <section class="topic-document-group{% if group.key == 'research-process' %} topic-document-group--secondary{% endif %}">
+          <h3>{{ group.title }}</h3>
+          <ol class="topic-document-list">
+            {% for item in group.documents %}
+            <li class="topic-document-item{% if item.document_id == document.document_id %} is-current{% endif %}">
+              <a href="{{ item.page_url }}"{% if item.document_id == document.document_id %} aria-current="page"{% endif %}>{{ item.display_title }}</a>
+              {% if item.document_id == document.document_id %}
+              {% if item.chapter_groups %}
+              <div class="current-document-chapters" aria-label="{{ document.display_title }}章节目录">
+                {% for chapter_group in item.chapter_groups %}
+                <section class="chapter-navigation-group">
+                  <h4>{{ chapter_group.title }}</h4>
+                  <ol>
+                    {% for chapter_item in chapter_group.chapters %}
+                    <li{% if document.chapter and chapter_item.chapter_revision_id == document.chapter.chapter_revision_id %} class="is-current"{% endif %}>
+                      <a href="{{ chapter_item.page_url }}"{% if document.chapter and chapter_item.chapter_revision_id == document.chapter.chapter_revision_id %} aria-current="page"{% endif %}>{{ chapter_item.display_title }}</a>
+                    </li>
+                    {% endfor %}
+                  </ol>
+                </section>
+                {% endfor %}
+              </div>
+              {% endif %}
+              {% endif %}
+            </li>
+            {% endfor %}
+          </ol>
+        </section>
+        {% endfor %}
+      </nav>
+    </aside>
+
+    <div class="reading-column">
+      <article class="research-document" id="document-{{ document.document_id }}">
+        <header class="document-header">
+          <div>
+            <p class="eyebrow">{% if document.is_supplement %}实验研究整理{% else %}来源完整性{% endif %}</p>
+            <h2>{% if document.chapter %}{{ document.chapter.display_title }}{% else %}{{ document.display_title }}{% endif %}</h2>
+          </div>
+          <a href="{{ document.source_url }}" download>{% if document.is_supplement %}下载研究整理稿{% else %}下载原始 Markdown{% endif %}</a>
+        </header>
+        {% if document.citation_projection_error %}
+        <p class="integrity-warning" role="alert">{{ document.citation_projection_error }}</p>
+        {% elif document.unprojected_citation_count %}
+        <p class="integrity-note">另有 {{ document.unprojected_citation_count }} 条证据线索因重叠或位于代码、图表等非唯一交互位置，保留在证据账本中而未插入正文。</p>
+        {% endif %}
+        <div class="research-body">{{ document.rendered_html }}</div>
+      </article>
+
+      <nav class="document-pager" aria-label="{% if document.chapter %}相邻章节{% else %}相邻子专题{% endif %}">
+        {% if document.chapter %}
+        {% if document.chapter.previous_chapter %}
+        <a rel="prev" href="{{ document.chapter.previous_chapter.page_url }}"><span>上一章</span>{{ document.chapter.previous_chapter.display_title }}</a>
+        {% else %}<span></span>{% endif %}
+        {% if document.chapter.next_chapter %}
+        <a rel="next" href="{{ document.chapter.next_chapter.page_url }}"><span>下一章</span>{{ document.chapter.next_chapter.display_title }}</a>
+        {% endif %}
+        {% else %}
+        {% if document.previous_document %}
+        <a rel="prev" href="{{ document.previous_document.page_url }}"><span>上一篇</span>{{ document.previous_document.display_title }}</a>
+        {% else %}<span></span>{% endif %}
+        {% if document.next_document %}
+        <a rel="next" href="{{ document.next_document.page_url }}"><span>下一篇</span>{{ document.next_document.display_title }}</a>
+        {% endif %}
+        {% endif %}
+      </nav>
+    </div>
+  </div>
+
+  <dialog id="citation-dialog" class="citation-dialog" data-citation-dialog data-endpoint-prefix="/api/v1/evidence/citations/" aria-labelledby="citation-dialog-title">
+    <div class="citation-dialog__surface">
+      <header class="citation-dialog__header">
+        <div><p class="eyebrow">来源追踪</p><h2 id="citation-dialog-title">引用证据</h2></div>
+        <button type="button" class="citation-dialog__close" data-citation-close aria-label="关闭引用证据">关闭</button>
+      </header>
+      <div class="citation-dialog__status" data-citation-status role="status" aria-live="polite"></div>
+      <div class="citation-dialog__content" data-citation-content hidden>
+        <div class="citation-state-row"><span class="citation-state" data-citation-resolution></span><code data-citation-id></code></div>
+        <dl class="citation-context">
+          <div><dt>原文线索</dt><dd data-citation-marker></dd></div>
+          <div><dt>正文位置</dt><dd data-citation-location></dd></div>
+          <div><dt>上下文</dt><dd data-citation-context></dd></div>
+        </dl>
+        <section aria-labelledby="citation-entries-title">
+          <h3 id="citation-entries-title">绑定与核验状态</h3>
+          <ol class="citation-entry-list" data-citation-entries></ol>
+        </section>
+      </div>
+    </div>
+  </dialog>
+</main>
+{% endblock %}

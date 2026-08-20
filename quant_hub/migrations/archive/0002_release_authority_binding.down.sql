@@ -1,0 +1,8 @@
+DROP TRIGGER IF EXISTS research_release_authority_consumption_no_delete;
+DROP TRIGGER IF EXISTS research_release_authority_consumption_no_update;
+DROP INDEX IF EXISTS research_release_authority_candidate_idx;
+DROP TABLE IF EXISTS research_release_authority_consumption;
+DROP TRIGGER IF EXISTS research_release_candidate_identity_no_delete;
+DROP TRIGGER IF EXISTS research_release_candidate_identity_no_update;
+DROP TRIGGER IF EXISTS research_release_candidate_identity_validate_insert;
+DROP TABLE IF EXISTS research_release_candidate_identity;

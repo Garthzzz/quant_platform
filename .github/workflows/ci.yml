@@ -1,0 +1,50 @@
+name: exact-sha-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quant-platform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  public-source-gate:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: quant_hub/pyproject.toml
+      - name: Install runtime and test dependencies
+        shell: pwsh
+        run: python -m pip install --disable-pip-version-check -e ./quant_hub pytest
+      - name: Verify public Git boundary
+        shell: pwsh
+        run: python -B tools/release/git_guard.py gate --scope tracked
+      - name: Run public-safe unit tests
+        shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}\quant_hub;${{ github.workspace }}\quant_hub\src
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: >-
+          python -B -m unittest
+          tests.test_git_guard
+          tests.test_ids_config
+          tests.test_migrations
+          tests.test_objects
+          tests.test_comment_store
+          tests.test_web_security
+          -v
+      - name: Validate OpenSpec
+        shell: pwsh
+        run: |
+          npm install --global @fission-ai/openspec@latest
+          openspec validate design-vm-knowledge-mcp --strict --no-interactive
+          openspec validate --all --strict --no-interactive

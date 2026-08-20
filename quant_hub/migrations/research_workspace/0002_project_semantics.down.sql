@@ -1,0 +1,4 @@
+ALTER TABLE research_workspace_node DROP COLUMN research_content_override;
+ALTER TABLE research_workspace_node DROP COLUMN default_research_content;
+ALTER TABLE research_workspace_node DROP COLUMN research_question_override;
+ALTER TABLE research_workspace_node DROP COLUMN default_research_question;

@@ -1,0 +1,9 @@
+{
+  "schema_version": "qrh-local-viewer-reviewed-runtime/v1",
+  "delivery_var": "quant_hub/var/delivery-final-reviewed-v6-20260730-v37",
+  "startup_gate": "project_state/gates/manual_project_creation_20260730/startup_gate.json",
+  "activation_seal_sha256": "8654e188be763a3b00fbe93bef81e920270bdbb1685d663eec83c44f64fe9e0a",
+  "startup_gate_sha256": "08340e2de50d50150d2148676c5574bec3ab3998ddcd4c0dfe67ab35b9009694",
+  "host": "localhost",
+  "port": 8765
+}

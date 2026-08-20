@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}Paper Lab · Quant Research Hub{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('paper_lab_web.static', filename='paper_lab.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="paper-lab-page paper-library" data-paper-lab-index data-csrf-token="{{ csrf_token }}">
+  <header class="paper-lab-header">
+    <div>
+      <p class="eyebrow">PAPER LAB</p>
+      <h1>量化论文研究库</h1>
+      <p>集中检索论文、比较研究设计并核对精读材料；历史字段与当前工作流状态分别保留。</p>
+    </div>
+    <a class="button-link" href="/paper-lab/designer">架构设计器</a>
+  </header>
+
+  <section class="paper-library-toolbar" aria-label="论文检索与视图">
+    <form class="paper-lab-search" role="search" method="get" action="/paper-lab/">
+      <label class="visually-hidden" for="paper-lab-query">检索全部论文字段</label>
+      <input id="paper-lab-query" name="q" type="search" autocomplete="off" placeholder="检索标题、模型、结论、机构等全部字段…">
+      <button type="submit" class="primary-action">检索</button>
+      <button type="button" id="paper-lab-advanced-toggle" aria-expanded="false" aria-controls="paper-lab-advanced">高级筛选</button>
+      <button type="button" id="paper-lab-curated-toggle" class="curated-toggle" aria-pressed="true">显示全量</button>
+    </form>
+    <div class="paper-view-tabs" role="tablist" aria-label="论文库视图">
+      <button type="button" id="paper-tab-list" role="tab" aria-selected="true" aria-controls="paper-view-list" data-paper-view="list">列表</button>
+      <button type="button" id="paper-tab-stats" role="tab" aria-selected="false" aria-controls="paper-view-stats" data-paper-view="stats">统计</button>
+      <button type="button" id="paper-tab-compare" role="tab" aria-selected="false" aria-controls="paper-view-compare" data-paper-view="compare">对比</button>
+    </div>
+  </section>
+
+  <form id="paper-lab-advanced" class="paper-advanced-panel" hidden>
+    <label>模型类型包含<input id="paper-adv-model" name="model_type" autocomplete="off"></label>
+    <label>特殊技术包含<input id="paper-adv-tech" name="special_tech" autocomplete="off"></label>
+    <label>资产市场包含<input id="paper-adv-market" name="asset_market" autocomplete="off"></label>
+    <label>任意字段包含<input id="paper-adv-any" name="any_field" autocomplete="off"></label>
+    <label>推荐评级<select id="paper-adv-rating" name="rating"><option value="">全部评级</option></select></label>
+    <label>来源类型<select id="paper-adv-source" name="source_type"><option value="">全部来源</option><option>学术论文</option><option>卖方研报</option></select></label>
+    <label>输入数据包含<input id="paper-adv-data-input" name="data_input" autocomplete="off"></label>
+    <label>预处理包含<input id="paper-adv-data-preprocess" name="data_preprocess" autocomplete="off"></label>
+    <label>模型架构包含<input id="paper-adv-method-model" name="method_model" autocomplete="off"></label>
+    <label>损失函数包含<input id="paper-adv-loss" name="loss_function" autocomplete="off"></label>
+    <label>跨方法字段检索<input id="paper-adv-method-any" name="method_any" autocomplete="off"></label>
+    <div class="paper-advanced-actions">
+      <button type="submit" class="primary-action">应用筛选</button>
+      <button type="reset">重置</button>
+    </div>
+  </form>
+
+  <details class="paper-column-settings" open>
+    <summary>显示字段</summary>
+    <div id="paper-column-groups" class="paper-column-groups"></div>
+  </details>
+
+  <div id="paper-active-filters" class="paper-active-filters" aria-label="当前筛选" hidden></div>
+  <p id="paper-lab-summary" role="status" aria-live="polite">正在读取论文库…</p>
+
+  <section id="paper-view-list" role="tabpanel" aria-labelledby="paper-tab-list">
+    <div class="table-scroll paper-table-region" tabindex="0" role="region" aria-label="论文结果，可横向滚动">
+      <table class="paper-lab-table" id="paper-lab-table">
+        <thead><tr>
+          <th class="paper-check-column"><label class="visually-hidden" for="paper-check-all">选择当前结果</label><input type="checkbox" id="paper-check-all"></th>
+          <th data-colkey="id" data-sort="id">编号</th>
+          <th data-colkey="title" data-sort="title">论文标题</th>
+          <th data-colkey="model_type" data-sort="model_type" data-filter="hierarchy">模型类型</th>
+          <th data-colkey="asset_market" data-sort="asset_market" data-filter="hierarchy">资产市场</th>
+          <th data-colkey="rating" data-sort="rating" data-filter="exact">推荐评级</th>
+          <th data-colkey="source_type" data-sort="source_type" data-filter="exact">来源类型</th>
+          <th data-colkey="start_year" data-sort="start_year">开始年份</th>
+          <th data-colkey="research_topic" data-sort="research_topic" data-filter="exact">研究主题</th>
+          <th data-colkey="status" data-sort="status" data-filter="exact">状态</th>
+          <th data-colkey="institution" data-sort="institution" data-filter="exact">机构</th>
+          <th data-colkey="data_input" data-sort="data_input" data-filter="pipeline">输入数据</th>
+          <th data-colkey="data_preprocess" data-sort="data_preprocess" data-filter="pipeline">预处理</th>
+          <th data-colkey="method_model" data-sort="method_model" data-filter="pipeline">模型架构</th>
+          <th data-colkey="method_special" data-sort="method_special" data-filter="pipeline">特殊方法</th>
+          <th data-colkey="loss_function" data-sort="loss_function" data-filter="pipeline">损失函数</th>
+          <th data-colkey="training_config" data-sort="training_config" data-filter="pipeline">训练配置</th>
+          <th data-colkey="pipeline_output" data-sort="pipeline_output" data-filter="pipeline">输出层</th>
+          <th data-colkey="link">链接</th>
+          <th data-colkey="authors" data-sort="authors">作者</th>
+          <th data-colkey="venue" data-sort="venue">发表渠道</th>
+          <th data-colkey="end_year" data-sort="end_year">结束年份</th>
+          <th data-colkey="study_period" data-sort="study_period">研究时间</th>
+          <th data-colkey="sample_length" data-sort="sample_length">样本长度</th>
+          <th data-colkey="prediction_target" data-sort="prediction_target">预测目标</th>
+          <th data-colkey="input_features" data-sort="input_features">输入特征</th>
+          <th data-colkey="feature_count" data-sort="feature_count">特征数量</th>
+          <th data-colkey="oos_method" data-sort="oos_method">样本外测试</th>
+          <th data-colkey="metrics" data-sort="metrics">评估指标</th>
+          <th data-colkey="performance" data-sort="performance">核心结果</th>
+          <th data-colkey="special_tech" data-sort="special_tech">特殊技术</th>
+          <th data-colkey="main_findings" data-sort="main_findings">主要结论</th>
+          <th data-colkey="innovations_insights" data-sort="innovations_insights">创新与启发</th>
+          <th data-colkey="caveats_replication" data-sort="caveats_replication">质疑与复现</th>
+          <th data-colkey="summary" data-sort="summary">结构化摘要</th>
+          <th data-colkey="diagram" data-sort="diagram">架构图</th>
+          <th data-colkey="phase" data-sort="phase">阶段</th>
+          <th data-colkey="updated_at" data-sort="updated_at">更新时间</th>
+        </tr></thead>
+        <tbody id="paper-lab-rows"></tbody>
+      </table>
+    </div>
+    <footer class="paper-table-footer">
+      <div><span id="paper-selected-count">已选择 0 篇</span><button type="button" id="paper-compare-selected">对比所选</button><button type="button" id="paper-export-selected">导出所选 CSV</button></div>
+      <button type="button" id="paper-export-filtered">导出当前结果 CSV</button>
+    </footer>
+  </section>
+
+  <section id="paper-view-stats" role="tabpanel" aria-labelledby="paper-tab-stats" hidden>
+    <div id="paper-stats" class="paper-stats-grid"></div>
+  </section>
+
+  <section id="paper-view-compare" role="tabpanel" aria-labelledby="paper-tab-compare" hidden>
+    <div class="paper-compare-controls">
+      <label>论文 1<select id="paper-compare-1"><option value="">请选择</option></select></label>
+      <label>论文 2<select id="paper-compare-2"><option value="">请选择</option></select></label>
+      <label>论文 3<select id="paper-compare-3"><option value="">可选</option></select></label>
+      <button type="button" id="paper-run-compare" class="primary-action">生成对比</button>
+    </div>
+    <div id="paper-compare-result" class="paper-compare-result"></div>
+  </section>
+</main>
+
+<div id="paper-drawer-backdrop" class="paper-drawer-backdrop" hidden></div>
+<aside id="paper-detail-drawer" class="paper-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="paper-drawer-title" aria-hidden="true">
+  <header><div><p class="eyebrow">PAPER PROFILE</p><h2 id="paper-drawer-title">论文详情</h2></div><button type="button" id="paper-drawer-close" class="paper-icon-button" aria-label="关闭论文详情">×</button></header>
+  <div id="paper-drawer-content" class="paper-drawer-content"></div>
+</aside>
+
+<dialog id="paper-diagram-dialog" class="paper-diagram-dialog">
+  <header><h2 id="paper-diagram-title">架构图</h2><button type="button" id="paper-diagram-close" class="paper-icon-button" aria-label="关闭架构图">×</button></header>
+  <pre id="paper-diagram-content"></pre>
+</dialog>
+
+<div id="paper-column-filter" class="paper-column-filter" hidden></div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('paper_lab_web.static', filename='paper_lab_index.js') }}" defer></script>{% endblock %}

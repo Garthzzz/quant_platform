@@ -1,0 +1,16 @@
+DROP TRIGGER paper_institution_resolution_no_delete;
+DROP TRIGGER paper_institution_resolution_no_update;
+DROP TRIGGER paper_reading_conclusion_binding_no_delete;
+DROP TRIGGER paper_reading_conclusion_binding_no_update;
+DROP TRIGGER paper_core_conclusion_evidence_no_delete;
+DROP TRIGGER paper_core_conclusion_evidence_no_update;
+DROP TRIGGER paper_category_assignment_detail_no_delete;
+DROP TRIGGER paper_category_assignment_detail_no_update;
+DROP TRIGGER paper_category_assertion_no_delete;
+DROP TRIGGER paper_category_assertion_no_update;
+DROP TABLE paper_institution_resolution;
+DROP TABLE paper_reading_conclusion_binding;
+DROP TABLE paper_core_conclusion_evidence;
+DROP INDEX one_primary_category_per_paper_idx;
+DROP TABLE paper_category_assignment_detail;
+DROP TABLE paper_category_assertion;

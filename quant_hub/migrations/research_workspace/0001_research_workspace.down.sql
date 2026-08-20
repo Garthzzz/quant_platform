@@ -1,0 +1,34 @@
+DROP TRIGGER research_workspace_command_receipt_no_delete;
+DROP TRIGGER research_workspace_command_receipt_no_update;
+DROP TABLE research_workspace_command_receipt;
+
+DROP TRIGGER research_workspace_comment_event_no_delete;
+DROP TRIGGER research_workspace_comment_event_no_update;
+DROP TABLE research_workspace_comment_event;
+
+DROP TRIGGER research_workspace_comment_deleted_no_rewrite;
+DROP TRIGGER research_workspace_comment_no_delete;
+DROP TRIGGER research_workspace_comment_revision_update;
+DROP TABLE research_workspace_comment;
+
+DROP TRIGGER research_workspace_event_no_delete;
+DROP TRIGGER research_workspace_event_no_update;
+DROP TABLE research_workspace_event;
+
+DROP TRIGGER research_workspace_observation_no_delete;
+DROP TRIGGER research_workspace_observation_no_update;
+DROP TABLE research_workspace_observation;
+
+DROP TRIGGER research_workspace_node_no_delete;
+DROP TRIGGER research_workspace_node_revision_update;
+DROP TRIGGER research_workspace_node_parent_update;
+DROP TRIGGER research_workspace_node_parent_insert;
+DROP TABLE research_workspace_node;
+
+DROP TRIGGER research_workspace_sync_run_no_delete;
+DROP TABLE research_workspace_sync_run;
+
+DROP INDEX actor_single_song;
+DROP INDEX actor_single_zhang;
+DROP INDEX actor_kind_display_name_unique;
+DROP TABLE actor;

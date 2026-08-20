@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}引用上下文 · Archive Evidence{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('evidence.static', filename='evidence.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell evidence-shell">
+  <section class="evidence-hero evidence-hero--detail">
+    <p class="eyebrow"><a href="/evidence/">Archive Evidence</a> · 引用上下文</p>
+    <h1>量化研究中的原始引用位置</h1>
+    <p>本页用于阅读当前研究页尚未映射的历史材料或旧版本引用；它保留来源路径、行号和原文上下文，不把历史引用提升为当前研究结论。</p>
+  </section>
+  <article class="evidence-detail-main evidence-citation-page">
+    <section class="evidence-panel">
+      <h2>来源位置</h2>
+      <dl class="evidence-provenance-grid">
+        <dt>原始路径</dt><dd>{{ citation.entries[0].canonical_path if citation.entries else '来源路径待核验' }}</dd>
+        <dt>原文行号</dt><dd>第 {{ citation.line_start }}–{{ citation.line_end }} 行</dd>
+        <dt>定位状态</dt><dd>{{ citation.locator_status }}</dd>
+      </dl>
+    </section>
+    <section class="evidence-panel">
+      <h2>引用上下文</h2>
+      <blockquote class="evidence-abstract">{{ citation.context_text }}</blockquote>
+      {% if citation.raw_marker_text %}<p><strong>识别标记：</strong>{{ citation.raw_marker_text }}</p>{% endif %}
+    </section>
+    <section class="evidence-panel">
+      <h2>绑定论文</h2>
+      {% for entry in citation.entries %}
+        {% if entry.paper %}
+        <article class="evidence-relation-card">
+          <h3><a href="{{ entry.paper.detail_url }}">{{ entry.paper.title }}</a></h3>
+          <p>{{ entry.rationale or '该来源位置已与此论文身份完成可追溯绑定。' }}</p>
+        </article>
+        {% endif %}
+      {% else %}<p class="evidence-boundary-note">该引用仍处于未绑定状态。</p>{% endfor %}
+    </section>
+  </article>
+</main>
+{% endblock %}

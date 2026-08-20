@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Quant Research Hub{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell">
+  <section class="panel error-panel">
+    <p class="eyebrow">Request status</p>
+    <h1>{{ title }}</h1>
+    <p>{{ message }}</p>
+    <a href="{{ url_for('web.home_page') }}">返回研究首页</a>
+  </section>
+</main>
+{% endblock %}

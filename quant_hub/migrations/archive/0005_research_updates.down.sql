@@ -1,0 +1,10 @@
+DROP TRIGGER research_update_export_checkpoint_no_delete;
+DROP TRIGGER research_update_annotation_no_delete;
+DROP TRIGGER research_update_annotation_no_update;
+DROP TRIGGER research_update_no_delete;
+DROP TRIGGER research_update_no_update;
+DROP TABLE research_update_export_checkpoint;
+DROP INDEX research_update_annotation_latest_idx;
+DROP TABLE research_update_annotation_event;
+DROP INDEX research_update_recent_idx;
+DROP TABLE research_update;

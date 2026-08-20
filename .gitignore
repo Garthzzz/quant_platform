@@ -1,0 +1,80 @@
+# Quant Research Hub public repository boundary
+
+# Raw/internal research and external evidence never enter public Git.
+/reference/
+/deploy/
+/研究修订工作区/
+/Quant_Platform_整改建议.md
+/quant_hub/paper_lab/papers/
+/quant_hub/fixtures/
+/quant_hub/src/quant_hub/presentation/chapter_manifests/
+/quant_hub/src/quant_hub/presentation/supplements/
+/quant_hub/src/quant_hub/presentation/*.json
+
+# Mutable state, objects, generated deliveries, caches and local evidence.
+/quant_hub/data/
+/quant_hub/var/
+/quant_hub/spikes/
+/quant_hub/build/
+/quant_hub/src/*.egg-info/
+/project_state/**
+!/project_state/architecture/
+!/project_state/architecture/quant_platform_VM知识MCP总体设计_20260820.md
+/.codegraph/
+/.v9t-failed-attempt1/
+/.v9w-failed-attempt1/
+/.pytest_cache/
+**/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+*.pyd
+*.egg-info/
+*.log
+*.pid
+*.tmp
+*.bak
+
+# Databases, sidecars, dumps and recovery material.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.dump
+*.backup
+*.zip
+
+# Papers and binary office/research inputs.
+*.pdf
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+
+# Credentials, browser sessions and local environments.
+.env
+.env.*
+**/*credential*
+**/*credentials*
+**/*storage_state*
+**/*cookie*.json
+/.venv*/
+/venv/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+/.vscode/
+/.idea/
+Thumbs.db
+.DS_Store
+
+# Stage evidence is local and intentionally outside the public repository.
+/stage_evidence/
+/state/
+/objects/
+/content_store/
+/releases/
+/incoming/
+/recovery/

@@ -1,0 +1,2 @@
+DROP TRIGGER object_blob_registry_update;
+DROP TRIGGER object_blob_registry_insert;

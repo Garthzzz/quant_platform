@@ -1,0 +1,282 @@
+{% extends "base.html" %}
+{% macro toc_nodes(nodes) -%}
+<ol>
+  {% for node in nodes %}
+  <li class="toc-entry toc-entry--{{ node.numbering_mode }}"><a href="#{{ node.anchor_id }}">{{ node.title_text }}</a>{% if node.children %}{{ toc_nodes(node.children) }}{% endif %}</li>
+  {% endfor %}
+</ol>
+{%- endmacro %}
+{% block title %}{{ research.display_title }} · Quant Research Hub{% endblock %}
+{% block body %}
+<main id="main-content" class="research-shell research-overview-shell" data-research-landing data-expected-featured-kinds="{{ research.featured_documents | map(attribute='featured_kind') | join(',') }}" data-expected-child-count="{{ research.linked_document_count }}">
+  <header class="research-header research-header--overview">
+    <p class="eyebrow">研究专题</p>
+    <h1>{{ research.display_title }}</h1>
+    {% if research.summary %}<p class="research-summary">{{ research.summary }}</p>{% endif %}
+    {% if research.orientation.question %}
+    <p class="research-question"><strong>核心研究问题</strong><span>{{ research.orientation.question }}</span></p>
+    {% endif %}
+  </header>
+
+  <div class="reading-layout reading-layout--overview">
+    <aside class="toc-panel topic-map-panel">
+      <nav aria-label="专题概述、综述与子研究目录">
+        <h2>概述与综述</h2>
+        {% for document in research.featured_documents %}
+        <section class="direct-document-map">
+          <a class="direct-document-map__title" href="#research-direct-{{ document.featured_kind }}">{{ document.featured_label }}</a>
+          {% if document.chapter_groups %}
+          <div class="direct-document-map__chapters">
+            {% for chapter_group in document.chapter_groups %}
+            <section class="chapter-navigation-group">
+              <h4>{{ chapter_group.title }}</h4>
+              <ol>{% for chapter in chapter_group.chapters %}<li><a href="{{ chapter.page_url }}">{{ chapter.display_title }}</a></li>{% endfor %}</ol>
+            </section>
+            {% endfor %}
+          </div>
+          {% elif document.toc %}<div class="direct-document-map__toc">{{ toc_nodes(document.toc) }}</div>{% endif %}
+        </section>
+        {% endfor %}
+        {% if research.linked_document_groups %}
+        <h2 class="topic-map-panel__secondary-title">子研究文档</h2>
+        {% for group in research.linked_document_groups %}
+        <section class="topic-document-group{% if group.key == 'research-process' %} topic-document-group--secondary{% endif %}">
+          <h3>{{ group.title }}</h3>
+          <ol>
+            {% for document in group.documents %}
+            <li data-document-id="{{ document.document_id }}"><a href="{{ document.page_url }}">{{ document.display_title }}</a></li>
+            {% endfor %}
+          </ol>
+        </section>
+        {% endfor %}
+        {% endif %}
+      </nav>
+    </aside>
+
+    <div class="reading-column overview-column">
+      {% if research.canonical_slug == 'q2-low-snr-neural-selection-factory' %}
+      <section class="q2-pipeline-map" id="q2-training-pipeline" aria-labelledby="q2-pipeline-title" data-q2-interactive-pipeline>
+        <header class="q2-pipeline-map__header">
+          <div><p class="eyebrow">研究概览与训练管线</p><h2 id="q2-pipeline-title">低信噪比选股训练工厂：三步数据流与跨步骤治理</h2></div>
+          <p>从原始因子到组合输出，Forward、Backward 与三类跨步骤约束共同构成一个反复迭代的训练系统。点击任一组件可进入对应研究位置。</p>
+        </header>
+        <div class="q2-pipeline-legend" aria-label="连线说明"><span><i class="is-forward"></i>正向数据流</span><span><i class="is-feedback"></i>参数反馈</span><span><i class="is-governance"></i>跨步骤约束</span></div>
+
+        <div class="q2-pipeline-flow" aria-label="训练工厂主数据流">
+          <a class="q2-flow-node q2-flow-node--source" href="{{ research.pipeline_nodes['raw-data'].page_url }}"><span>输入</span><strong>原始量价、基本面与状态数据</strong><small>point-in-time 特征、标签与可交易状态</small></a>
+          <span class="q2-flow-arrow" aria-hidden="true">→</span>
+          <section class="q2-flow-stage q2-flow-stage--d1" aria-labelledby="q2-stage-1-title">
+            <header><span>步骤 1</span><a id="q2-stage-1-title" href="{{ research.pipeline_nodes['step-1-d1'].page_url }}">D1 预处理：信噪比第一道闸门</a></header>
+            <ol class="q2-node-sequence">
+              <li><a href="{{ research.pipeline_nodes['d1-gaussian-rank'].page_url }}">截面 Gaussian-rank</a></li>
+              <li><a href="{{ research.pipeline_nodes['d1-winsorize'].page_url }}">±3 MAD Winsorize</a></li>
+              <li><a href="{{ research.pipeline_nodes['d1-neutralization'].page_url }}">行业 / 市值中性化</a></li>
+              <li><a href="{{ research.pipeline_nodes['d1-ic-screening'].page_url }}">IC 筛选与多重检验校正</a></li>
+            </ol>
+            <a class="q2-stage-rail" href="{{ research.pipeline_nodes['d1-a-share'].page_url }}">A 股可交易样本约束</a>
+          </section>
+          <span class="q2-flow-arrow" aria-hidden="true">→</span>
+          <a class="q2-flow-node q2-flow-node--tensor" href="{{ research.pipeline_nodes['processed-tensor'].page_url }}"><span>张量</span><strong>预处理输入 X</strong><small>进入 Forward</small></a>
+          <span class="q2-flow-arrow" aria-hidden="true">→</span>
+          <section class="q2-flow-stage q2-flow-stage--forward" aria-labelledby="q2-stage-2-title">
+            <header><span>步骤二 · Forward</span><strong id="q2-stage-2-title">前向传播与模型内部表示</strong></header>
+            <ol class="q2-node-sequence">
+              <li><a href="{{ research.pipeline_nodes['step-2-d2'].page_url }}"><b>D2</b> 特征表征层</a></li>
+              <li><a href="{{ research.pipeline_nodes['step-2-d3'].page_url }}"><b>D3</b> 网络架构</a></li>
+              <li><a href="{{ research.pipeline_nodes['step-2-d4'].page_url }}"><b>D4</b> 激活函数</a></li>
+              <li><a href="{{ research.pipeline_nodes['step-2-d5'].page_url }}"><b>D5</b> 归一化层</a></li>
+            </ol>
+          </section>
+          <span class="q2-flow-arrow" aria-hidden="true">→</span>
+          <section class="q2-flow-stage q2-flow-stage--backward" aria-labelledby="q2-stage-3-title">
+            <header><span>步骤 3 · Loss + Backward</span><strong id="q2-stage-3-title">目标、梯度与参数更新</strong></header>
+            <div class="q2-loss-inputs"><span>预测分 ŷ</span><a href="{{ research.pipeline_nodes['true-label'].page_url }}">真实标签 y</a></div>
+            <ol class="q2-node-sequence">
+              <li><a href="{{ research.pipeline_nodes['step-3-d10'].page_url }}"><b>D10</b> 可交易目标与 Loss</a></li>
+              <li><a href="#q2-backward"><b>Backward</b> 自动微分与梯度治理</a></li>
+              <li><a href="{{ research.pipeline_nodes['step-3-d7'].page_url }}"><b>D7</b> AdamW / 优化器</a></li>
+              <li><a href="{{ research.pipeline_nodes['step-3-d8'].page_url }}"><b>D8</b> 学习率与退火</a></li>
+              <li><a href="{{ research.pipeline_nodes['weight-update'].page_url }}"><b>ΔW</b> 权重更新量</a></li>
+            </ol>
+          </section>
+        </div>
+
+        <div class="q2-feedback-loop" aria-label="参数更新反馈环"><span aria-hidden="true">↺</span><strong>权重更新</strong><span>→ 下一 iteration</span><span>→ 返回 Forward</span></div>
+
+        <section class="q2-governance-rail" id="q2-cross-step-coverage" aria-labelledby="q2-governance-title">
+          <header><p class="eyebrow">覆盖整个 iteration</p><h3 id="q2-governance-title">跨步骤治理轨道</h3></header>
+          <div>
+            <a href="{{ research.pipeline_nodes['cross-step-d6'].page_url }}"><b>D6</b><span>正则化、Flooding、Dropout 与梯度约束</span></a>
+            <a href="{{ research.pipeline_nodes['cross-step-d9'].page_url }}"><b>D9</b><span>截面 Batch 与梯度采样噪声</span></a>
+            <a href="{{ research.pipeline_nodes['cross-step-d11'].page_url }}"><b>D11</b><span>gSNR、早停、EMA / SWA 与集成</span></a>
+          </div>
+        </section>
+
+        <details class="q2-backward-detail" id="q2-backward">
+          <summary>展开 Backward 反向传播详图</summary>
+          <ol class="q2-backward-sequence">
+            <li><a href="{{ research.pipeline_nodes['step-3-d10'].page_url }}">Loss 标量</a></li>
+            <li><span>AutoGrad</span></li>
+            <li><span>原始梯度</span></li>
+            <li><a href="{{ research.pipeline_nodes['cross-step-d6'].page_url }}">D6：Flooding / Jacobian / 梯度裁剪</a></li>
+            <li><a href="{{ research.pipeline_nodes['step-3-d7'].page_url }}">D7：AdamW m/v 与有效学习率</a></li>
+            <li><a href="{{ research.pipeline_nodes['step-3-d8'].page_url }}">D8：Schedule</a></li>
+            <li><a href="{{ research.pipeline_nodes['weight-update'].page_url }}">ΔW / EMA</a></li>
+            <li><span>返回 Forward</span></li>
+          </ol>
+        </details>
+
+        <div class="q2-pipeline-supporting-views">
+          <section id="q2-temperature-triangle" aria-labelledby="q2-temperature-title">
+            <p class="eyebrow">优化温度三角</p><h3 id="q2-temperature-title"><a href="{{ research.pipeline_nodes['temperature'].page_url }}">T ∝ η / B<sub>eff</sub></a></h3>
+            <div class="q2-temperature-nodes"><a href="{{ research.pipeline_nodes['step-3-d7'].page_url }}">D7 优化器</a><a href="{{ research.pipeline_nodes['step-3-d8'].page_url }}">D8 学习率 η</a><a href="{{ research.pipeline_nodes['cross-step-d9'].page_url }}">D9 有效 Batch</a></div>
+          </section>
+          <section aria-labelledby="q2-output-title">
+            <p class="eyebrow">训练终止后的决策链</p><h3 id="q2-output-title">从推理到组合</h3>
+            <ol class="q2-output-sequence"><li><span>推理</span></li><li><span>截面排序</span></li><li><a href="{{ research.pipeline_nodes['ensemble'].page_url }}">受 CMSN / GSD / CFN / RBP 约束的集成</a></li><li><a href="{{ research.pipeline_nodes['portfolio'].page_url }}">最终组合</a></li></ol>
+          </section>
+        </div>
+      </section>
+      {% endif %}
+      <section class="research-direct-reading" aria-label="专题概述与综合综述">
+        {% for document in research.featured_documents %}
+        <article class="research-direct-content" id="research-direct-{{ document.featured_kind }}" data-research-direct-content="{{ document.featured_kind }}" data-document-id="{{ document.document_id }}">
+          <header class="direct-content-header">
+            <div>
+              <p class="eyebrow">{{ document.featured_label }}</p>
+              <h2>{{ document.display_title }}</h2>
+            </div>
+            <a href="{{ document.page_url }}">独立阅读</a>
+          </header>
+          {% if document.citation_projection_error %}
+          <p class="integrity-warning" role="alert">{{ document.citation_projection_error }}</p>
+          {% elif document.unprojected_citation_count %}
+          <p class="integrity-note">另有 {{ document.unprojected_citation_count }} 条证据线索保留在证据库中，未插入正文交互位置。</p>
+          {% endif %}
+          <div class="research-body">{{ document.rendered_html }}</div>
+          {% if document.chapter_groups %}
+          <section class="chapter-directory" aria-label="{{ document.display_title }}全部研究章节">
+            <header><p class="eyebrow">章节化阅读</p><h3>按研究问题继续阅读</h3></header>
+            {% for chapter_group in document.chapter_groups %}
+            <section>
+              <h4>{{ chapter_group.title }}</h4>
+              <ol class="chapter-card-grid">
+                {% for chapter in chapter_group.chapters %}
+                <li><a href="{{ chapter.page_url }}">{{ chapter.display_title }}</a></li>
+                {% endfor %}
+              </ol>
+            </section>
+            {% endfor %}
+          </section>
+          {% endif %}
+        </article>
+        {% else %}
+        <p class="empty-state">该专题当前没有已指定的概述文档。</p>
+        {% endfor %}
+      </section>
+
+      <section class="document-catalog" data-research-document-links aria-labelledby="document-catalog-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">延伸阅读</p>
+            <h2 id="document-catalog-title">子研究文档</h2>
+          </div>
+          <span class="count">{{ research.linked_document_count }} 篇</span>
+        </div>
+        {% for group in research.linked_document_groups %}
+        <section class="document-catalog__group{% if group.key == 'research-process' %} document-catalog__group--secondary{% endif %}" aria-labelledby="group-{{ group.key }}">
+          <header><h3 id="group-{{ group.key }}">{{ group.title }}</h3><span>{{ group.documents|length }}</span></header>
+          <ol class="document-card-grid">
+            {% for document in group.documents %}
+            <li id="document-{{ document.document_id }}" data-document-id="{{ document.document_id }}">
+              <a href="{{ document.page_url }}">{{ document.display_title }}</a>
+            </li>
+            {% endfor %}
+          </ol>
+        </section>
+        {% else %}
+        <p class="empty-state">本专题没有额外的子研究文档。</p>
+        {% endfor %}
+      </section>
+
+      <section class="comments-panel" id="comments" aria-labelledby="comments-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">研究协作</p>
+            <h2 id="comments-title">专题评论</h2>
+          </div>
+          <span class="count">{{ comments|length }} 条</span>
+        </div>
+        <p class="boundary-note">评论是专题级纯文本协作记录，与各子专题正文和论文证据分离。</p>
+
+        <form class="comment-form" data-comment-create data-research-id="{{ research.research_id }}">
+          <fieldset>
+            <legend>评论者</legend>
+            <label><input type="radio" name="actor_kind" value="zhang_zhengze" checked> 张正泽</label>
+            <label><input type="radio" name="actor_kind" value="song_dingkun"> 宋定坤</label>
+            <label><input type="radio" name="actor_kind" value="other"> 其他</label>
+          </fieldset>
+          <label class="other-name is-hidden">姓名 <input name="display_name" type="text" maxlength="80" autocomplete="name"></label>
+          <label>评论内容 <textarea name="content" rows="4" maxlength="8000" autocomplete="off" required></textarea></label>
+          <div class="form-actions"><button type="submit">发布评论</button><span class="form-status" role="status" aria-live="polite"></span></div>
+        </form>
+
+        <ol class="comment-list">
+          {% for comment in comments %}
+          <li class="comment-card" data-comment-id="{{ comment.comment_id }}" data-revision="{{ comment.revision }}">
+            <header>
+              <strong>{{ comment.actor.display_name }}</strong>
+              <span><time datetime="{{ comment.updated_at }}" data-local-datetime>{{ comment.updated_at }}</time> · revision <span translate="no">{{ comment.revision }}</span></span>
+            </header>
+            <p class="comment-content">{{ comment.content }}</p>
+            <details>
+              <summary>修改或删除</summary>
+              <form class="comment-edit-form" data-comment-edit>
+                <label>本次操作者
+                  <select name="actor_kind" autocomplete="off">
+                    <option value="zhang_zhengze">张正泽</option>
+                    <option value="song_dingkun">宋定坤</option>
+                    <option value="other">其他</option>
+                  </select>
+                </label>
+                <label class="other-name is-hidden">姓名 <input name="display_name" type="text" maxlength="80" autocomplete="name"></label>
+                <label>评论内容 <textarea name="content" rows="3" maxlength="8000" autocomplete="off" required>{{ comment.content }}</textarea></label>
+                <div class="form-actions">
+                  <button type="submit">保存修改</button>
+                  <button class="button-danger" type="button" data-comment-delete>删除评论</button>
+                  <span class="form-status" role="status" aria-live="polite"></span>
+                </div>
+              </form>
+            </details>
+          </li>
+          {% else %}<li class="empty-state">还没有专题评论。</li>{% endfor %}
+        </ol>
+      </section>
+    </div>
+  </div>
+
+  {% if research.featured_documents %}
+  <dialog id="citation-dialog" class="citation-dialog" data-citation-dialog data-endpoint-prefix="/api/v1/evidence/citations/" aria-labelledby="citation-dialog-title">
+    <div class="citation-dialog__surface">
+      <header class="citation-dialog__header">
+        <div><p class="eyebrow">来源追踪</p><h2 id="citation-dialog-title">引用证据</h2></div>
+        <button type="button" class="citation-dialog__close" data-citation-close aria-label="关闭引用证据">关闭</button>
+      </header>
+      <div class="citation-dialog__status" data-citation-status role="status" aria-live="polite"></div>
+      <div class="citation-dialog__content" data-citation-content hidden>
+        <div class="citation-state-row"><span class="citation-state" data-citation-resolution></span><code data-citation-id></code></div>
+        <dl class="citation-context">
+          <div><dt>原文线索</dt><dd data-citation-marker></dd></div>
+          <div><dt>正文位置</dt><dd data-citation-location></dd></div>
+          <div><dt>上下文</dt><dd data-citation-context></dd></div>
+        </dl>
+        <section aria-labelledby="citation-entries-title">
+          <h3 id="citation-entries-title">绑定与核验状态</h3>
+          <ol class="citation-entry-list" data-citation-entries></ol>
+        </section>
+      </div>
+    </div>
+  </dialog>
+  {% endif %}
+</main>
+{% endblock %}

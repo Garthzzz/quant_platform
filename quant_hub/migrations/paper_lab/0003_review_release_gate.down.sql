@@ -1,0 +1,2 @@
+DROP TRIGGER IF EXISTS reading_run_release_update_requires_review;
+DROP TRIGGER IF EXISTS reading_run_release_insert_requires_review;

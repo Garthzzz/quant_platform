@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-research-hub"
+version = "0.1.0"
+description = "Archive-first 量化研究知识与工程平台"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "bleach>=6.3,<7",
+  "flask>=3.1,<4",
+  "latex2mathml>=3.81,<4",
+  "markdown-it-py>=4.0,<5",
+  "pymupdf>=1.27,<2",
+  "pydantic>=2.12,<3",
+  "typer>=0.20,<1",
+]
+
+[project.scripts]
+qrh = "quant_hub.cli:app"
+paper-lab-scan = "quant_hub.paper_lab.compat:scan_main"
+paper-lab-run = "quant_hub.paper_lab.compat:run_main"
+paper-lab-write = "quant_hub.paper_lab.compat:write_main"
+paper-lab-query = "quant_hub.paper_lab.compat:query_main"
+paper-lab-components = "quant_hub.paper_lab.compat:component_main"
+paper-lab-import = "quant_hub.paper_lab.compat:legacy_import_main"
+paper-lab-viewer = "quant_hub.paper_lab.compat:viewer_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"quant_hub.web" = ["templates/*.html", "static/*.css", "static/*.js"]
+"quant_hub.evidence" = [
+  "templates/evidence/*.html",
+  "static/*.css",
+]
+"quant_hub.paper_lab" = [
+  "schemas/*.json",
+  "templates/paper_lab/*.html",
+  "static/*.css",
+  "static/*.js",
+]
+"quant_hub.presentation" = ["*.json", "supplements/**/*.md"]
+
+[tool.setuptools.data-files]
+"migrations/platform" = ["migrations/platform/*.sql"]
+"migrations/archive" = ["migrations/archive/*.sql"]
+"migrations/research_papers" = ["migrations/research_papers/*.sql"]
+"migrations/paper_lab" = ["migrations/paper_lab/*.sql"]
+"paper_lab/pipeline" = ["paper_lab/pipeline/*.py"]
+"paper_lab/tools" = ["paper_lab/tools/*.py"]
+"paper_lab/tools/viewer" = ["paper_lab/tools/viewer/*.py"]

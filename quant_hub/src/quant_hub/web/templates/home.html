@@ -1,0 +1,400 @@
+{% extends "base.html" %}
+{% set status_labels = {
+  'todo':'待开始',
+  'in_progress':'进行中',
+  'review':'待复核',
+  'completed':'已完成',
+  'archived':'有价值但暂时搁置',
+  'cancelled':'已取消'
+} %}
+
+{% macro actor_picker(prefix, legend) -%}
+<fieldset class="workspace-actor">
+  <legend>{{ legend }}</legend>
+  <label class="workspace-actor__choice" for="{{ prefix }}-actor-zhang"><input id="{{ prefix }}-actor-zhang" name="actor_kind" type="radio" value="zhang_zhengze" checked><span>张正泽</span></label>
+  <label class="workspace-actor__choice" for="{{ prefix }}-actor-song"><input id="{{ prefix }}-actor-song" name="actor_kind" type="radio" value="song_dingkun"><span>宋定坤</span></label>
+  <label class="workspace-actor__choice" for="{{ prefix }}-actor-other"><input id="{{ prefix }}-actor-other" name="actor_kind" type="radio" value="other"><span>其他</span></label>
+  <label class="workspace-actor__other is-hidden" for="{{ prefix }}-actor-name">
+    姓名
+    <input id="{{ prefix }}-actor-name" name="display_name" type="text" maxlength="100" autocomplete="name">
+  </label>
+</fieldset>
+{%- endmacro %}
+
+{% macro render_tree(nodes) -%}
+<ul class="workspace-tree__list">
+  {% for item in nodes %}
+  <li class="workspace-tree__item" data-node-kind="{{ item.node_kind }}" data-node-status="{{ item.lifecycle_status }}">
+    {% if item.children %}
+    <details {% if parameters.query or parameters.status or parameters.parent_node_id or parameters.node_kind or item.node_kind == 'system' %}open{% endif %}>
+      <summary>
+        <span class="workspace-tree__disclosure" aria-hidden="true"></span>
+        <a class="workspace-tree__link{% if selected_node and selected_node.node_id == item.node_id %} is-current{% endif %}"
+           href="{{ url_for('web.home_page', q=parameters.query or None, status=parameters.status, parent_node_id=parameters.parent_node_id, node_kind=parameters.node_kind, node=item.node_id, _anchor='workspace-detail') }}"
+           {% if selected_node and selected_node.node_id == item.node_id %}aria-current="page"{% endif %}>
+          <span>{{ item.display_title }}</span>
+          {% if item.node_kind == 'project' %}
+          <span class="workspace-status workspace-status--{{ item.lifecycle_status }}">{{ status_labels[item.lifecycle_status] }}</span>
+          {% endif %}
+        </a>
+        {% if item.page_url %}
+        <a class="workspace-tree__read" href="{{ item.page_url }}" aria-label="进入正文：{{ item.display_title }}">进入正文 <span aria-hidden="true">→</span></a>
+        {% endif %}
+      </summary>
+      {{ render_tree(item.children) }}
+    </details>
+    {% else %}
+    <div class="workspace-tree__document-row">
+      <a class="workspace-tree__link workspace-tree__link--leaf{% if selected_node and selected_node.node_id == item.node_id %} is-current{% endif %}"
+         href="{{ url_for('web.home_page', q=parameters.query or None, status=parameters.status, parent_node_id=parameters.parent_node_id, node_kind=parameters.node_kind, node=item.node_id, _anchor='workspace-detail') }}"
+         {% if selected_node and selected_node.node_id == item.node_id %}aria-current="page"{% endif %}>
+        <span>{{ item.display_title }}</span>
+        {% if item.node_kind == 'project' %}
+        <span class="workspace-status workspace-status--{{ item.lifecycle_status }}">{{ status_labels[item.lifecycle_status] }}</span>
+        {% endif %}
+      </a>
+      {% if item.page_url %}
+      <a class="workspace-tree__read" href="{{ item.page_url }}" aria-label="进入正文：{{ item.display_title }}">进入正文 <span aria-hidden="true">→</span></a>
+      {% endif %}
+    </div>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{%- endmacro %}
+
+{% block title %}研究工作台 · Quant Research Hub{% endblock %}
+{% block body %}
+<main id="main-content" class="research-workspace-page">
+  <section class="workspace-intro" aria-labelledby="workspace-title">
+    <div>
+      <p class="eyebrow">Research workspace</p>
+      <h1 id="workspace-title">量化研究工作台</h1>
+      <p>Q 系列目录只收录已经形成正文的正式研究。点击目录标题可查看说明与评论；“进入正文”用于直接阅读研报。</p>
+    </div>
+    <div class="workspace-intro__actions">
+      <a class="primary-button" href="#research-progress-monitor">新增进度记录</a>
+      <button class="secondary-button" type="button" data-workspace-sync>同步研究目录</button>
+    </div>
+    <p class="form-status" role="status" aria-live="polite" data-workspace-sync-status></p>
+  </section>
+
+  <section class="workspace-overview" aria-label="研究状态总览">
+    {% for key in ['todo','in_progress','review','completed','archived','cancelled'] %}
+    <a href="{{ url_for('web.home_page', status=key) }}" class="workspace-metric workspace-metric--{{ key }}">
+      <span>{{ status_labels[key] }}</span>
+      <strong>{{ workspace.stats[key] }}</strong>
+    </a>
+    {% endfor %}
+  </section>
+
+  <form class="workspace-filter" action="{{ url_for('web.home_page') }}" method="get" role="search">
+    <div class="workspace-filter__search">
+      <label for="workspace-query">搜索研究树</label>
+      <input id="workspace-query" name="q" type="search" value="{{ parameters.query }}" maxlength="300" autocomplete="off" placeholder="标题、研究问题、研究内容或文件路径">
+    </div>
+    <div>
+      <label for="workspace-project">所属研究专项</label>
+      <select id="workspace-project" name="parent_node_id">
+        <option value="">全部专项</option>
+        {% for project in project_options %}
+        <option value="{{ project.node_id }}" {% if parameters.parent_node_id == project.node_id %}selected{% endif %}>{{ project.display_title }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label for="workspace-status">研究状态</label>
+      <select id="workspace-status" name="status">
+        <option value="">全部状态</option>
+        {% for key in ['todo','in_progress','review','completed','archived','cancelled'] %}
+        <option value="{{ key }}" {% if parameters.status == key %}selected{% endif %}>{{ status_labels[key] }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit">应用筛选</button>
+    {% if parameters.query or parameters.status or parameters.parent_node_id or parameters.node_kind %}
+    <a class="text-button" href="{{ url_for('web.home_page') }}">清除</a>
+    {% endif %}
+  </form>
+
+  <div class="workspace-layout">
+    <aside class="workspace-tree" aria-labelledby="workspace-tree-title">
+      <div class="workspace-section-heading workspace-section-heading--compact">
+        <h2 id="workspace-tree-title">研究目录</h2>
+        <span>{{ workspace.matched_count }} / {{ workspace.total_count }}</span>
+      </div>
+      {% if workspace.tree %}
+      <nav aria-label="研究专项、专题与文档">
+        {{ render_tree(workspace.tree) }}
+      </nav>
+      {% else %}
+      <p class="empty-state">当前筛选条件下没有研究节点。</p>
+      {% endif %}
+    </aside>
+
+    <section id="workspace-detail" class="workspace-detail" aria-live="polite">
+      {% if selected_node %}
+      <header class="workspace-detail__header">
+        <div>
+          <p class="workspace-detail__path">{{ selected_node.source_relative_path }}</p>
+          <h2>{{ selected_node.display_title }}</h2>
+          {% if selected_node.description %}<p>{{ selected_node.description }}</p>{% endif %}
+        </div>
+        {% if selected_node.node_kind == 'project' or selected_node.page_url %}
+        <div class="workspace-detail__header-actions">
+          {% if selected_node.page_url %}<a class="primary-button workspace-detail__read" href="{{ selected_node.page_url }}">进入本节正文 <span aria-hidden="true">→</span></a>{% endif %}
+          {% if selected_node.node_kind == 'project' %}
+          <span class="workspace-status workspace-status--{{ selected_node.lifecycle_status }}">{{ status_labels[selected_node.lifecycle_status] }}</span>
+          <button class="secondary-button" type="button" data-workspace-editor-open>编辑专项研究</button>
+          {% endif %}
+        </div>
+        {% endif %}
+      </header>
+
+      <dl class="workspace-detail__meta">
+        <div><dt>最近更新</dt><dd><time datetime="{{ selected_node.updated_at }}" data-local-datetime>{{ selected_node.updated_at }}</time></dd></div>
+        <div><dt>目录位置</dt><dd>{{ selected_node.source_relative_path }}</dd></div>
+        {% if selected_node.page_url %}<div><dt>正文状态</dt><dd>已发布，可由上方按钮直接进入</dd></div>{% endif %}
+      </dl>
+
+      {% if selected_node.node_kind == 'project' %}
+      <section class="workspace-project-brief" aria-label="专项研究定义">
+        <article>
+          <p class="eyebrow">Research question</p>
+          <h3>研究问题</h3>
+          <p>{{ selected_node.research_question or '尚未填写。可在下方“编辑专项研究”中补充。' }}</p>
+        </article>
+        <article>
+          <p class="eyebrow">Research scope</p>
+          <h3>研究内容</h3>
+          <p>{{ selected_node.research_content or '尚未填写。可在下方“编辑专项研究”中补充。' }}</p>
+        </article>
+      </section>
+      {% endif %}
+
+      {% if selected_node.children %}
+      <section class="workspace-related" aria-labelledby="workspace-related-title">
+        <div class="workspace-section-heading workspace-section-heading--compact">
+          <h3 id="workspace-related-title">下级研究与文档</h3>
+          <span>{{ selected_node.children|length }}</span>
+        </div>
+        <ul>
+          {% for child in selected_node.children %}
+          <li>
+            <div>
+              <a class="workspace-related__manage" href="{{ url_for('web.home_page', node=child.node_id, _anchor='workspace-detail') }}">{{ child.display_title }} <span>查看说明与评论</span></a>
+              {% if child.page_url %}<a class="workspace-related__read" href="{{ child.page_url }}">进入正文 <span aria-hidden="true">→</span></a>{% endif %}
+            </div>
+          </li>
+          {% endfor %}
+        </ul>
+      </section>
+      {% endif %}
+
+      <details id="workspace-editor" class="workspace-editor">
+        <summary>{{ '编辑专项研究' if selected_node.node_kind == 'project' else '编辑目录信息' }}</summary>
+        <form data-research-node-edit data-node-id="{{ selected_node.node_id }}" data-node-revision="{{ selected_node.revision }}">
+          <label for="node-title">显示标题</label>
+          <input id="node-title" name="title" type="text" maxlength="500" value="{{ selected_node.display_title }}" autocomplete="off" required>
+          <label for="node-description">{{ '专项概述' if selected_node.node_kind == 'project' else '目录说明' }}</label>
+          <textarea id="node-description" name="description" rows="5" maxlength="8000">{{ selected_node.description or '' }}</textarea>
+          {% if selected_node.node_kind == 'project' %}
+          <label for="node-research-question">研究问题</label>
+          <textarea id="node-research-question" name="research_question" rows="4" maxlength="8000" placeholder="这个专项真正要回答什么问题？">{{ selected_node.research_question or '' }}</textarea>
+          <label for="node-research-content">研究内容</label>
+          <textarea id="node-research-content" name="research_content" rows="8" maxlength="20000" placeholder="研究范围、主要方向、边界与预期产出。">{{ selected_node.research_content or '' }}</textarea>
+          <label for="node-status">研究状态</label>
+          <select id="node-status" name="lifecycle_status" required>
+            {% for key in ['todo','in_progress','review','completed','archived','cancelled'] %}
+            <option value="{{ key }}" {% if selected_node.lifecycle_status == key %}selected{% endif %}>{{ status_labels[key] }}</option>
+            {% endfor %}
+          </select>
+          <label for="node-status-note">本次维护说明</label>
+          <textarea id="node-status-note" name="status_note" rows="3" maxlength="4000">{{ selected_node.status_note or '' }}</textarea>
+          {% endif %}
+          {{ actor_picker('node-edit', '编辑者') }}
+          <button type="submit">保存修改</button>
+          <p class="form-status" role="status" aria-live="polite"></p>
+        </form>
+      </details>
+
+      <section class="workspace-comments" aria-labelledby="workspace-comments-title">
+        <div class="workspace-section-heading workspace-section-heading--compact">
+          <h3 id="workspace-comments-title">节点评论</h3>
+          <span>{{ selected_node.comments|length }}</span>
+        </div>
+        <ol class="workspace-comments__list">
+          {% for comment in selected_node.comments %}
+          <li data-workspace-comment data-comment-id="{{ comment.comment_id }}" data-comment-revision="{{ comment.revision }}">
+            <div class="workspace-comment__meta">
+              <strong>{{ comment.actor.display_name }}</strong>
+              <time datetime="{{ comment.created_at }}" data-local-datetime>{{ comment.created_at }}</time>
+            </div>
+            <p data-comment-body>{{ comment.content }}</p>
+            <div class="workspace-comment__actions">
+              <button class="text-button" type="button" data-workspace-comment-edit>编辑</button>
+              <button class="text-button text-button--danger" type="button" data-workspace-comment-delete>删除</button>
+            </div>
+          </li>
+          {% else %}
+          <li class="empty-state">这个节点还没有评论。</li>
+          {% endfor %}
+        </ol>
+        <form class="workspace-comment-form" data-workspace-comment-create data-node-id="{{ selected_node.node_id }}">
+          <label for="workspace-comment-content">添加评论</label>
+          <textarea id="workspace-comment-content" name="content" rows="4" maxlength="8000" required></textarea>
+          {{ actor_picker('comment-create', '评论者') }}
+          <button type="submit">提交评论</button>
+          <p class="form-status" role="status" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <details class="workspace-history">
+        <summary>查看节点更新历史（{{ selected_node.events|length }}）</summary>
+        <ol>
+          {% for event in selected_node.events %}
+          <li>
+            <span>{{ {'discovered':'纳入研究树','content_updated':'正文更新','moved':'位置调整','missing':'来源移除','restored':'来源恢复','metadata_updated':'信息修改','status_changed':'状态修改','comment_created':'新增评论','comment_updated':'修改评论','comment_deleted':'删除评论'}[event.event_kind] }}</span>
+            <time datetime="{{ event.occurred_at }}" data-local-datetime>{{ event.occurred_at }}</time>
+            {% if event.actor %}<span>{{ event.actor.display_name }}</span>{% endif %}
+          </li>
+          {% endfor %}
+        </ol>
+      </details>
+      <dialog class="workspace-comment-dialog" data-workspace-comment-dialog aria-labelledby="workspace-comment-dialog-title">
+        <form method="dialog" data-workspace-comment-dialog>
+          <h3 id="workspace-comment-dialog-title">编辑节点评论</h3>
+          <label for="workspace-comment-edit-content">评论内容</label>
+          <textarea id="workspace-comment-edit-content" name="content" rows="6" maxlength="8000" required></textarea>
+          {{ actor_picker('comment-edit', '编辑者') }}
+          <div class="workspace-dialog__actions">
+            <button type="button" class="secondary-button" data-dialog-cancel>取消</button>
+            <button type="submit">保存评论</button>
+          </div>
+          <p class="form-status" role="status" aria-live="polite"></p>
+        </form>
+      </dialog>
+      {% else %}
+      <div class="workspace-detail__empty">
+        <p class="eyebrow">Research navigator</p>
+        <h2>从左侧研究树选择一个节点</h2>
+        <p>研究专项、专题、子专题与 Markdown 文档保持原始父子关系。专项可维护研究问题、研究内容与状态；各层级均可维护标题、说明和评论。</p>
+      </div>
+      {% endif %}
+    </section>
+  </div>
+
+  <section id="research-progress-monitor" class="research-progress-monitor" aria-labelledby="research-progress-title">
+    <div class="workspace-section-heading">
+      <div>
+        <p class="eyebrow">Progress monitor</p>
+        <h2 id="research-progress-title">研究进度监视</h2>
+        <p>这里记录准备启动或暂时搁置的研究提醒；它们不会生成 Q 编号，也不会混入上方正式研报目录。</p>
+      </div>
+      <span>{{ dashboard.active|length + dashboard.paused|length }} 条记录</span>
+    </div>
+    <div class="progress-monitor-grid">
+      <section class="progress-monitor-column" aria-labelledby="active-title">
+        <header><div><p class="eyebrow">To start</p><h3 id="active-title">其他待完成研究</h3></div><span>{{ dashboard.active|length }}</span></header>
+        <div class="progress-monitor-list">
+          {% for topic in dashboard.active %}
+          <article class="topic-card topic-card--managed" data-topic-managed data-topic-id="{{ topic.topic_id }}" data-topic-revision="{{ topic.revision }}" data-source-kind="manual">
+            <h4>{{ topic.display_title }}</h4>
+            {% if topic.state_note %}<p class="topic-note">{{ topic.state_note }}</p>{% else %}<p class="topic-note topic-note--empty">尚未填写研究说明。</p>{% endif %}
+            <p class="topic-audit-line">最近维护：{{ topic.last_modified_by.display_name if topic.last_modified_by else topic.state_actor.display_name }} · <time datetime="{{ topic.last_mutation_at or topic.updated_at }}" data-local-datetime>{{ topic.last_mutation_at or topic.updated_at }}</time></p>
+            <details class="topic-maintenance">
+              <summary>编辑这条进度记录</summary>
+              <form class="topic-edit-form" data-topic-edit>
+                <label for="edit-{{ topic.topic_id }}-title">记录标题</label>
+                <input id="edit-{{ topic.topic_id }}-title" name="title" type="text" value="{{ topic.title }}" maxlength="300" autocomplete="off" required>
+                <label for="edit-{{ topic.topic_id }}-note">研究说明或下一步</label>
+                <textarea id="edit-{{ topic.topic_id }}-note" name="note" rows="4" maxlength="2000">{{ topic.state_note or '' }}</textarea>
+                <label for="edit-{{ topic.topic_id }}-state">进度状态</label>
+                <select id="edit-{{ topic.topic_id }}-state" name="state" required><option value="planned" selected>其他待完成研究</option><option value="paused">值得推进但暂时搁置</option></select>
+                {{ actor_picker('edit-' ~ topic.topic_id, '维护者') }}
+                <div class="topic-form-actions"><button type="submit">保存修改</button><button class="danger-button" type="button" data-topic-delete>删除记录</button></div>
+                <p class="form-status" role="status" aria-live="polite"></p>
+              </form>
+            </details>
+          </article>
+          {% else %}<p class="empty-state">尚无待开始记录。</p>{% endfor %}
+        </div>
+        <details class="topic-create-panel">
+          <summary>新增待开始记录</summary>
+          <form class="topic-create-form" data-topic-create data-initial-state="planned">
+            <label for="create-planned-title">记录标题</label>
+            <input id="create-planned-title" name="title" type="text" maxlength="300" autocomplete="off" required>
+            <label for="create-planned-note">研究说明或下一步</label>
+            <textarea id="create-planned-note" name="note" rows="4" maxlength="2000"></textarea>
+            {{ actor_picker('create-planned', '记录者') }}
+            <button type="submit">添加待开始记录</button>
+            <p class="form-status" role="status" aria-live="polite"></p>
+          </form>
+        </details>
+      </section>
+
+      <section class="progress-monitor-column progress-monitor-column--paused" aria-labelledby="paused-title">
+        <header><div><p class="eyebrow">Paused</p><h3 id="paused-title">值得推进但暂时搁置的研究</h3></div><span>{{ dashboard.paused|length }}</span></header>
+        <div class="progress-monitor-list">
+          {% for topic in dashboard.paused %}
+          <article class="topic-card topic-card--managed" data-topic-managed data-topic-id="{{ topic.topic_id }}" data-topic-revision="{{ topic.revision }}" data-source-kind="manual">
+            <h4>{{ topic.display_title }}</h4>
+            {% if topic.state_note %}<p class="topic-note">{{ topic.state_note }}</p>{% else %}<p class="topic-note topic-note--empty">尚未填写搁置说明。</p>{% endif %}
+            <p class="topic-audit-line">最近维护：{{ topic.last_modified_by.display_name if topic.last_modified_by else topic.state_actor.display_name }} · <time datetime="{{ topic.last_mutation_at or topic.updated_at }}" data-local-datetime>{{ topic.last_mutation_at or topic.updated_at }}</time></p>
+            <details class="topic-maintenance">
+              <summary>编辑这条进度记录</summary>
+              <form class="topic-edit-form" data-topic-edit>
+                <label for="edit-{{ topic.topic_id }}-title">记录标题</label>
+                <input id="edit-{{ topic.topic_id }}-title" name="title" type="text" value="{{ topic.title }}" maxlength="300" autocomplete="off" required>
+                <label for="edit-{{ topic.topic_id }}-note">研究说明或搁置原因</label>
+                <textarea id="edit-{{ topic.topic_id }}-note" name="note" rows="4" maxlength="2000">{{ topic.state_note or '' }}</textarea>
+                <label for="edit-{{ topic.topic_id }}-state">进度状态</label>
+                <select id="edit-{{ topic.topic_id }}-state" name="state" required><option value="planned">其他待完成研究</option><option value="paused" selected>值得推进但暂时搁置</option></select>
+                {{ actor_picker('edit-' ~ topic.topic_id, '维护者') }}
+                <div class="topic-form-actions"><button type="submit">保存修改</button><button class="danger-button" type="button" data-topic-delete>删除记录</button></div>
+                <p class="form-status" role="status" aria-live="polite"></p>
+              </form>
+            </details>
+          </article>
+          {% else %}<p class="empty-state">尚无暂时搁置记录。</p>{% endfor %}
+        </div>
+        <details class="topic-create-panel">
+          <summary>新增暂时搁置记录</summary>
+          <form class="topic-create-form" data-topic-create data-initial-state="paused">
+            <label for="create-paused-title">记录标题</label>
+            <input id="create-paused-title" name="title" type="text" maxlength="300" autocomplete="off" required>
+            <label for="create-paused-note">研究说明或搁置原因</label>
+            <textarea id="create-paused-note" name="note" rows="4" maxlength="2000"></textarea>
+            {{ actor_picker('create-paused', '记录者') }}
+            <button type="submit">添加暂时搁置记录</button>
+            <p class="form-status" role="status" aria-live="polite"></p>
+          </form>
+        </details>
+      </section>
+    </div>
+  </section>
+
+  <section class="workspace-activity" aria-labelledby="workspace-activity-title">
+    <div class="workspace-section-heading">
+      <div>
+        <p class="eyebrow">Recent activity</p>
+        <h2 id="workspace-activity-title">最近研究更新</h2>
+      </div>
+    </div>
+    <ol class="workspace-activity__list">
+      {% for update in recent_updates %}
+      <li>
+        <span class="workspace-activity__mark" aria-hidden="true"></span>
+        <div>
+          <a href="{{ update.page_url }}">{{ update.title }}</a>
+          <p><span>{{ {'discovered':'纳入研究树','content_updated':'正文已更新','moved':'目录位置调整','restored':'来源已恢复','metadata_updated':'研究信息更新','status_changed':'研究状态更新'}[update.event_kind] }}</span> · <time datetime="{{ update.occurred_at }}" data-local-datetime>{{ update.occurred_at }}</time>{% if update.actor_display_name %} · {{ update.actor_display_name }}{% endif %} · <a class="workspace-activity__open" href="{{ update.page_url }}">{% if update.has_published_page %}打开正文{% else %}查看研究节点{% endif %} →</a></p>
+        </div>
+      </li>
+      {% else %}
+      <li class="empty-state">尚无研究更新。</li>
+      {% endfor %}
+    </ol>
+  </section>
+  <noscript><p class="empty-state">当前浏览器未启用 JavaScript；目录和正式研究仍可阅读，状态与评论维护需启用 JavaScript。</p></noscript>
+</main>
+{% endblock %}

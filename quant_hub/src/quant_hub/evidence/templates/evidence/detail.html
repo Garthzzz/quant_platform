@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}{{ paper.title }} · Archive Evidence{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('evidence.static', filename='evidence.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell evidence-shell" data-evidence-page="detail">
+  <section class="evidence-hero evidence-hero--detail" aria-labelledby="paper-title">
+    <div class="evidence-hero-copy">
+      <p class="eyebrow"><a href="/evidence/">Archive Evidence</a></p>
+      <h1 id="paper-title">{{ paper.title }}</h1>
+      <p class="evidence-publication-meta">
+        {% if paper.publication_date %}<time datetime="{{ paper.publication_date }}">{{ paper.publication_date }}</time>{% endif %}
+        {% if paper.venue %}<span>{{ paper.venue.value }}{% if paper.venue.volume %} · {{ paper.venue.volume }}{% if paper.venue.issue %}({{ paper.venue.issue }}){% endif %}{% endif %}{% if paper.venue.pages %} · {{ paper.venue.pages }}{% endif %}</span>{% endif %}
+      </p>
+    </div>
+    <nav class="evidence-hero-actions" aria-label="论文原文入口"{% if not paper.external_links and not paper.local_resources %} hidden{% endif %}>
+      <span class="evidence-resource-slot" data-acceptance-content="external-original" data-evidence-status="{{ 'present' if paper.external_links else 'missing' }}">
+        {% for link in paper.external_links %}
+          {% if loop.first %}<a class="evidence-action evidence-action--secondary" href="{{ link.url }}" rel="noreferrer noopener" data-evidence-present="true">原文来源</a>{% endif %}
+        {% endfor %}
+      </span>
+      <span class="evidence-resource-slot" data-acceptance-content="local-original" data-evidence-status="{{ 'present' if paper.local_resources else 'missing' }}">
+        {% for resource in paper.local_resources %}
+          {% if loop.first %}<a class="evidence-action evidence-action--primary" href="{{ resource.url }}" data-evidence-present="true">打开本地 PDF</a>{% endif %}
+        {% endfor %}
+      </span>
+    </nav>
+  </section>
+
+  <article class="evidence-detail-main evidence-detail-main--wide">
+    <section class="evidence-panel">
+      <h2>作者与机构</h2>
+      {% if paper.authors %}
+      <ol class="evidence-author-list">
+        {% for author in paper.authors %}<li>{{ author.name }}{% if author.affiliations %}<span> · {{ author.affiliations|join('、') }}</span>{% endif %}</li>{% endfor %}
+      </ol>
+      {% else %}<p class="evidence-muted">作者信息暂缺。</p>{% endif %}
+      {% if paper.institutions %}<p class="evidence-institutions">{{ paper.institutions|join('、') }}</p>{% endif %}
+    </section>
+
+    <section class="evidence-panel" data-acceptance-content="abstract-evidence" data-evidence-status="{{ 'present' if paper.evidence_coverage.abstract_evidence else 'missing' }}">
+      <h2>摘要原文</h2>
+      {% for excerpt in paper.abstract_excerpts %}
+      <blockquote class="evidence-abstract evidence-rich-text" data-evidence-present="true">{{ excerpt.text|research_text }}</blockquote>
+      {% if excerpt.chinese_presentation %}
+      <div class="evidence-translation">
+        <h3>中文参考译文</h3>
+        <div class="evidence-rich-text">{{ excerpt.chinese_presentation.abstract_translation_zh|research_text }}</div>
+      </div>
+      {% else %}<p class="evidence-muted">暂无中文参考译文。</p>{% endif %}
+      {% else %}<p class="evidence-release-blocked">暂无可展示的论文摘要。</p>{% endfor %}
+    </section>
+
+    <section class="evidence-panel" data-acceptance-content="core-conclusions" data-evidence-status="{{ 'present' if paper.evidence_coverage.core_conclusions else 'missing' }}">
+      <h2>核心结论</h2>
+      {% if paper.core_conclusions %}
+      <ul class="evidence-conclusion-list" data-evidence-present="true">{% for item in paper.core_conclusions %}<li class="evidence-rich-text">{{ item.text|research_text }}</li>{% endfor %}</ul>
+      {% else %}<p class="evidence-release-blocked">暂无可展示的核心结论。</p>{% endif %}
+      {% if paper.chinese_presentation %}
+      <div class="evidence-synthesis">
+        <h3>研究解读</h3>
+        <div class="evidence-rich-text">{{ paper.chinese_presentation.synthesis_zh|research_text }}</div>
+      </div>
+      {% else %}<p class="evidence-muted">暂无中文研究解读。</p>{% endif %}
+    </section>
+
+    <section class="evidence-panel" data-acceptance-content="archive-relations" data-evidence-status="{{ 'present' if paper.evidence_coverage.archive_relations else 'missing' }}" data-relation-scope="{{ paper.archive_relation_scope }}">
+      <h2>在 Archive 量化研究中的应用</h2>
+      <div class="evidence-relation-list">
+        {% set display_relations = paper.archive_core_relations if paper.archive_core_relations else paper.archive_reference_relations %}
+        {% for relation in display_relations %}
+        <article class="evidence-relation-card" data-evidence-present="true">
+          <header class="evidence-relation-header">
+            <div class="evidence-relation-heading">
+              <p class="evidence-relation-topic">{{ relation.research_title }}</p>
+              {% if relation.source_url %}<h3 class="evidence-relation-title"><a class="evidence-relation-document-link" href="{{ relation.source_url }}">{{ relation.document_title }}</a></h3>{% else %}<h3 class="evidence-relation-title">{{ relation.document_title }}</h3>{% endif %}
+            </div>
+            {% if relation.source_section_title %}<p class="evidence-relation-section">{{ relation.source_section_title }}</p>{% endif %}
+          </header>
+          <div class="evidence-relation-body">
+            <div class="evidence-relation-kind"><span class="evidence-relation-label">引用方式</span><strong>{{ relation.relation_label }}</strong></div>
+            <div class="evidence-relation-usage"><span class="evidence-relation-label">在量化研究中的具体用法</span><div class="evidence-rich-text">{{ relation.usage_description|research_text }}</div></div>
+          </div>
+          {% if relation.source_excerpt %}<blockquote class="evidence-relation-excerpt evidence-rich-text">{{ relation.source_excerpt|research_text }}</blockquote>{% endif %}
+          {% if relation.source_url %}<a class="evidence-source-jump" href="{{ relation.source_url }}">查看研究正文{% if relation.source_section_title %} · {{ relation.source_section_title }}{% endif %}</a>{% endif %}
+        </article>
+        {% else %}<p class="evidence-muted">当前研究正文中暂无可展示的直接应用。</p>{% endfor %}
+      </div>
+    </section>
+  </article>
+</main>
+{% endblock %}

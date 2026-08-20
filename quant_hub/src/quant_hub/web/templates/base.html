@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {% if csrf_token %}<meta name="csrf-token" content="{{ csrf_token }}">{% endif %}
+  <title>{% block title %}Quant Research Hub{% endblock %}</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%23005f52'/%3E%3Cpath d='M14 45V20h8v25zm14 0V12h8v33zm14 0V27h8v18z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  {% block extra_head %}{% endblock %}
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <header class="site-header">
+    <div class="site-header__inner">
+      <a class="brand" href="{{ url_for('web.home_page') }}">
+        <span class="brand__eyebrow">Quant Research Hub</span>
+        <span class="brand__name">量化研究知识中枢</span>
+      </a>
+      <nav aria-label="全局导航">
+        <a href="{{ url_for('web.home_page') }}">研究首页</a>
+        <a href="/evidence/">论文证据库</a>
+        <a href="/paper-lab/">Paper Lab</a>
+      </nav>
+    </div>
+  </header>
+  {% block body %}{% endblock %}
+  <footer class="site-footer">
+    <p>研究正文来自只读 Archive；论文证据、Paper Lab、状态与评论均在独立数据层维护。</p>
+  </footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

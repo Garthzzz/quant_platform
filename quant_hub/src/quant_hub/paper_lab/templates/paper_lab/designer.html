@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}架构设计器 · Paper Lab{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('paper_lab_web.static', filename='paper_lab.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="paper-lab-page" data-paper-lab-designer data-csrf-token="{{ csrf_token }}">
+  <header class="paper-lab-header"><div><p class="eyebrow">ARCHITECTURE DESIGNER</p><h1>量化架构设计器</h1><p>沿用原架构积木、Tag 浏览与兼容规则，并以版本化蓝图保存当前研究设计。</p></div><a href="/paper-lab/">返回论文库</a></header>
+  <nav class="designer-view-tabs" role="tablist" aria-label="架构设计器视图">
+    <button type="button" id="designer-tab-pipeline" role="tab" aria-selected="true" aria-controls="designer-pipeline-view">架构设计</button>
+    <button type="button" id="designer-tab-tags" role="tab" aria-selected="false" aria-controls="designer-tags-view">Tag 浏览器</button>
+  </nav>
+
+  <div id="designer-pipeline-view" role="tabpanel" aria-labelledby="designer-tab-pipeline">
+    <section class="designer-command" aria-labelledby="designer-command-title">
+      <h2 id="designer-command-title">蓝图管理</h2>
+      <div class="designer-fields">
+        <label>蓝图名称<input id="designer-name" name="blueprint_name" maxlength="160" autocomplete="off" placeholder="例如：日频横截面 Alpha v1…"></label>
+        <label>研究目标<textarea id="designer-objective" name="objective" rows="2" maxlength="2000" autocomplete="off" placeholder="记录输入、预测目标与使用边界…"></textarea></label>
+        <label>恢复已有蓝图<select id="designer-blueprint" name="blueprint_id"><option value="">新建蓝图</option></select></label>
+      </div>
+      <div class="designer-actions">
+        <button type="button" id="designer-new">新建</button>
+        <button type="button" id="designer-load">恢复最新版本</button>
+        <button type="button" id="designer-validate">验证组合</button>
+        <button type="button" id="designer-save" class="primary-action">保存新版本</button>
+      </div>
+      <p id="designer-status" role="status" aria-live="polite">正在读取组件与蓝图…</p>
+      <div id="designer-validation" class="designer-validation" aria-live="polite"></div>
+    </section>
+    <div class="designer-workspace">
+      <aside class="designer-catalogue" aria-labelledby="designer-catalogue-title">
+        <h2 id="designer-catalogue-title">可用架构积木</h2>
+        <p>选择积木加入右侧管线；组件版本与约束来自 Paper Lab 数据库。</p>
+        <label class="designer-filter">筛选<input id="designer-filter" name="component_filter" type="search" autocomplete="off" placeholder="检索名称、层级或说明…"></label>
+        <div id="designer-layers" class="designer-layers"></div>
+      </aside>
+      <section class="designer-selection" aria-labelledby="designer-selection-title">
+        <div class="designer-selection-heading"><div><h2 id="designer-selection-title">当前组合</h2><p id="designer-count">尚未选择积木。</p></div><button type="button" id="designer-visualize">完整架构图</button></div>
+        <ol id="designer-selected" class="designer-selected"></ol>
+      </section>
+    </div>
+  </div>
+
+  <section id="designer-tags-view" class="designer-tags-view" role="tabpanel" aria-labelledby="designer-tab-tags" hidden>
+    <header><div><h2>Tag 组件索引</h2><p>浏览原系统的细粒度方法标签、论文证据与研究员策展信息。</p></div><label>检索 Tag<input id="designer-tag-search" name="tag_search" type="search" autocomplete="off" placeholder="检索标签、层级或说明…"></label></header>
+    <p id="designer-tag-summary" role="status" aria-live="polite">正在读取 Tag 组件…</p>
+    <div id="designer-tag-grid" class="designer-tag-grid"></div>
+  </section>
+
+  <dialog id="designer-component-dialog" class="designer-component-dialog" aria-labelledby="designer-component-title">
+    <header><h2 id="designer-component-title">组件详情</h2><button type="button" id="designer-component-close" aria-label="关闭组件详情">×</button></header>
+    <div id="designer-component-content"></div>
+  </dialog>
+  <dialog id="designer-architecture-dialog" class="designer-architecture-dialog" aria-labelledby="designer-architecture-title">
+    <header><h2 id="designer-architecture-title">完整架构图</h2><div><button type="button" id="designer-download-svg">导出 SVG</button><button type="button" id="designer-download-png">导出 PNG</button><button type="button" id="designer-architecture-close" aria-label="关闭完整架构图">×</button></div></header>
+    <div id="designer-architecture-canvas" class="designer-architecture-canvas"></div>
+  </dialog>
+</main>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('paper_lab_web.static', filename='paper_lab.js') }}" defer></script>{% endblock %}

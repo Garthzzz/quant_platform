@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · Archive Evidence{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{{ url_for('evidence.static', filename='evidence.css') }}">{% endblock %}
+{% block body %}
+<main id="main-content" class="page-shell evidence-shell">
+  <section class="empty-state evidence-not-found"><p class="eyebrow">Archive Evidence</p><h1>{{ title }}</h1><p>{{ message }}</p><a href="/evidence/">返回论文目录</a></section>
+</main>
+{% endblock %}

@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS research_completion_review_consumption_no_delete;
+DROP TRIGGER IF EXISTS research_completion_review_consumption_no_update;
+DROP TRIGGER IF EXISTS research_completion_review_consumption_validate_insert;
+DROP TABLE IF EXISTS research_completion_review_consumption;

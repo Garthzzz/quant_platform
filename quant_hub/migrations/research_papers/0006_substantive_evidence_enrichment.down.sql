@@ -1,0 +1,2 @@
+DROP INDEX evidence_substantive_enrichment_pdf_sha256_idx;
+DROP TABLE evidence_substantive_enrichment;
