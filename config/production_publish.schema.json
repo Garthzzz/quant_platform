@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schema/production-publish-v1.json",
+  "title": "Quant Research Hub production publish configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "github", "vm"],
+  "properties": {
+    "schema_version": {"const": "qrh-production-publish-config/v1"},
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "repository",
+        "workflow_id",
+        "credential_target",
+        "poll_interval_seconds",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "owner": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+        "repository": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+        "workflow_id": {"type": "integer", "minimum": 1},
+        "credential_target": {
+          "description": "受保护 credential provider 的逻辑名称；不是 token。Public 阶段可为 null。",
+          "oneOf": [
+            {"type": "null"},
+            {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"}
+          ]
+        },
+        "poll_interval_seconds": {"type": "number", "minimum": 1, "maximum": 60},
+        "timeout_seconds": {"type": "number", "minimum": 10, "maximum": 3600}
+      }
+    },
+    "vm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ssh_alias", "root"],
+      "properties": {
+        "ssh_alias": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+        "root": {"const": "D:\\quant\\quant_platform"}
+      }
+    }
+  }
+}

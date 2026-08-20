@@ -177,6 +177,7 @@ def build_recovery_bundle(
     restore_tool: Path,
     runbook: Path,
     compatibility: Mapping[str, object],
+    checkpoint_scratch_root: Path | None = None,
 ) -> RecoveryBundle:
     """Create a write-once bundle under an already attested recovery root."""
 
@@ -202,7 +203,10 @@ def build_recovery_bundle(
             raise RecoveryBundleError("release manifest is not canonical")
         release_hash = manifest_sha256(release_manifest)
 
-        checkpoint_verification = verify_sqlite_checkpoint(checkpoint_root)
+        checkpoint_verification = verify_sqlite_checkpoint(
+            checkpoint_root,
+            scratch_root=checkpoint_scratch_root,
+        )
         if not checkpoint_verification.valid:
             raise RecoveryBundleError("checkpoint is not fully verified")
         checkpoint_manifest = json.loads(
@@ -291,7 +295,10 @@ def build_recovery_bundle(
             shutil.rmtree(partial, ignore_errors=True)
         raise
 
-    verification = verify_recovery_bundle(destination)
+    verification = verify_recovery_bundle(
+        destination,
+        checkpoint_scratch_root=checkpoint_scratch_root,
+    )
     if not verification.valid:
         raise RecoveryBundleError("published recovery bundle failed verification")
     return RecoveryBundle(
@@ -326,7 +333,11 @@ def _verify_sums(root: Path) -> None:
             raise RecoveryBundleError(f"SHA256SUMS mismatch: {relative}")
 
 
-def verify_recovery_bundle(root: Path) -> RecoveryVerification:
+def verify_recovery_bundle(
+    root: Path,
+    *,
+    checkpoint_scratch_root: Path | None = None,
+) -> RecoveryVerification:
     root = Path(root).resolve()
     bundle_id = release_id = checkpoint_id = None
     release_hash = checkpoint_hash = recovery_hash = None
@@ -354,7 +365,10 @@ def verify_recovery_bundle(root: Path) -> RecoveryVerification:
 
         checkpoint_ref = recovery_manifest["checkpoint"]
         checkpoint_root = root / "checkpoints" / str(checkpoint_ref["checkpoint_id"])
-        checkpoint_report = verify_sqlite_checkpoint(checkpoint_root)
+        checkpoint_report = verify_sqlite_checkpoint(
+            checkpoint_root,
+            scratch_root=checkpoint_scratch_root,
+        )
         if not checkpoint_report.valid:
             raise RecoveryBundleError("recovery checkpoint validation failed")
         checkpoint_manifest = json.loads(
@@ -435,7 +449,17 @@ def restore_recovery_bundle(*, bundle_root: Path, empty_target_root: Path) -> Re
     target = Path(empty_target_root).resolve(strict=True)
     if _is_reparse(target) or any(target.iterdir()):
         raise RecoveryBundleError("restore target must be a real empty directory")
-    report = verify_recovery_bundle(bundle_root)
+    scratch_root = target / ".recovery-verify-scratch"
+    if scratch_root.exists():
+        raise RecoveryBundleError("restore verification scratch path already exists")
+    scratch_root.mkdir()
+    try:
+        report = verify_recovery_bundle(
+            bundle_root,
+            checkpoint_scratch_root=scratch_root,
+        )
+    finally:
+        shutil.rmtree(scratch_root, ignore_errors=True)
     if not report.valid or not all(
         (
             report.release_id,

@@ -215,8 +215,16 @@ def _online_backup(source_path: Path, destination_path: Path) -> None:
         source.close()
 
 
-def _prove_restore(database_path: Path, expected: Mapping[str, object]) -> None:
-    with tempfile.TemporaryDirectory(prefix="qrh-checkpoint-restore-") as raw_root:
+def _prove_restore(
+    database_path: Path,
+    expected: Mapping[str, object],
+    *,
+    scratch_root: Path | None = None,
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="qrh-checkpoint-restore-",
+        dir=str(scratch_root) if scratch_root is not None else None,
+    ) as raw_root:
         restored = Path(raw_root) / "restored.sqlite3"
         source = _readonly_database(database_path, immutable=True)
         target = sqlite3.connect(restored, timeout=30)
@@ -233,9 +241,15 @@ def _prove_restore(database_path: Path, expected: Mapping[str, object]) -> None:
             raise CheckpointError("restored checkpoint logical counts differ")
 
 
-def _database_record(logical_name: str, relative_path: str, path: Path) -> dict[str, object]:
+def _database_record(
+    logical_name: str,
+    relative_path: str,
+    path: Path,
+    *,
+    scratch_root: Path | None = None,
+) -> dict[str, object]:
     facts = _database_facts(path)
-    _prove_restore(path, facts)
+    _prove_restore(path, facts, scratch_root=scratch_root)
     return {
         "logical_name": logical_name,
         "relative_path": relative_path,
@@ -258,6 +272,7 @@ def create_sqlite_checkpoint(
     captured_under_release_id: str,
     captured_under_manifest_sha256: str,
     captured_at: datetime | None = None,
+    scratch_root: Path | None = None,
 ) -> CheckpointCreation:
     """Create and fully restore-verify one immutable multi-database checkpoint.
 
@@ -286,6 +301,13 @@ def create_sqlite_checkpoint(
         seen_paths.add(source_path)
         normalized_sources.append((logical_name, source_path))
 
+    resolved_scratch_root: Path | None = None
+    if scratch_root is not None:
+        resolved_scratch_root = Path(scratch_root).resolve()
+        resolved_scratch_root.mkdir(parents=True, exist_ok=True)
+        if not resolved_scratch_root.is_dir():
+            raise CheckpointError("checkpoint scratch root is not a directory")
+
     capture_time = _utc(captured_at or datetime.now(UTC))
     parent = checkpoint_root.resolve()
     parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +325,12 @@ def create_sqlite_checkpoint(
             database_path = partial / Path(relative_path)
             _online_backup(source_path, database_path)
             databases.append(
-                _database_record(logical_name, relative_path, database_path)
+                _database_record(
+                    logical_name,
+                    relative_path,
+                    database_path,
+                    scratch_root=resolved_scratch_root,
+                )
             )
 
         inventory_sha256 = hashlib.sha256(
@@ -352,7 +379,10 @@ def create_sqlite_checkpoint(
             shutil.rmtree(partial, ignore_errors=True)
         raise
 
-    verification = verify_sqlite_checkpoint(destination)
+    verification = verify_sqlite_checkpoint(
+        destination,
+        scratch_root=resolved_scratch_root,
+    )
     if not verification.valid:
         # The object has already become visible and is intentionally not
         # overwritten or silently removed.  Fail closed for its caller.
@@ -377,7 +407,11 @@ def _safe_manifest_path(root: Path, relative_path: object) -> Path:
     return candidate
 
 
-def verify_sqlite_checkpoint(checkpoint_path: Path) -> CheckpointVerification:
+def verify_sqlite_checkpoint(
+    checkpoint_path: Path,
+    *,
+    scratch_root: Path | None = None,
+) -> CheckpointVerification:
     """Re-hash, inspect and restore every database in a checkpoint."""
 
     root = checkpoint_path.resolve()
@@ -440,6 +474,7 @@ def verify_sqlite_checkpoint(checkpoint_path: Path) -> CheckpointVerification:
                 logical_name,
                 str(raw_record["relative_path"]),
                 database_path,
+                scratch_root=scratch_root,
             )
             if actual != raw_record:
                 raise CheckpointError("checkpoint database evidence differs")
@@ -481,6 +516,7 @@ def evaluate_recovery_protection(
     latest_attempt_succeeded: bool = True,
     closure_valid: bool = True,
     failure_domain_attested: bool = True,
+    scratch_root: Path | None = None,
 ) -> RecoveryProtectionStatus:
     """Compute RPO from the latest *successful, fully verified* checkpoint.
 
@@ -492,7 +528,10 @@ def evaluate_recovery_protection(
     evaluated_at = _utc(now or datetime.now(UTC))
     if rpo <= timedelta(0):
         raise CheckpointError("rpo must be positive")
-    reports = [verify_sqlite_checkpoint(path) for path in checkpoints]
+    reports = [
+        verify_sqlite_checkpoint(path, scratch_root=scratch_root)
+        for path in checkpoints
+    ]
     valid_reports = [
         report
         for report in reports

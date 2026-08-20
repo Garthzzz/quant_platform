@@ -96,13 +96,17 @@ class PublishRequest:
     request_id: str
     commit_sha: str
     submitted_at: str
+    deployment_mode: str = "activate"
 
     @classmethod
-    def create(cls, commit_sha: str) -> "PublishRequest":
+    def create(
+        cls, commit_sha: str, *, deployment_mode: str = "activate"
+    ) -> "PublishRequest":
         return cls(
             request_id=f"publish-{uuid.uuid4().hex}",
             commit_sha=_full_sha(commit_sha, "commit_sha"),
             submitted_at=_now(),
+            deployment_mode=_deployment_mode(deployment_mode),
         )
 
 
@@ -126,6 +130,8 @@ class FrozenSources:
     freeze_id: str
     commit_sha: str
     inventory_sha256: str
+    release_id: str
+    release_manifest_sha256: str
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,7 @@ class VMDeployResult:
     candidate_manifest_sha256: str
     status: str
     receipt_id: str
+    receipt_type: str
 
 
 @dataclass(frozen=True)
@@ -161,7 +168,14 @@ class PublishResult:
     candidate_manifest_sha256: str
     ci_run_id: str
     deploy_receipt_id: str
+    deployment_mode: str
     status: str
+
+
+def _deployment_mode(value: object) -> str:
+    if value not in {"activate", "candidate_only"}:
+        raise PublishError("deployment_mode must be activate or candidate_only")
+    return str(value)
 
 
 InspectGit = Callable[[str], GitSnapshot]
@@ -205,7 +219,8 @@ class PublishPipeline:
     def _candidate(value: object) -> Mapping[str, object]:
         if not isinstance(value, dict) or set(value) != {
             "schema_version", "request_id", "commit_sha", "tracked_tree_sha256",
-            "source_freeze", "local_gates", "candidate_manifest_sha256",
+            "source_freeze", "release", "local_gates", "deployment_mode",
+            "candidate_manifest_sha256",
         }:
             raise PublishError("publish candidate schema is not closed")
         if value["schema_version"] != PUBLISH_CANDIDATE_SCHEMA:
@@ -228,6 +243,7 @@ class PublishPipeline:
 
     def execute(self, request: PublishRequest) -> PublishResult:
         expected_sha = _full_sha(request.commit_sha, "request.commit_sha")
+        deployment_mode = _deployment_mode(request.deployment_mode)
         snapshot = self._call("inspect_git", self.actions.inspect_git, expected_sha)
         if _full_sha(snapshot.commit_sha, "git.commit_sha") != expected_sha:
             raise PublishError("tracked tree HEAD changed before publish")
@@ -252,6 +268,8 @@ class PublishPipeline:
         if _full_sha(frozen.commit_sha, "freeze.commit_sha") != expected_sha:
             raise PublishError("frozen non-Git sources belong to another commit")
         _digest(frozen.inventory_sha256, "freeze.inventory_sha256")
+        _stable_id(frozen.release_id, "freeze.release_id")
+        _digest(frozen.release_manifest_sha256, "freeze.release_manifest_sha256")
 
         candidate: dict[str, object] = {
             "schema_version": PUBLISH_CANDIDATE_SCHEMA,
@@ -262,10 +280,15 @@ class PublishPipeline:
                 "freeze_id": frozen.freeze_id,
                 "inventory_sha256": frozen.inventory_sha256,
             },
+            "release": {
+                "release_id": frozen.release_id,
+                "manifest_sha256": frozen.release_manifest_sha256,
+            },
             "local_gates": {
                 "public_guard": public_gate.gate_id,
                 "tests": local_gate.gate_id,
             },
+            "deployment_mode": deployment_mode,
         }
         candidate["candidate_manifest_sha256"] = _sha256(candidate)
         candidate_hash = str(candidate["candidate_manifest_sha256"])
@@ -296,10 +319,15 @@ class PublishPipeline:
             raise PublishError("candidate transport did not verify the exact manifest")
         deployed = self._call("deploy_candidate", self.actions.deploy_candidate, candidate)
         self._candidate(candidate)
-        if (
-            deployed.status not in {"activated", "candidate_validated"}
-            or deployed.candidate_manifest_sha256 != candidate_hash
-        ):
+        expected_deploy = (
+            ("activated", "activation")
+            if deployment_mode == "activate"
+            else ("candidate_validated", "candidate_validation")
+        )
+        if deployed.candidate_manifest_sha256 != candidate_hash or (
+            deployed.status,
+            deployed.receipt_type,
+        ) != expected_deploy:
             raise PublishError("VM deploy did not return the exact candidate identity")
         _stable_id(deployed.receipt_id, "deploy.receipt_id")
         return PublishResult(
@@ -308,6 +336,7 @@ class PublishPipeline:
             candidate_manifest_sha256=candidate_hash,
             ci_run_id=ci.run_id,
             deploy_receipt_id=deployed.receipt_id,
+            deployment_mode=deployment_mode,
             status=deployed.status,
         )
 
@@ -371,6 +400,7 @@ class PublishQueue:
                 raise PublishError("publish request record is invalid")
             _stable_id(request_id, "stored request_id")
             _full_sha(record.get("commit_sha"), "stored commit_sha")
+            _deployment_mode(record.get("deployment_mode"))
             if record.get("status") not in TERMINAL | {"running", "pending"}:
                 raise PublishError("publish request status is invalid")
         return value
@@ -433,6 +463,7 @@ class PublishQueue:
             "request_id": _stable_id(request.request_id, "request_id"),
             "commit_sha": _full_sha(request.commit_sha, "commit_sha"),
             "submitted_at": request.submitted_at,
+            "deployment_mode": _deployment_mode(request.deployment_mode),
             "status": status,
             "superseded_by": None,
             "error": None,
@@ -536,6 +567,7 @@ class PublishQueue:
                 request_id=str(record["request_id"]),
                 commit_sha=str(record["commit_sha"]),
                 submitted_at=str(record["submitted_at"]),
+                deployment_mode=str(record["deployment_mode"]),
             )
 
 
@@ -591,7 +623,12 @@ def inspect_local_git(project_root: Path, expected_sha: str) -> GitSnapshot:
     )
 
 
-def dry_run_plan(project_root: Path, expected_sha: str | None = None) -> Mapping[str, object]:
+def dry_run_plan(
+    project_root: Path,
+    expected_sha: str | None = None,
+    *,
+    deployment_mode: str = "activate",
+) -> Mapping[str, object]:
     """只读验证 CLI 拓扑；绝不调用 push、CI、transport 或 deploy。"""
 
     root = project_root.resolve(strict=True)
@@ -612,6 +649,7 @@ def dry_run_plan(project_root: Path, expected_sha: str | None = None) -> Mapping
         "project_root": str(root),
         "commit_sha": snapshot.commit_sha,
         "tracked_clean": snapshot.tracked_clean,
+        "deployment_mode": _deployment_mode(deployment_mode),
         "steps": [
             "public_guard", "local_test_gate", "freeze_non_git_sources",
             "push_once", "wait_exact_sha_ci", "incremental_candidate_transport",
@@ -626,13 +664,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--commit-sha")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="显式无生产切换候选演练；默认 publish 必须完成 activation",
+    )
     args = parser.parse_args(argv)
     if not args.dry_run:
         parser.error(
             "production adapters must be supplied by the controlled runtime; "
             "the standalone core only permits --dry-run"
         )
-    result = dry_run_plan(args.project_root, args.commit_sha)
+    result = dry_run_plan(
+        args.project_root,
+        args.commit_sha,
+        deployment_mode="candidate_only" if args.candidate_only else "activate",
+    )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

@@ -10,6 +10,7 @@ import tempfile
 import unittest
 import subprocess
 import sys
+from unittest.mock import patch
 
 from quant_hub.collaboration.checkpoint import create_sqlite_checkpoint
 from quant_hub.ops.recovery_bundle import (
@@ -236,6 +237,29 @@ class RecoveryBundleTests(unittest.TestCase):
         (target / "keep.txt").write_text("keep", encoding="utf-8")
         with self.assertRaisesRegex(RecoveryBundleError, "real empty"):
             restore_recovery_bundle(bundle_root=bundle.root, empty_target_root=target)
+
+    def test_restore_verification_scratch_stays_under_empty_target(self) -> None:
+        bundle = self._build()
+        target = self.root / "bounded-empty-target"
+        target.mkdir()
+        original = tempfile.TemporaryDirectory
+        observed: list[Path | None] = []
+
+        def tracked(*args, **kwargs):
+            raw_dir = kwargs.get("dir")
+            observed.append(Path(raw_dir) if raw_dir is not None else None)
+            return original(*args, **kwargs)
+
+        with patch(
+            "quant_hub.collaboration.checkpoint.tempfile.TemporaryDirectory",
+            side_effect=tracked,
+        ):
+            restore_recovery_bundle(bundle_root=bundle.root, empty_target_root=target)
+        self.assertTrue(observed)
+        self.assertTrue(
+            all(path is not None and path.is_relative_to(target) for path in observed)
+        )
+        self.assertFalse((target / ".recovery-verify-scratch").exists())
 
 
 if __name__ == "__main__":

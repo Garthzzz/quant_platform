@@ -73,7 +73,9 @@ class FakeActions:
 
     def freeze(self, snapshot: GitSnapshot) -> FrozenSources:
         self.calls.append(("freeze", snapshot.commit_sha))
-        return FrozenSources("freeze-1", snapshot.commit_sha, "b" * 64)
+        return FrozenSources(
+            "freeze-1", snapshot.commit_sha, "b" * 64, "release-1", "c" * 64
+        )
 
     def push(self, sha: str) -> PushResult:
         self.calls.append(("push", sha))
@@ -91,7 +93,10 @@ class FakeActions:
     def deploy(self, candidate):
         self.calls.append(("deploy", str(candidate["commit_sha"])))
         return VMDeployResult(
-            str(candidate["candidate_manifest_sha256"]), "activated", "activation-1"
+            str(candidate["candidate_manifest_sha256"]),
+            "activated",
+            "activation-1",
+            "activation",
         )
 
 
@@ -109,6 +114,47 @@ class PublishPipelineTests(unittest.TestCase):
         )
         self.assertTrue(all(sha == SHA_A for _, sha in fake.calls))
         self.assertEqual(64, len(result.candidate_manifest_sha256))
+        self.assertEqual("activate", result.deployment_mode)
+
+    def test_default_publish_rejects_candidate_only_result(self) -> None:
+        fake = FakeActions()
+
+        def candidate_only(candidate):
+            return VMDeployResult(
+                str(candidate["candidate_manifest_sha256"]),
+                "candidate_validated",
+                "candidate-validation-1",
+                "candidate_validation",
+            )
+
+        actions = fake.bundle()
+        actions = PublishActions(**{**actions.__dict__, "deploy_candidate": candidate_only})
+        with self.assertRaisesRegex(PublishError, "exact candidate identity"):
+            PublishPipeline(actions).execute(
+                PublishRequest("request-a", SHA_A, "2026-08-21T00:00:00Z")
+            )
+
+    def test_explicit_candidate_only_accepts_validation_but_not_activation(self) -> None:
+        fake = FakeActions()
+
+        def candidate_only(candidate):
+            self.assertEqual("candidate_only", candidate["deployment_mode"])
+            return VMDeployResult(
+                str(candidate["candidate_manifest_sha256"]),
+                "candidate_validated",
+                "candidate-validation-1",
+                "candidate_validation",
+            )
+
+        actions = fake.bundle()
+        actions = PublishActions(**{**actions.__dict__, "deploy_candidate": candidate_only})
+        result = PublishPipeline(actions).execute(
+            PublishRequest(
+                "request-a", SHA_A, "2026-08-21T00:00:00Z", "candidate_only"
+            )
+        )
+        self.assertEqual("candidate_validated", result.status)
+        self.assertEqual("candidate_only", result.deployment_mode)
 
     def test_exact_sha_ci_mismatch_stops_before_transport(self) -> None:
         fake = FakeActions()

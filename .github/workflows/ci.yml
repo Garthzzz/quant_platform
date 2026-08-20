@@ -46,12 +46,14 @@ jobs:
           tests.test_release_builder
           tests.test_release_identity
           tests.test_sqlite_checkpoint
+          tests.test_checkpoint_cli
           tests.test_failure_domain
           tests.test_failure_domain_cli
           tests.test_vm_boundary
           tests.test_recovery_bundle
           tests.test_deployment_controller
           tests.test_publish_cli
+          tests.test_publish_adapters
           tests.test_knowledge_reference_compiler
           tests.test_generic_research_renderer
           -v

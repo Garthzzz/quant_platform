@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from unittest.mock import patch
 
 from quant_hub.collaboration.checkpoint import (
     CHECKPOINT_MANIFEST_HASH_NAME,
@@ -133,6 +134,36 @@ class SQLiteCheckpointTests(unittest.TestCase):
         writer.commit()
         self.assertEqual(1, records["comments"]["logical_counts"]["comment"])
         self.assertTrue(verify_sqlite_checkpoint(created.root).valid)
+
+    def test_restore_proof_uses_explicit_scratch_root_when_supplied(self) -> None:
+        scratch = self.root / "vm-approved-scratch"
+        original = tempfile.TemporaryDirectory
+        observed: list[Path | None] = []
+
+        def tracked(*args, **kwargs):
+            raw_dir = kwargs.get("dir")
+            observed.append(Path(raw_dir) if raw_dir is not None else None)
+            return original(*args, **kwargs)
+
+        with patch(
+            "quant_hub.collaboration.checkpoint.tempfile.TemporaryDirectory",
+            side_effect=tracked,
+        ):
+            created = create_sqlite_checkpoint(
+                sources={"comments": self.comments},
+                checkpoint_root=self.checkpoint_root,
+                checkpoint_id="checkpoint-explicit-scratch",
+                state_authority_id="quant-platform-d-state",
+                captured_under_release_id="release-v39-test",
+                captured_under_manifest_sha256=self.release_hash,
+                captured_at=self.captured_at,
+                scratch_root=scratch,
+            )
+        self.assertTrue(verify_sqlite_checkpoint(created.root).valid)
+        # Creation proves the copied databases and then re-verifies the whole
+        # immutable checkpoint; both restore probes must stay in D scratch.
+        self.assertEqual([scratch.resolve(), scratch.resolve()], observed)
+        self.assertEqual([], list(scratch.iterdir()))
 
     def test_reusing_checkpoint_id_fails_without_changing_existing_bytes(self) -> None:
         created = self._create()
