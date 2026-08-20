@@ -1,8 +1,8 @@
 """从显式 mapping policy 构建可审核的全量 Archive release manifests。
 
-该工具不发布、不写 Archive 源，也不根据文件名自行决定 research 身份。路径规则是
-待独立审核的输入 policy；输出同时列出全部纳入、排除和未分配 Markdown，任何未分配
-或多重分配都会失败。
+该工具不发布、不写 Archive 源。既有 curated research 仍由审核过的 mapping policy
+决定；没有命中旧分组的正常新 Markdown 走统一 default-publishable policy，并明确
+handoff 给 deterministic generic compiler。异常/隔离项没有显式处理时仍 fail closed。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from quant_hub.archive.source_reader import ReadOnlyArchiveSource
+from quant_hub.knowledge.policy import SourcePolicy
 
 
 FORMAL_ROOT = Path(__file__).resolve().parents[1]
@@ -94,6 +95,7 @@ def build(policy_path: Path, archive_root: Path) -> tuple[dict[str, Any], dict[s
     authority = str(policy["mapping_authority_urn"])
     assignments: dict[str, str] = {}
     excluded: list[dict[str, str]] = []
+    generic_documents: list[dict[str, Any]] = []
     release_files: dict[str, bytes] = {}
     group_index: list[dict[str, Any]] = []
 
@@ -218,7 +220,25 @@ def build(policy_path: Path, archive_root: Path) -> tuple[dict[str, Any], dict[s
                 matched_group = str(group["research_slug"])
                 break
         if not matched_reason:
-            raise ValueError(f"unassigned Markdown has no exclusion reason: {relative_path}")
+            snapshot = reader.snapshot(relative_path)
+            decision = SourcePolicy().evaluate(relative_path, snapshot.content)
+            if decision.publishable:
+                generic_documents.append(
+                    {
+                        "path": relative_path,
+                        "bytes": snapshot.bytes,
+                        "sha256": snapshot.sha256,
+                        "source_class": decision.source_class,
+                        "policy_version": SourcePolicy().config.policy_version,
+                        "external_ai_allowed": decision.external_ai_allowed,
+                        "handoff": "deterministic_reference_compiler",
+                    }
+                )
+                continue
+            raise ValueError(
+                "unassigned Markdown is not default-publishable and has no explicit "
+                f"quarantine/exclusion handling: {relative_path} ({decision.reason_code})"
+            )
         excluded.append(
             {
                 "path": relative_path,
@@ -263,6 +283,7 @@ def build(policy_path: Path, archive_root: Path) -> tuple[dict[str, Any], dict[s
         },
         "coverage": {
             "assigned_count": len(assignments),
+            "generic_count": len(generic_documents),
             "excluded_count": len(excluded),
             "unassigned_count": 0,
             "multiply_assigned_count": 0,
@@ -270,6 +291,7 @@ def build(policy_path: Path, archive_root: Path) -> tuple[dict[str, Any], dict[s
         "groups": group_index,
         "bootstrap_releases": bootstrap_releases,
         "excluded": excluded,
+        "generic_documents": generic_documents,
     }
     release_files["index.json"] = canonical_json(index).encode("utf-8")
     release_files["source_manifest.tsv"] = source_manifest + b"\n"

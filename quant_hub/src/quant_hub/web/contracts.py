@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from quant_hub.archive.contracts import ActorInput, Slug, TopicId
+from quant_hub.collaboration.comment_anchors import CommentTargetInput
 
 
 ResearchId = Annotated[str, StringConstraints(pattern=r"^res_[0-9a-f]{32}$")]
@@ -36,11 +37,76 @@ class ApiEnvelope(BaseModel):
         return self
 
 
+class CommentTargetCreate(BaseModel):
+    """Optional generic-renderer target; legacy clients omit it unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_kind: Literal["document", "block", "span"]
+    document_id: str = Field(min_length=1, max_length=128)
+    origin_document_version_id: str | None = Field(default=None, min_length=1, max_length=128)
+    origin_source_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    origin_block_type: str | None = Field(
+        default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$"
+    )
+    origin_start_byte: int | None = Field(default=None, ge=0)
+    origin_end_byte: int | None = Field(default=None, gt=0)
+    origin_exact_text: str | None = Field(default=None, min_length=1, max_length=20_000)
+    structural_context: dict[str, Any] | None = None
+    locator: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def validate_complete_target(self) -> Self:
+        self.to_domain().normalized()
+        return self
+
+    def to_domain(self) -> CommentTargetInput:
+        if self.target_kind == "document":
+            return CommentTargetInput.document(self.document_id)
+        if any(
+            value is None
+            for value in (
+                self.origin_document_version_id,
+                self.origin_source_sha256,
+                self.origin_block_type,
+                self.origin_start_byte,
+                self.origin_end_byte,
+                self.origin_exact_text,
+                self.structural_context,
+                self.locator,
+            )
+        ):
+            raise ValueError("block/span comment target requires a complete origin anchor")
+        assert self.origin_document_version_id is not None
+        assert self.origin_source_sha256 is not None
+        assert self.origin_block_type is not None
+        assert self.origin_start_byte is not None
+        assert self.origin_end_byte is not None
+        assert self.origin_exact_text is not None
+        assert self.structural_context is not None
+        assert self.locator is not None
+        return CommentTargetInput.anchored(
+            target_kind=self.target_kind,
+            document_id=self.document_id,
+            origin_document_version_id=self.origin_document_version_id,
+            origin_source_sha256=self.origin_source_sha256,
+            origin_block_type=self.origin_block_type,
+            origin_start_byte=self.origin_start_byte,
+            origin_end_byte=self.origin_end_byte,
+            origin_exact_bytes=self.origin_exact_text.encode("utf-8"),
+            structural_context=self.structural_context,
+            locator=self.locator,
+        )
+
+
 class CommentCreate(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     actor: ActorInput
     content: str = Field(min_length=1, max_length=8_000)
+    target: CommentTargetCreate | None = None
 
 
 class CommentUpdate(BaseModel):

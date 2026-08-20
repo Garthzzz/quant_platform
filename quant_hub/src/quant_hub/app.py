@@ -15,6 +15,7 @@ from quant_hub.collaboration.service import ArchiveCollaboration
 from quant_hub.config import Settings
 from quant_hub.evidence.service import EvidenceQueryService
 from quant_hub.evidence.web import create_evidence_blueprint
+from quant_hub.generic_research import GenericResearchCatalog, generic_research_web
 from quant_hub.paper_lab import register_paper_lab
 from quant_hub.research_workspace import ResearchWorkspace
 from quant_hub.web.routes import api_error, api_v1, web
@@ -49,6 +50,7 @@ def create_app(
         INITIALIZE_ARCHIVE_CATALOG=True,
         COMMENT_DATABASE_PATH=None,
         RESEARCH_WORKSPACE_DATABASE_PATH=None,
+        GENERIC_RESEARCH_CATALOG=None,
     )
     if config:
         app.config.update(config)
@@ -95,9 +97,15 @@ def create_app(
     app.extensions["trusted_origins"] = compile_trusted_origins(
         app.config["TRUSTED_ORIGINS"]
     )
+    generic_catalog = app.config.get("GENERIC_RESEARCH_CATALOG")
+    if generic_catalog is not None:
+        if not isinstance(generic_catalog, GenericResearchCatalog):
+            raise TypeError("GENERIC_RESEARCH_CATALOG must be a GenericResearchCatalog")
+        app.extensions["generic_research_catalog"] = generic_catalog
 
     app.register_blueprint(web)
     app.register_blueprint(api_v1)
+    app.register_blueprint(generic_research_web)
     app.register_blueprint(create_evidence_blueprint(resolved))
     register_paper_lab(app, resolved)
 

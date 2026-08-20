@@ -1,0 +1,145 @@
+{% extends "base.html" %}
+{% block title %}{{ page.title }} · 通用研究{% endblock %}
+{% block extra_head %}
+  <link rel="stylesheet" href="{{ url_for('generic_research.static', filename='generic.css') }}">
+{% endblock %}
+{% block body %}
+<main id="main-content" class="qrh-generic" data-generic-document data-snapshot-id="{{ page.snapshot_id }}" data-document-version-id="{{ page.version_id }}">
+  <header class="qrh-generic__header">
+    <nav class="qrh-generic__breadcrumb" aria-label="面包屑">
+      <a href="{{ url_for('web.home_page') }}">研究首页</a>
+      <span aria-hidden="true">/</span>
+      <span>新增通用研究</span>
+    </nav>
+    <p class="qrh-generic__eyebrow">确定性研究视图</p>
+    <h1>{{ page.title }}</h1>
+    <p class="qrh-generic__boundary">正文由不可变来源逐字节投影；导航、定位、版本和知识卡属于独立展示层，不改写原文。</p>
+    {% if page.is_current %}
+      <span class="qrh-generic__status qrh-generic__status--current">当前有效版本</span>
+    {% else %}
+      <span class="qrh-generic__status qrh-generic__status--history">历史版本</span>
+    {% endif %}
+  </header>
+
+  <div class="qrh-generic__layout">
+    <aside class="qrh-generic__rail" aria-label="文档导航与身份">
+      <section class="qrh-generic__identity" aria-labelledby="generic-identity-title">
+        <h2 id="generic-identity-title">版本身份</h2>
+        <dl>
+          <div><dt>Snapshot</dt><dd><code>{{ page.snapshot_id }}</code></dd></div>
+          <div><dt>Document</dt><dd><code>{{ page.document_id }}</code></dd></div>
+          <div><dt>Version</dt><dd><code>{{ page.version_id }}</code></dd></div>
+          <div><dt>Source</dt><dd><code>{{ page.source_sha256 }}</code></dd></div>
+          <div><dt>路径</dt><dd>{{ page.logical_path }}</dd></div>
+          <div><dt>字节</dt><dd>{{ page.source_bytes }}</dd></div>
+        </dl>
+        <a class="qrh-generic__source-link" href="{{ url_for('generic_research.source_document', document_id=page.document_id, version_id=page.version_id) }}">下载此版本原文</a>
+      </section>
+
+      <nav class="qrh-generic__toc" aria-labelledby="generic-toc-title">
+        <h2 id="generic-toc-title">本页目录</h2>
+        <ol>
+        {% for item in page.toc %}
+          <li class="qrh-generic__toc-level-{{ item.heading_level }}" data-heading-level="{{ item.heading_level }}">
+            <a href="#{{ item.heading_anchor }}">{{ item.label }}</a>
+            <small>行 {{ item.line_start }}{% if item.line_end != item.line_start %}–{{ item.line_end }}{% endif %}</small>
+          </li>
+        {% endfor %}
+        </ol>
+      </nav>
+    </aside>
+
+    <div class="qrh-generic__reading-column">
+      <section class="qrh-generic__knowledge" aria-labelledby="generic-knowledge-title" data-knowledge-status="{{ page.knowledge_status }}">
+        <div class="qrh-generic__section-heading">
+          <div><p class="qrh-generic__eyebrow">结构化知识</p><h2 id="generic-knowledge-title">已验证知识</h2></div>
+          <span class="qrh-generic__knowledge-state">{{ page.knowledge_status }}</span>
+        </div>
+        {% if page.knowledge_cards %}
+          <div class="qrh-generic__knowledge-grid">
+          {% for card in page.knowledge_cards %}
+            <article class="qrh-generic__knowledge-card" data-knowledge-id="{{ card.knowledge_id }}">
+              <p class="qrh-generic__knowledge-kind">{{ card.kind }}</p>
+              <h3>{{ card.title }}</h3>
+              <p>{{ card.statement }}</p>
+              <details>
+                <summary>查看原文定位</summary>
+                <ul>
+                {% for locator in page.knowledge_evidence[card.knowledge_id] %}
+                  <li><code>{{ locator.span_id }}</code> · 行 {{ locator.line_start }}–{{ locator.line_end }} · bytes {{ locator.byte_start }}–{{ locator.byte_end }}<br>{{ locator.label }}</li>
+                {% endfor %}
+                </ul>
+              </details>
+            </article>
+          {% endfor %}
+          </div>
+        {% else %}
+          <p class="qrh-generic__pending" role="status">知识增强 {{ page.knowledge_status }}；当前仅展示确定性页面和检索结构，不以旧版本知识冒充当前结论。</p>
+        {% endif %}
+      </section>
+
+      <article class="qrh-generic__document" aria-labelledby="generic-document-title">
+        <header class="qrh-generic__section-heading">
+          <div><p class="qrh-generic__eyebrow">原文投影</p><h2 id="generic-document-title">研究正文</h2></div>
+          <span>UTF-8 · byte exact</span>
+        </header>
+        <div class="qrh-generic__body research-body">{{ rendered_html }}</div>
+      </article>
+
+      <section class="qrh-generic__references" aria-labelledby="generic-reference-title">
+        <div class="qrh-generic__section-heading">
+          <div><p class="qrh-generic__eyebrow">来源追踪</p><h2 id="generic-reference-title">引用与资源定位</h2></div>
+          <span>{{ page.references|length }} 项</span>
+        </div>
+        {% if page.references %}
+        <ol>
+        {% for item in page.references %}
+          <li id="source-{{ item.span_id }}">
+            {% if item.href %}<a href="{{ item.href }}" target="_blank" rel="noopener noreferrer">{{ item.label }}</a>{% else %}{{ item.label }}{% endif %}
+            <small>行 {{ item.line_start }}–{{ item.line_end }} · bytes {{ item.byte_start }}–{{ item.byte_end }} · {{ item.kind }}</small>
+          </li>
+        {% endfor %}
+        </ol>
+        {% else %}
+        <p>本版本没有可定位的结构化引用 occurrence。</p>
+        {% endif %}
+      </section>
+
+      <section class="qrh-generic__versions" aria-labelledby="generic-version-title">
+        <div class="qrh-generic__section-heading"><h2 id="generic-version-title">版本历史</h2></div>
+        <ol>
+        {% for version in page.versions %}
+          <li{% if version.version_id == page.version_id %} aria-current="page"{% endif %}>
+            <a href="{{ url_for('generic_research.version_document', document_id=page.document_id, version_id=version.version_id) }}"><code>{{ version.version_id }}</code></a>
+            {% if version.is_current %}<strong>当前</strong>{% else %}<span>历史</span>{% endif %}
+            <small>{{ version.logical_path }} · {{ version.source_sha256 }}</small>
+          </li>
+        {% endfor %}
+        </ol>
+      </section>
+    </div>
+  </div>
+
+  <dialog id="citation-dialog" class="citation-dialog" data-citation-dialog data-endpoint-prefix="/api/v1/evidence/citations/" aria-labelledby="citation-dialog-title">
+    <div class="citation-dialog__surface">
+      <header class="citation-dialog__header">
+        <div><p class="qrh-generic__eyebrow">来源追踪</p><h2 id="citation-dialog-title">引用证据</h2></div>
+        <button type="button" class="citation-dialog__close" data-citation-close aria-label="关闭引用证据">关闭</button>
+      </header>
+      <div class="citation-dialog__status" data-citation-status role="status" aria-live="polite"></div>
+      <div class="citation-dialog__content" data-citation-content hidden>
+        <div class="citation-state-row"><span class="citation-state" data-citation-resolution></span><code data-citation-id></code></div>
+        <dl class="citation-context">
+          <div><dt>原文线索</dt><dd data-citation-marker></dd></div>
+          <div><dt>正文位置</dt><dd data-citation-location></dd></div>
+          <div><dt>上下文</dt><dd data-citation-context></dd></div>
+        </dl>
+        <section aria-labelledby="citation-entries-title">
+          <h3 id="citation-entries-title">绑定与核验状态</h3>
+          <ol class="citation-entry-list" data-citation-entries></ol>
+        </section>
+      </div>
+    </div>
+  </dialog>
+</main>
+{% endblock %}

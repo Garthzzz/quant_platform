@@ -139,9 +139,9 @@ class ArchivePresentationTests(unittest.TestCase):
 
         before = tree_identity()
         self.assertEqual(
-            # 2026-07-30 用户将完整 Yao 实验包（63 files /
-            # 21,592,279 bytes）加入只读 Archive；冻结基线只提升这一批来源。
-            (226, 37_808_488, "6f4873f95ce3ca395e8c512508922d6050ddb9c240dd11ff68934a8deec61b3a"),
+            # 2026-07-30 的 Yao 实验包和 2026-08-11 新增的两篇根级研究均只读；
+            # 新研究由 default-publishable generic intake 接管，不要求修改 curated policy。
+            (228, 37_838_987, "ac642e80df0a355aced727bb9e69b1c4ea8ffa4004dd79dab2af6a7d8fb834a5"),
             before,
         )
 

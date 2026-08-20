@@ -436,7 +436,7 @@ def run(
     discovery_after = ArchiveDiscoveryScanner(settings).scan()
     expected_unmapped = int(index["coverage"]["excluded_count"]) + int(
         index["coverage"]["unassigned_count"]
-    )
+    ) + int(index["coverage"].get("generic_count", 0))
     expected_mapped = expected_markdown - expected_unmapped
     if (
         discovery_after.status != "PASS"

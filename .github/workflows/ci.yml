@@ -40,7 +40,19 @@ jobs:
           tests.test_migrations
           tests.test_objects
           tests.test_comment_store
+          tests.test_comment_anchor_projection
           tests.test_web_security
+          tests.test_release_inventory
+          tests.test_release_builder
+          tests.test_release_identity
+          tests.test_sqlite_checkpoint
+          tests.test_failure_domain
+          tests.test_vm_boundary
+          tests.test_recovery_bundle
+          tests.test_deployment_controller
+          tests.test_publish_cli
+          tests.test_knowledge_reference_compiler
+          tests.test_generic_research_renderer
           -v
       - name: Validate OpenSpec
         shell: pwsh

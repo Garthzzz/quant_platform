@@ -59,7 +59,7 @@ class FullArchiveReplayTests(unittest.TestCase):
         )
         expected_unmapped = int(index["coverage"]["excluded_count"]) + int(
             index["coverage"]["unassigned_count"]
-        )
+        ) + int(index["coverage"].get("generic_count", 0))
         # This is deliberately a test-only review artifact. Production replay must
         # consume the separately persisted independent reviewer verdict.
         review = {

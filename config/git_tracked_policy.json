@@ -15,6 +15,7 @@
     ".codex/",
     ".github/",
     "config/",
+    "docs/runbooks/",
     "openspec/changes/design-vm-knowledge-mcp/",
     "quant_hub/migrations/",
     "quant_hub/paper_lab/pipeline/",
@@ -63,4 +64,3 @@
   ],
   "large_file_block_bytes": 5242880
 }
-

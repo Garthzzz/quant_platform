@@ -1685,6 +1685,7 @@ def create_comment(research_id: str) -> Response:
             payload.actor,
             payload.content,
             idempotency_key=key,
+            target=payload.target.to_domain() if payload.target is not None else None,
         )
     except IdempotencyConflict as error:
         return _idempotency_conflict(error)

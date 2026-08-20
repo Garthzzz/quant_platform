@@ -27,6 +27,7 @@ paper-lab-query = "quant_hub.paper_lab.compat:query_main"
 paper-lab-components = "quant_hub.paper_lab.compat:component_main"
 paper-lab-import = "quant_hub.paper_lab.compat:legacy_import_main"
 paper-lab-viewer = "quant_hub.paper_lab.compat:viewer_main"
+qrh-publish = "quant_hub.ops.publish:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -36,6 +37,10 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "quant_hub.web" = ["templates/*.html", "static/*.css", "static/*.js"]
+"quant_hub.generic_research" = [
+  "templates/generic_research/*.html",
+  "static/*.css",
+]
 "quant_hub.evidence" = [
   "templates/evidence/*.html",
   "static/*.css",

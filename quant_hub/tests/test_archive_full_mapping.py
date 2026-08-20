@@ -40,6 +40,7 @@ class FullArchiveMappingTests(unittest.TestCase):
         self.assertEqual(
             index["source"]["markdown_count"],
             index["coverage"]["assigned_count"]
+            + index["coverage"].get("generic_count", 0)
             + index["coverage"]["excluded_count"]
             + index["coverage"]["unassigned_count"],
         )
@@ -78,10 +79,17 @@ class FullArchiveMappingTests(unittest.TestCase):
         self.assertEqual(index["coverage"]["assigned_count"], document_count)
 
         excluded = {row["path"] for row in index["excluded"]}
+        generic = {row["path"] for row in index.get("generic_documents", [])}
         self.assertEqual(index["coverage"]["excluded_count"], len(excluded))
+        self.assertEqual(index["coverage"].get("generic_count", 0), len(generic))
+        self.assertTrue(
+            all(row["handoff"] == "deterministic_reference_compiler" for row in index.get("generic_documents", []))
+        )
         self.assertTrue(all(row["reason"].strip() for row in index["excluded"]))
         self.assertFalse(assigned & excluded)
-        self.assertEqual(markdown, assigned | excluded)
+        self.assertFalse(assigned & generic)
+        self.assertFalse(excluded & generic)
+        self.assertEqual(markdown, assigned | excluded | generic)
 
     def test_generated_mapping_is_byte_deterministic_and_uses_utf8_lf(self) -> None:
         expected = tree_bytes(GENERATED_ROOT)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import sqlite3
 from typing import Any
 
 from quant_hub.config import ConfigurationError
+from quant_hub.collaboration.comment_anchors import COMMENT_TARGET_SCHEMA_VERSION
 from quant_hub.ids import new_public_id
 from quant_hub.platform.db import connect_database, immediate_transaction, utc_now
 
@@ -212,6 +214,108 @@ END;
 CREATE TRIGGER IF NOT EXISTS progress_command_receipt_no_delete
 BEFORE DELETE ON progress_command_receipt BEGIN
  SELECT RAISE(ABORT,'progress command receipts are immutable');
+END;
+"""
+
+# The core version deliberately remains v2.  V39's initializer accepts unknown
+# additive tables but rejects an extra row in comment_store_schema, so recording
+# target v3 in that legacy table would make a retained prior release unable to
+# start.  The extension marker and tables below are an expand-only schema: old
+# code ignores them and keeps its v2 read/write behavior, while current code can
+# deterministically project versioned anchors.
+_COMMENT_TARGET_SCHEMA = """
+CREATE TABLE IF NOT EXISTS comment_target_schema(
+    version INTEGER PRIMARY KEY CHECK(version=3),
+    applied_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS comment_target(
+    comment_target_id TEXT PRIMARY KEY,
+    comment_id TEXT NOT NULL UNIQUE REFERENCES comment(comment_id) ON DELETE RESTRICT,
+    target_kind TEXT NOT NULL CHECK(target_kind IN ('research','document','block','span')),
+    research_id TEXT NOT NULL,
+    document_id TEXT,
+    origin_document_version_id TEXT,
+    origin_source_sha256 TEXT CHECK(
+        origin_source_sha256 IS NULL OR (
+            length(origin_source_sha256)=64
+            AND origin_source_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    origin_block_type TEXT,
+    origin_start_byte INTEGER CHECK(origin_start_byte IS NULL OR origin_start_byte>=0),
+    origin_end_byte INTEGER CHECK(origin_end_byte IS NULL OR origin_end_byte>0),
+    origin_exact_bytes BLOB,
+    origin_exact_bytes_sha256 TEXT CHECK(
+        origin_exact_bytes_sha256 IS NULL OR (
+            length(origin_exact_bytes_sha256)=64
+            AND origin_exact_bytes_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    origin_structural_context_json TEXT CHECK(
+        origin_structural_context_json IS NULL OR json_valid(origin_structural_context_json)
+    ),
+    origin_structural_context_sha256 TEXT CHECK(
+        origin_structural_context_sha256 IS NULL OR (
+            length(origin_structural_context_sha256)=64
+            AND origin_structural_context_sha256 NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    origin_locator_json TEXT CHECK(
+        origin_locator_json IS NULL OR json_valid(origin_locator_json)
+    ),
+    locator_schema_version TEXT,
+    created_at TEXT NOT NULL,
+    CHECK(
+        (target_kind='research' AND document_id IS NULL
+         AND origin_document_version_id IS NULL AND origin_source_sha256 IS NULL
+         AND origin_block_type IS NULL AND origin_start_byte IS NULL
+         AND origin_end_byte IS NULL AND origin_exact_bytes IS NULL
+         AND origin_exact_bytes_sha256 IS NULL
+         AND origin_structural_context_json IS NULL
+         AND origin_structural_context_sha256 IS NULL
+         AND origin_locator_json IS NULL AND locator_schema_version IS NULL)
+        OR
+        (target_kind='document' AND document_id IS NOT NULL
+         AND origin_document_version_id IS NULL AND origin_source_sha256 IS NULL
+         AND origin_block_type IS NULL AND origin_start_byte IS NULL
+         AND origin_end_byte IS NULL AND origin_exact_bytes IS NULL
+         AND origin_exact_bytes_sha256 IS NULL
+         AND origin_structural_context_json IS NULL
+         AND origin_structural_context_sha256 IS NULL
+         AND origin_locator_json IS NULL AND locator_schema_version IS NULL)
+        OR
+        (target_kind IN ('block','span') AND document_id IS NOT NULL
+         AND origin_document_version_id IS NOT NULL
+         AND origin_source_sha256 IS NOT NULL AND origin_block_type IS NOT NULL
+         AND origin_start_byte IS NOT NULL AND origin_end_byte IS NOT NULL
+         AND origin_end_byte>origin_start_byte
+         AND length(origin_exact_bytes)=origin_end_byte-origin_start_byte
+         AND origin_exact_bytes_sha256 IS NOT NULL
+         AND origin_structural_context_json IS NOT NULL
+         AND origin_structural_context_sha256 IS NOT NULL
+         AND origin_locator_json IS NOT NULL
+         AND locator_schema_version='comment-locator/v1')
+    )
+) STRICT;
+CREATE INDEX IF NOT EXISTS comment_target_document_idx
+ON comment_target(research_id,document_id,target_kind,comment_id);
+CREATE INDEX IF NOT EXISTS comment_target_origin_version_idx
+ON comment_target(origin_document_version_id,comment_id);
+CREATE TRIGGER IF NOT EXISTS comment_target_comment_identity
+BEFORE INSERT ON comment_target
+WHEN NEW.research_id<>(
+    SELECT research_id FROM comment WHERE comment_id=NEW.comment_id
+)
+BEGIN
+ SELECT RAISE(ABORT,'comment target must preserve stable research identity');
+END;
+CREATE TRIGGER IF NOT EXISTS comment_target_no_update
+BEFORE UPDATE ON comment_target BEGIN
+ SELECT RAISE(ABORT,'comment origin targets are immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS comment_target_no_delete
+BEFORE DELETE ON comment_target BEGIN
+ SELECT RAISE(ABORT,'comment origin targets are immutable');
 END;
 """
 
@@ -630,6 +734,39 @@ def _import_misclassified_workspace_progress(
     return counts
 
 
+def _backfill_legacy_comment_targets(connection: sqlite3.Connection) -> int:
+    """Give v2 comments a stable research-level target without touching facts."""
+
+    rows = connection.execute(
+        """
+        SELECT comment_id,research_id,created_at
+        FROM comment AS comment_row
+        WHERE NOT EXISTS(
+            SELECT 1 FROM comment_target AS target
+            WHERE target.comment_id=comment_row.comment_id
+        )
+        ORDER BY created_at,comment_id
+        """
+    ).fetchall()
+    for row in rows:
+        comment_id = str(row["comment_id"])
+        target_id = "ctgt_" + hashlib.sha256(comment_id.encode("utf-8")).hexdigest()[:32]
+        connection.execute(
+            """
+            INSERT INTO comment_target(
+                comment_target_id,comment_id,target_kind,research_id,document_id,
+                origin_document_version_id,origin_source_sha256,origin_block_type,
+                origin_start_byte,origin_end_byte,origin_exact_bytes,
+                origin_exact_bytes_sha256,origin_structural_context_json,
+                origin_structural_context_sha256,origin_locator_json,
+                locator_schema_version,created_at
+            ) VALUES(?,?,'research',?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,?)
+            """,
+            (target_id, comment_id, str(row["research_id"]), str(row["created_at"])),
+        )
+    return len(rows)
+
+
 def initialize_comment_store(
     database_path: Path,
     *,
@@ -641,6 +778,7 @@ def initialize_comment_store(
     try:
         connection.executescript(_SCHEMA)
         connection.executescript(_PROGRESS_SCHEMA)
+        connection.executescript(_COMMENT_TARGET_SCHEMA)
         with immediate_transaction(connection):
             versions = [
                 int(row[0])
@@ -681,6 +819,25 @@ def initialize_comment_store(
                 )
                 for key, value in workspace_counts.items():
                     counts[key] = counts.get(key, 0) + value
+            extension_versions = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_target_schema ORDER BY version"
+                )
+            ]
+            if not extension_versions:
+                connection.execute(
+                    "INSERT INTO comment_target_schema(version,applied_at) VALUES(?,?)",
+                    (COMMENT_TARGET_SCHEMA_VERSION, utc_now()),
+                )
+                extension_versions = [COMMENT_TARGET_SCHEMA_VERSION]
+            if extension_versions != [COMMENT_TARGET_SCHEMA_VERSION]:
+                raise RuntimeError(
+                    f"不支持的评论锚点扩展 schema：{extension_versions}"
+                )
+            counts["comment_targets_backfilled"] = _backfill_legacy_comment_targets(
+                connection
+            )
         if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
             raise RuntimeError("持久评论库完整性检查失败")
         if connection.execute("PRAGMA foreign_key_check").fetchall():
@@ -704,6 +861,11 @@ def comment_store_state(database_path: Path) -> dict[str, Any]:
     try:
         return {
             "schema_version": COMMENT_STORE_SCHEMA_VERSION,
+            "comment_target_schema_version": int(
+                connection.execute(
+                    "SELECT max(version) FROM comment_target_schema"
+                ).fetchone()[0]
+            ),
             "comments": int(connection.execute("SELECT count(*) FROM comment").fetchone()[0]),
             "active_comments": int(
                 connection.execute(
@@ -712,6 +874,9 @@ def comment_store_state(database_path: Path) -> dict[str, Any]:
             ),
             "events": int(
                 connection.execute("SELECT count(*) FROM comment_event").fetchone()[0]
+            ),
+            "comment_targets": int(
+                connection.execute("SELECT count(*) FROM comment_target").fetchone()[0]
             ),
             "progress_topics": int(
                 connection.execute("SELECT count(*) FROM progress_topic").fetchone()[0]
@@ -749,6 +914,8 @@ def backup_comment_store(database_path: Path, backup_root: Path) -> Path | None:
 
 __all__ = [
     "COMMENT_DATABASE_NAME",
+    "COMMENT_STORE_SCHEMA_VERSION",
+    "COMMENT_TARGET_SCHEMA_VERSION",
     "backup_comment_store",
     "comment_connection",
     "comment_store_state",

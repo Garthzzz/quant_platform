@@ -34,6 +34,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--chrome", type=Path, default=DEFAULT_CHROME)
     parser.add_argument("--research-slug", default=DEFAULT_RESEARCH_SLUG)
+    parser.add_argument("--access-password", default=None)
+    parser.add_argument("--dashboard-columns", type=int, default=4)
     args = parser.parse_args()
 
     output_dir = args.output_dir.resolve()
@@ -82,8 +84,19 @@ def main() -> None:
 
             home_status = response_status(page, f"{base_url}/")
             require(home_status == 200, f"首页状态异常：{home_status}")
+            if "/login" in page.url:
+                require(
+                    args.access_password is not None,
+                    "broadcast login requires --access-password",
+                )
+                page.locator("input[name=password]").fill(args.access_password)
+                with page.expect_navigation(wait_until="networkidle"):
+                    page.locator("button[type=submit]").click()
             dashboard_columns = page.locator(".dashboard-grid > .status-column").count()
-            require(dashboard_columns == 4, "Dashboard 必须显示四个状态列")
+            require(
+                dashboard_columns == args.dashboard_columns,
+                f"Dashboard column count differs: {dashboard_columns}",
+            )
             page.screenshot(path=str(output_dir / "home.png"), full_page=False)
 
             with page.expect_navigation(wait_until="networkidle"):

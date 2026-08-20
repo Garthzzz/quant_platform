@@ -1,0 +1,69 @@
+/* Generic research is an additive namespace.  No legacy selector is redefined. */
+.qrh-generic {
+  --generic-ink: #17312d;
+  --generic-muted: #5b716c;
+  --generic-line: #d8e3df;
+  --generic-paper: #fbfdfc;
+  --generic-accent: #00695c;
+  color: var(--generic-ink);
+  margin: 0 auto;
+  max-width: 1600px;
+  padding: 2rem clamp(1rem, 3vw, 3rem) 5rem;
+}
+
+.qrh-generic *, .qrh-generic *::before, .qrh-generic *::after { box-sizing: border-box; }
+.qrh-generic__header { border-bottom: 1px solid var(--generic-line); padding-bottom: 1.5rem; }
+.qrh-generic__header h1 { font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.15; margin: .45rem 0 .8rem; max-width: 28ch; }
+.qrh-generic__breadcrumb { align-items: center; display: flex; flex-wrap: wrap; gap: .5rem; }
+.qrh-generic__eyebrow { color: var(--generic-accent); font-size: .75rem; font-weight: 700; letter-spacing: .12em; margin: 0; text-transform: uppercase; }
+.qrh-generic__boundary { color: var(--generic-muted); max-width: 76ch; }
+.qrh-generic__status { border-radius: 999px; display: inline-block; font-size: .82rem; font-weight: 700; padding: .3rem .65rem; }
+.qrh-generic__status--current { background: #dff4eb; color: #0b5d4e; }
+.qrh-generic__status--history { background: #f3ead6; color: #7a5316; }
+
+.qrh-generic__layout { align-items: start; display: grid; gap: clamp(1.5rem, 3vw, 3rem); grid-template-columns: minmax(15rem, 21rem) minmax(0, 1fr); margin-top: 2rem; }
+.qrh-generic__rail { max-height: calc(100vh - 2rem); overflow: auto; position: sticky; top: 1rem; }
+.qrh-generic__rail section, .qrh-generic__toc { background: var(--generic-paper); border: 1px solid var(--generic-line); border-radius: .65rem; padding: 1rem; }
+.qrh-generic__toc { margin-top: 1rem; }
+.qrh-generic__toc ol { list-style: none; margin: 0; padding: 0; }
+.qrh-generic__toc li { border-top: 1px solid #edf2f0; padding: .55rem 0; }
+.qrh-generic__toc-level-2 { padding-left: .65rem !important; }
+.qrh-generic__toc-level-3 { padding-left: 1.3rem !important; }
+.qrh-generic__toc-level-4, .qrh-generic__toc-level-5, .qrh-generic__toc-level-6 { padding-left: 1.95rem !important; }
+.qrh-generic__toc a { display: block; line-height: 1.35; }
+.qrh-generic__toc small, .qrh-generic__references small, .qrh-generic__versions small { color: var(--generic-muted); display: block; font-size: .73rem; margin-top: .2rem; overflow-wrap: anywhere; }
+.qrh-generic__identity dl { margin: 0; }
+.qrh-generic__identity dl > div { border-top: 1px solid #edf2f0; display: grid; gap: .4rem; grid-template-columns: 5rem minmax(0, 1fr); padding: .45rem 0; }
+.qrh-generic__identity dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.qrh-generic__identity code { font-size: .72rem; }
+.qrh-generic__source-link { display: inline-block; margin-top: .75rem; }
+
+.qrh-generic__reading-column { min-width: 0; }
+.qrh-generic__reading-column > section, .qrh-generic__document { border-bottom: 1px solid var(--generic-line); margin-bottom: 2rem; padding-bottom: 2rem; }
+.qrh-generic__section-heading { align-items: end; display: flex; gap: 1rem; justify-content: space-between; margin-bottom: 1rem; }
+.qrh-generic__section-heading h2 { margin: .25rem 0 0; }
+.qrh-generic__knowledge-state { background: #e8f0ed; border-radius: .3rem; font-family: ui-monospace, monospace; font-size: .75rem; padding: .3rem .5rem; }
+.qrh-generic__knowledge-grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 18rem), 1fr)); }
+.qrh-generic__knowledge-card { background: var(--generic-paper); border: 1px solid var(--generic-line); border-left: .25rem solid var(--generic-accent); border-radius: .5rem; padding: 1rem; }
+.qrh-generic__knowledge-card h3 { margin: .3rem 0; }
+.qrh-generic__knowledge-card li { overflow-wrap: anywhere; }
+.qrh-generic__knowledge-kind { color: var(--generic-accent); font-family: ui-monospace, monospace; font-size: .75rem; margin: 0; text-transform: uppercase; }
+.qrh-generic__pending { background: #f6f8f7; border-left: .25rem solid #83948f; margin: 0; padding: .8rem 1rem; }
+
+.qrh-generic__body { min-width: 0; overflow-wrap: anywhere; }
+.qrh-generic__body .table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; }
+.qrh-generic__body table { min-width: max-content; }
+.qrh-generic__body pre { max-width: 100%; overflow-x: auto; white-space: pre; }
+.qrh-generic__body code { overflow-wrap: normal; }
+.qrh-generic__body .math-display { display: block; max-width: 100%; overflow-x: auto; padding-block: .35rem; }
+.qrh-generic__body img { height: auto; max-width: 100%; }
+.qrh-generic__references ol, .qrh-generic__versions ol { padding-left: 1.4rem; }
+.qrh-generic__references li, .qrh-generic__versions li { margin-block: .75rem; overflow-wrap: anywhere; }
+
+@media (max-width: 860px) {
+  .qrh-generic { padding-inline: 1rem; }
+  .qrh-generic__layout { grid-template-columns: minmax(0, 1fr); }
+  .qrh-generic__rail { max-height: none; position: static; }
+  .qrh-generic__toc ol { columns: 1; }
+  .qrh-generic__toc-level-2, .qrh-generic__toc-level-3, .qrh-generic__toc-level-4, .qrh-generic__toc-level-5, .qrh-generic__toc-level-6 { padding-left: .5rem !important; }
+}

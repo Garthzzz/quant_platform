@@ -50,6 +50,7 @@
 4. 在新实现完成等价性和回归验证前，不得删除或替换旧实现。
 5. 所有迁移和重构应可追溯、可回滚，不得使用不可恢复的破坏性操作换取便利。
 6. `archive` 研究 Markdown 的原始正文必须保持逐字节不变。任何元数据、摘要、索引、引用、评论和展示优化必须与原文分离；前端不得借解析或格式化之名改写正文。
+7. **VM 写入根边界：**生产 VM 上本项目的任何新增或修改内容，包括代码、Git checkout、candidate、release、`incoming`、外置 state、checkpoint、backup、audit、lock、manifest、部署工具、日志和临时文件，都必须位于唯一根目录 `D:\quant\quant_platform` 内。不得在 VM 的 `D:\`、`D:\quant` 或其他同级/上级目录落任何项目文件或临时产物；更不得向 VM C 盘新增、覆盖或修改内容。现有 `C:\quant_platform`、`C:\quant_platform_data` 及其服务仅允许只读核验，直到既定 writer handoff 门禁通过；任何工具在执行 VM 写操作前必须机械验证目标解析后仍位于该 D 根内，并在执行后审计实际写入路径。独立故障域 `RECOVERY_ROOT` 位于另一主机，不受“放到生产 VM D 根”误解为同机其他目录。
 
 ## 4. 第一阶段：完整理解三个来源体系
 

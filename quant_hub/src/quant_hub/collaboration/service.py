@@ -18,6 +18,10 @@ from quant_hub.archive.contracts import (
 )
 from quant_hub.archive.database import archive_connection
 from quant_hub.collaboration.comment_store import comment_connection
+from quant_hub.collaboration.comment_anchors import (
+    CommentTargetInput,
+    insert_comment_target,
+)
 from quant_hub.config import (
     ConfigurationError,
     Settings,
@@ -26,6 +30,7 @@ from quant_hub.config import (
 )
 from quant_hub.ids import new_public_id, sha256_hex, stable_sha256
 from quant_hub.platform.db import immediate_transaction, utc_now
+from quant_hub.platform.objects import ObjectStore, ObjectStoreError
 from quant_hub.platform.reviews import ReviewAuthority, ReviewCertificateError
 from quant_hub.platform.workflow import canonical_json
 from quant_hub.presentation import ArchivePresentation
@@ -131,6 +136,59 @@ class ArchiveCollaboration:
             (actor_id, actor.actor_kind, name, utc_now()),
         )
         return actor_id
+
+    def _validate_comment_target_source(
+        self,
+        *,
+        research_id: str,
+        target: CommentTargetInput,
+        material: dict[str, Any],
+    ) -> str | None:
+        """Validate stable identities and exact origin bytes against Archive."""
+
+        if material["target_kind"] == "research":
+            return None
+        document_id = str(material["document_id"])
+        with archive_connection(self.settings) as archive:
+            document = archive.execute(
+                """
+                SELECT research_id FROM research_document WHERE document_id=?
+                """,
+                (document_id,),
+            ).fetchone()
+            if document is None or str(document["research_id"]) != research_id:
+                return "document_id 不属于当前 stable research identity。"
+            if material["target_kind"] == "document":
+                return None
+            version = archive.execute(
+                """
+                SELECT document_id,object_urn,content_sha256,bytes
+                FROM research_document_version
+                WHERE document_version_id=?
+                """,
+                (str(material["origin_document_version_id"]),),
+            ).fetchone()
+        if version is None or str(version["document_id"]) != document_id:
+            return "origin document version 不属于当前 stable document identity。"
+        if str(version["content_sha256"]) != material["origin_source_sha256"]:
+            return "origin source hash 与 document version 不一致。"
+        object_urn = str(version["object_urn"])
+        prefix = "qrh:object:"
+        if not object_urn.startswith(prefix):
+            return "origin object identity 无法解析。"
+        try:
+            source = ObjectStore(self.settings.object_root).read_bytes(
+                object_urn.removeprefix(prefix)
+            )
+        except ObjectStoreError:
+            return "origin source object 不可读取或完整性校验失败。"
+        if len(source) != int(version["bytes"]):
+            return "origin source object 长度与 document version 不一致。"
+        start = int(material["origin_start_byte"])
+        end = int(material["origin_end_byte"])
+        if end > len(source) or source[start:end] != material["origin_exact_bytes"]:
+            return "exact byte span 无法在 origin source 中确定性定位。"
+        return None
 
     @staticmethod
     def _replay(
@@ -384,13 +442,31 @@ class ArchiveCollaboration:
         body: str,
         *,
         idempotency_key: str,
+        target: CommentTargetInput | None = None,
     ) -> CommandOutcome:
         body = body.strip()
+        selected_target = target or CommentTargetInput.research()
+        target_error: str | None = None
+        try:
+            target_material = selected_target.normalized()
+            target_payload = {
+                key: value
+                for key, value in target_material.items()
+                if key != "origin_exact_bytes"
+            }
+        except ValueError as error:
+            target_material = {"target_kind": "invalid"}
+            target_payload = {"validation_error": str(error)}
+            target_error = str(error)
+        if target is not None and self.comment_database_path is None:
+            target_error = "versioned comment target 必须使用 release 外评论库。"
         payload = {
             "research_id": research_id,
             "actor": actor.model_dump(mode="json"),
             "body": body,
         }
+        if target is not None:
+            payload["target"] = target_payload
         command = "comment.create"
         digest = _payload_hash(command, payload)
         with self._comment_connection() as connection, immediate_transaction(connection):
@@ -429,6 +505,28 @@ class ArchiveCollaboration:
                     actor_id=actor_id,
                     outcome=CommandOutcome(False, 404, error_code="research_not_found", error_message="研究不存在。"),
                 )
+            if target_error is None:
+                target_error = self._validate_comment_target_source(
+                    research_id=research_id,
+                    target=selected_target,
+                    material=target_material,
+                )
+            if target_error is not None:
+                return self._record(
+                    connection,
+                    idempotency_key=idempotency_key,
+                    command_name=command,
+                    payload_hash=digest,
+                    request_payload=payload,
+                    aggregate_urn=f"qrh:research:{research_id}",
+                    actor_id=actor_id,
+                    outcome=CommandOutcome(
+                        False,
+                        422,
+                        error_code="invalid_comment_target",
+                        error_message=target_error,
+                    ),
+                )
             now = utc_now()
             comment_id = new_public_id("cmt")
             body_hash = sha256_hex(body.encode("utf-8"))
@@ -440,6 +538,14 @@ class ArchiveCollaboration:
                 """,
                 (comment_id, research_id, actor_id, body, now, now),
             )
+            if self.comment_database_path is not None:
+                insert_comment_target(
+                    connection,
+                    comment_id=comment_id,
+                    research_id=research_id,
+                    target=selected_target,
+                    created_at=now,
+                )
             connection.execute(
                 """
                 INSERT INTO comment_event(
