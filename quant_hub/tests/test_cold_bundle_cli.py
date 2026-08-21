@@ -452,7 +452,10 @@ class ColdBundleBuilderTests(unittest.TestCase):
             calls.append(call)
             if call[0] == "scp":
                 self.assertIn("HostName=10.5.1.240", call)
-                self.assertEqual(str(bundle), call[-2])
+                # The runner account can expose one existing path as both
+                # RUNNER~1 and runneradmin.  The transfer contract is physical
+                # same-file identity, not a particular lexical spelling.
+                self.assertTrue(Path(call[-2]).samefile(bundle))
                 self.assertEqual(
                     "honghu-vm:D:/quant/quant_platform/tmp/recovery-import",
                     call[-1],

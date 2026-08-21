@@ -266,9 +266,12 @@ def install_profile(
         "schema_version": "qrh-mcp-profile-install/v1",
         "status": "installed",
         "scope": scope,
-        "config_path": str(config_path),
-        "agents_path": str(agents_path),
-        "client_config_path": str(client_path),
+        # Return the filesystem-canonical identities.  Windows may supply a
+        # profile root through an 8.3 alias even though the created files are
+        # subsequently reported with the long account path.
+        "config_path": str(config_path.resolve(strict=True)),
+        "agents_path": str(agents_path.resolve(strict=True)),
+        "client_config_path": str(client_path.resolve(strict=True)),
         "mirror_root": str(client_config.mirror_root.resolve()),
         "changed": written_client or written_config or written_agents,
         "source_code_copied": False,

@@ -539,8 +539,18 @@ def _powershell_package_inventory_verification_script() -> str:
         "-or $relative.EndsWith('.pyc',[StringComparison]::OrdinalIgnoreCase)"
         "-or $relative.EndsWith('.pyo',[StringComparison]::OrdinalIgnoreCase)){continue};"
         "if(($file.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
-        "{throw 'package_file_reparse'};$hash=(Get-FileHash -Algorithm SHA256 "
-        "-LiteralPath $file.FullName).Hash.ToLowerInvariant();"
+        "{throw 'package_file_reparse'};"
+        # Do not depend on Get-FileHash being present in the host PowerShell
+        # session.  The operational bootstrap must also work in a minimal or
+        # constrained Windows PowerShell environment, so hash the exact file
+        # bytes through the framework cryptography API and dispose both native
+        # resources on every success/failure path.
+        "$fileHasher=[Security.Cryptography.SHA256]::Create();try{"
+        "$fileStream=[IO.File]::Open($file.FullName,[IO.FileMode]::Open,"
+        "[IO.FileAccess]::Read,[IO.FileShare]::Read);try{"
+        "$hash=([BitConverter]::ToString($fileHasher.ComputeHash($fileStream)))."
+        "Replace('-','').ToLowerInvariant()}finally{$fileStream.Dispose()}"
+        "}finally{$fileHasher.Dispose()};"
         # PowerShell single-quoted strings do not interpret backticks.  Use
         # explicit characters so these bytes equal Python's tab/newline form.
         "$records.Add($relative+[char]9+$file.Length+[char]9+$hash+[char]10)};"

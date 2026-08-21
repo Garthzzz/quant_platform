@@ -717,9 +717,20 @@ def restore_recovery_bundle(*, bundle_root: Path, empty_target_root: Path) -> Re
         raise RecoveryBundleError("restore verification scratch path already exists")
     scratch_root.mkdir()
     try:
+        # ``TEMP`` on Windows runners may spell an existing parent through its
+        # 8.3 alias while ``Path.resolve`` returns the long name (or vice versa).
+        # Bind the verifier to the filesystem-resolved child, not to a lexical
+        # spelling, and still fail closed if a reparse race redirects that child.
+        if _path_has_reparse(scratch_root):
+            raise RecoveryBundleError(
+                "restore verification scratch must be a real directory"
+            )
+        resolved_scratch = scratch_root.resolve(strict=True)
+        if not resolved_scratch.is_relative_to(target):
+            raise RecoveryBundleError("restore verification scratch escaped empty target")
         report = verify_recovery_bundle(
             bundle_root,
-            checkpoint_scratch_root=scratch_root,
+            checkpoint_scratch_root=resolved_scratch,
         )
     finally:
         shutil.rmtree(scratch_root, ignore_errors=True)

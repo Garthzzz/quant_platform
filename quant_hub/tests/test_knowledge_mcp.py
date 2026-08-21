@@ -734,7 +734,12 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 project_root=None,
                 client_config=config,
             )
-            self.assertEqual(str(profile / "AGENTS.md"), result["agents_path"])
+            # A Windows user profile may be supplied through its 8.3 alias;
+            # installer output intentionally reports the canonical existing
+            # file identity.
+            self.assertTrue(
+                Path(str(result["agents_path"])).samefile(profile / "AGENTS.md")
+            )
             agents = (profile / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("# Existing global rules", agents)
             self.assertIn("search_quant_knowledge", agents)

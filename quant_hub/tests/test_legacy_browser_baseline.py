@@ -16,6 +16,16 @@ SPEC.loader.exec_module(MODULE)
 
 
 class LegacyBrowserCredentialTests(unittest.TestCase):
+    def test_import_does_not_require_optional_playwright_runtime(self) -> None:
+        missing = ModuleNotFoundError("No module named 'playwright'")
+        with mock.patch.object(
+            MODULE.importlib, "import_module", side_effect=missing
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "requires the optional 'playwright' package"
+            ):
+                MODULE._load_sync_playwright()
+
     def test_production_password_can_be_injected_without_process_argv(self) -> None:
         with mock.patch.dict(
             os.environ, {"VIEWER_ACCESS_PASSWORD": "protected-fixture"}, clear=False

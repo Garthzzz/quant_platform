@@ -5,16 +5,39 @@ from __future__ import annotations
 import argparse
 from datetime import UTC, datetime
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urljoin
 
-from playwright.sync_api import Page, sync_playwright
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 
 DEFAULT_CHROME = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+
+
+def _load_sync_playwright() -> Callable[[], Any]:
+    """Load the optional browser dependency only for a real capture.
+
+    Public exact-SHA CI imports this module to test the credential boundary,
+    but intentionally installs only the application runtime.  Keeping the
+    import here preserves that lightweight contract while a real browser run
+    still fails explicitly instead of silently omitting browser evidence.
+    """
+
+    try:
+        module = importlib.import_module("playwright.sync_api")
+    except ModuleNotFoundError as error:
+        raise RuntimeError(
+            "legacy browser baseline requires the optional 'playwright' package"
+        ) from error
+    loader = getattr(module, "sync_playwright", None)
+    if not callable(loader):
+        raise RuntimeError("playwright.sync_api.sync_playwright is unavailable")
+    return loader
 
 
 def _sha256(path: Path) -> str:
@@ -98,7 +121,7 @@ def main() -> int:
     }
     console_errors: list[str] = []
     try:
-        with sync_playwright() as playwright:
+        with _load_sync_playwright()() as playwright:
             browser = playwright.chromium.launch(
                 executable_path=str(args.chrome),
                 headless=True,

@@ -338,8 +338,37 @@ class VMDeploymentAdapterTests(unittest.TestCase):
                 + _powershell_package_inventory_verification_script()
                 + "Write-Output 'verified'"
             )
+            self.assertNotIn("Get-FileHash", script)
+            self.assertIn("[Security.Cryptography.SHA256]::Create()", script)
+            # Make the regression independent of the developer machine: even
+            # if the cmdlet exists locally, a shadowing function proves the
+            # generated verifier never resolves or calls it.
+            execution_script = (
+                "function global:Get-FileHash{throw 'Get-FileHash is unavailable'};"
+                + script
+            )
+            parsed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[void][scriptblock]::Create([Console]::In.ReadToEnd())",
+                ],
+                input=execution_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, parsed.returncode, parsed.stderr)
             verified = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    execution_script,
+                ],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(0, verified.returncode, verified.stderr)
@@ -347,7 +376,13 @@ class VMDeploymentAdapterTests(unittest.TestCase):
 
             dependency.write_bytes(b"tampered dependency\n")
             rejected = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    execution_script,
+                ],
                 text=True, capture_output=True, check=False,
             )
             self.assertNotEqual(0, rejected.returncode)

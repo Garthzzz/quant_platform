@@ -347,12 +347,21 @@ class SemanticAuthorityPromotionTests(unittest.TestCase):
 
     def test_reparse_target_is_rejected_before_partial_creation(self) -> None:
         target = self.state / "semantic_jobs.sqlite3"
+        expected_parent = self.state.resolve(strict=True)
         original = semantic_authority.ensure_no_reparse_components
 
         def reject_target(path: Path) -> None:
-            if Path(path) == target:
+            # GitHub's Windows runner may spell the temporary root through a
+            # short-name/canonical alias after ``state_root.resolve()``.  Match
+            # the actual semantic target by its already-existing canonical
+            # parent instead of comparing that spelling to the fixture path.
+            candidate = Path(path)
+            if (
+                candidate.name == semantic_authority.TARGET_FILE_NAME
+                and candidate.parent.resolve(strict=True) == expected_parent
+            ):
                 raise ConfigurationError("simulated reparse target")
-            original(Path(path))
+            original(candidate)
 
         with patch(
             "quant_hub.ops.semantic_authority.ensure_no_reparse_components",

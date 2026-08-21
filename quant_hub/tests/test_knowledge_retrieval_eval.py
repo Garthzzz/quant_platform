@@ -289,6 +289,27 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         self.assertEqual("method", factor.cards[0].knowledge_kind)
         self.assertIn("intent_kind:method", factor.cards[0].hit_reasons)
 
+        controlled_alias = self.index.search(
+            "Which A-share factor evaluation method uses rank correlation?",
+            context=TaskContext.create(market="A股", frequency="日频"),
+        )
+        self.assertTrue(controlled_alias.answerable)
+        self.assertNotIn(
+            "named_anchor:a-share", controlled_alias.no_answer_reason or ""
+        )
+
+        long_exact_identity = self.index.search(
+            "Why is Rank IC useful when a researcher evaluates a very long "
+            "natural-language cross-sectional factor selection question?"
+        )
+        self.assertTrue(long_exact_identity.answerable)
+        self.assertTrue(
+            any(
+                "route:strong-document-identity" in card.hit_reasons
+                for card in long_exact_identity.cards
+            )
+        )
+
         data = self.index.search("How should factor exposure winsorization be applied?")
         self.assertTrue(data.answerable)
         self.assertTrue(

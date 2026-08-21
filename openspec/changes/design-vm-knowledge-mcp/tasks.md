@@ -50,7 +50,7 @@
 - [x] 5.8 实现 exact/alias/FTS5/CJK/short fallback、item-scope applicability 与受控 facet alias、显式否定硬过滤、极性/条件安全 relation 扩展、版本/状态惩罚、重排与 exact source-range/knowledge-identity 去重；展示 context 不参与 qrel 命中或证据增权。
 - [ ] 5.9 建立 source-version/span/exact-byte-range/quote-hash grounded qrels、覆盖矩阵、development set 与至少三分之一 sealed holdout；answerable 的 Recall/nDCG/MRR 与 no-answer accuracy 分开聚合，kind/citation 绑定实际正向卡；包含因子/模型/数据/回测、hard negative、无答案、条件冲突、历史/废弃和错引，来源修订后 qrel 自动 stale。
 - [ ] 5.10 与当前 LIKE search 比较总体和分 slice 质量；预注册门禁，证明至少两个声明的 lexical/structured 困难 slice 稳定改善且引用/废弃/冲突硬错误为 0。
-- [ ] 5.11 依据召回/排序、no-answer、条件、版本、引用、P95、体积和重建成本联合决定 vector；本版不得依赖 vector 才可用。
+- [x] 5.11 依据召回/排序、no-answer、条件、版本、引用、P95、体积和重建成本联合决定 vector；本版不得依赖 vector 才可用。独立隔离的 pinned `multilingual-e5-small` 对照虽使 current candidate Recall 提高 0.0833，但 knowledge-kind accuracy 下降 0.0833、hard error 增 2、CPU P95 变慢且 peak RSS 约 1.72 GiB，因此本版明确拒绝生产 vector，保留 structured lexical；实验未读取 sealed qrels，authority/reference/Git 均未变化。
 - [x] 5.12 实现经 tool-choice eval 验证的最小只读 MCP 工具面，以及客户端本地 `serve-stdio`、用户级 immutable mirror 与只读 VM authority resolver；current-sensitive 请求只有 mirror/VM `release_id/manifest_sha256/snapshot_id` 一致才返回 fresh，断网、落后、伪造或不可验证时返回结构化 stale/unavailable 并使 continuation 失效。
 - [ ] 5.13 交付 cwd 无关、可幂等 install/doctor/uninstall 的 CLI/package、user/project Codex profile、`AGENTS.md`/server instructions 应调用与不应调用规则；在 `quant_platform` 和独立 `D:\quant\backtest_demo` 从无显式 MCP 字样的 prompt 验证 search→get、不应调用、snapshot activation/rollback 后 list-updates→重查与返回身份。本版不实现 HTTP。
 - [ ] 5.14 用相同任务做 MCP-assisted 与 no-MCP 对照；只有 grounded decision、条件/限制识别和引用正确性出现可复现净增益且无意义调用受控时才通过。

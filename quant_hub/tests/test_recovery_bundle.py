@@ -486,7 +486,12 @@ class RecoveryBundleTests(unittest.TestCase):
 
         def tracked(*args, **kwargs):
             raw_dir = kwargs.get("dir")
-            observed.append(Path(raw_dir) if raw_dir is not None else None)
+            # Capture the physical identity while the scratch directory still
+            # exists; Windows CI may expose the same parent under 8.3 and long
+            # path spellings.
+            observed.append(
+                Path(raw_dir).resolve(strict=True) if raw_dir is not None else None
+            )
             return original(*args, **kwargs)
 
         with patch(
@@ -495,8 +500,12 @@ class RecoveryBundleTests(unittest.TestCase):
         ):
             restore_recovery_bundle(bundle_root=bundle.root, empty_target_root=target)
         self.assertTrue(observed)
+        resolved_target = target.resolve(strict=True)
         self.assertTrue(
-            all(path is not None and path.is_relative_to(target) for path in observed)
+            all(
+                path is not None and path.is_relative_to(resolved_target)
+                for path in observed
+            )
         )
         self.assertFalse((target / ".recovery-verify-scratch").exists())
 

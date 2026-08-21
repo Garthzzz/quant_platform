@@ -15,7 +15,7 @@ from .contracts import BaseSnapshot, Chunk, canonical_json
 from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
-INDEX_VERSION = "qrh-structured-lexical-index/v1.8-quant-bilingual"
+INDEX_VERSION = "qrh-structured-lexical-index/v1.9-quant-bilingual"
 RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v2"
 
 # Only relations whose direction adds supporting context may introduce a new
@@ -405,6 +405,23 @@ _FACET_ALIASES: dict[str, dict[str, str]] = {
 
 def _facet_key(value: str) -> str:
     return re.sub(r"[^a-z0-9\u3400-\u9fff]", "", value.casefold())
+
+
+def _controlled_facet_canonical(value: str) -> str | None:
+    """Return the canonical value for a surface in the closed facet vocabulary.
+
+    Named-anchor rejection protects no-answer behavior for unsupported methods
+    and instruments. It must not reject a spelling such as ``A-share`` that
+    the applicability layer already canonicalizes deterministically. Unknown
+    named surfaces remain closed-world, while actual facet conflicts are still
+    handled by ``_unsupported_concrete_context`` and ``_applicability``.
+    """
+
+    key = _facet_key(value)
+    for aliases in _FACET_ALIASES.values():
+        if key in aliases:
+            return aliases[key]
+    return None
 
 
 def _canonical_facet_values(
@@ -1013,6 +1030,17 @@ class KnowledgeIndex:
             folded = surface.casefold()
             if folded in _ASCII_QUESTION_WORDS or len(folded) < 2:
                 continue
+            controlled_facet = _controlled_facet_canonical(surface)
+            if controlled_facet is not None:
+                # A controlled spelling is known only when its canonical value
+                # is actually present in the active corpus. Thus A-share does
+                # not become an unsupported named method in an A-share corpus,
+                # while an absent Crypto market remains closed-world.
+                canonical_terms = tuple(dict.fromkeys(_surface_terms(controlled_facet)))
+                if canonical_terms and all(
+                    term in self._active_corpus_terms for term in canonical_terms
+                ):
+                    continue
             lower_hyphenated_domain_term = (
                 surface.count("-") >= 2
                 or surface.casefold().endswith(("-duration", "-yield"))
@@ -1166,6 +1194,25 @@ class KnowledgeIndex:
                 positive_query,
                 "\n".join((record.title, *record.aliases)),
             )
+            strong_document_anchors = tuple(
+                anchor
+                for anchor in document_anchors
+                if any(
+                    (
+                        surface.strip().casefold() == anchor
+                        or (
+                            anchor.isascii()
+                            and 2 <= len(anchor) <= 12
+                            and any(
+                                token.isupper()
+                                and token.casefold() == anchor
+                                for token in _ASCII_RE.findall(surface)
+                            )
+                        )
+                    )
+                    for surface in (record.title, *record.aliases)
+                )
+            )
             if document_anchors:
                 # Route named research/method identity to its passages without
                 # injecting the H1 title into every passage's BM25 term bag.
@@ -1266,6 +1313,15 @@ class KnowledgeIndex:
                 reasons.append("route:formal-grounded-evidence")
                 if preferred_kind_route:
                     reasons.append("route:explicit-kind-intent")
+            if strong_document_anchors:
+                # A closed-world exact alias or bounded acronym (for example
+                # PBO) is itself grounded document identity. It may route a
+                # long natural-language question to passages in that document,
+                # but it does not bypass the score floor, local passage ranking,
+                # applicability conflicts, or unsupported-name checks.
+                effective_weighted_floor = min(effective_weighted_floor, 0.05)
+                effective_term_floor = min(effective_term_floor, 0.05)
+                reasons.append("route:strong-document-identity")
             if score >= minimum_score and (
                 exact_match
                 or (

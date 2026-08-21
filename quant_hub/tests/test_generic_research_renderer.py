@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 import hashlib
 from pathlib import Path
@@ -44,6 +44,34 @@ def _legacy_hashes() -> dict[str, str]:
     return {
         path: _sha256_bytes((PROJECT_ROOT / path).read_bytes()) for path in LEGACY_FILES
     }
+
+
+@contextmanager
+def _generic_only_legacy_shell():
+    """Keep generic-route CI independent of the private legacy projection.
+
+    ``archive_presentation.json`` and chapter manifests are release-bound
+    business content and are deliberately absent from a Public Git checkout.
+    These tests never visit a legacy route, so they inject the smallest empty
+    legacy read shell rather than weakening production's fail-closed manifest
+    requirement or checking private content into Git.
+    """
+
+    with (
+        patch(
+            "quant_hub.archive.catalog.ArchivePresentation.default",
+            return_value=Mock(research={}),
+        ),
+        patch(
+            "quant_hub.archive.catalog.ArchiveChapterManifests.default",
+            return_value=Mock(),
+        ),
+        patch(
+            "quant_hub.archive.catalog.ArchiveCatalog.archive_link_index",
+            return_value={},
+        ),
+    ):
+        yield
 
 
 def _ready_snapshot(snapshot):
@@ -297,24 +325,7 @@ class GenericCitationInteractionTests(SettingsTestCase):
             snapshot,
             {_sha256_bytes(source): source},
         )
-        # The public checkout deliberately excludes the private, generated
-        # legacy presentation bundle.  This test only exercises the isolated
-        # generic namespace, so inject empty legacy projections instead of
-        # accidentally making CI depend on ignored business content.
-        with (
-            patch(
-                "quant_hub.archive.catalog.ArchivePresentation.default",
-                return_value=Mock(research={}),
-            ),
-            patch(
-                "quant_hub.archive.catalog.ArchiveChapterManifests.default",
-                return_value=Mock(),
-            ),
-            patch(
-                "quant_hub.archive.catalog.ArchiveCatalog.archive_link_index",
-                return_value={},
-            ),
-        ):
+        with _generic_only_legacy_shell():
             app = create_app(
                 self.settings,
                 {
@@ -352,16 +363,17 @@ class GenericCommentPersistenceAcceptanceTests(SettingsTestCase):
             }
 
     def _app(self, catalog: GenericResearchCatalog, database: Path):
-        return create_app(
-            self.settings,
-            {
-                "TESTING": True,
-                "SECRET_KEY": "generic-comment-test-only",
-                "TRUSTED_ORIGINS": ("http://localhost",),
-                "COMMENT_DATABASE_PATH": str(database),
-                "GENERIC_RESEARCH_CATALOG": catalog,
-            },
-        )
+        with _generic_only_legacy_shell():
+            return create_app(
+                self.settings,
+                {
+                    "TESTING": True,
+                    "SECRET_KEY": "generic-comment-test-only",
+                    "TRUSTED_ORIGINS": ("http://localhost",),
+                    "COMMENT_DATABASE_PATH": str(database),
+                    "GENERIC_RESEARCH_CATALOG": catalog,
+                },
+            )
 
     @staticmethod
     def _post_comment(client, document_id: str, payload: dict[str, object], key: str):
@@ -522,14 +534,15 @@ class GenericCommentPersistenceAcceptanceTests(SettingsTestCase):
             report.candidate_snapshot,
             {_sha256_bytes(source): source},
         )
-        with self.assertRaisesRegex(ConfigurationError, "COMMENT_DATABASE_PATH"):
-            create_app(
-                self.settings,
-                {
-                    "TESTING": False,
-                    "GENERIC_RESEARCH_CATALOG": catalog,
-                },
-            )
+        with _generic_only_legacy_shell():
+            with self.assertRaisesRegex(ConfigurationError, "COMMENT_DATABASE_PATH"):
+                create_app(
+                    self.settings,
+                    {
+                        "TESTING": False,
+                        "GENERIC_RESEARCH_CATALOG": catalog,
+                    },
+                )
 
 
 if __name__ == "__main__":
