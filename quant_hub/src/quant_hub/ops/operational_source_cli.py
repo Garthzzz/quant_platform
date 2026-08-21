@@ -613,7 +613,7 @@ class OperationalSourceOrchestrator:
             "if($name-eq'runtime_inventory.json'){$manifestCount++}};"
             "if($manifestCount-ne 1){throw 'transport_manifest_count'};"
             "if($total-ne$expectedBytes){throw 'transport_uncompressed_size'};"
-            "$partialItem=New-Item -ItemType Directory -LiteralPath $partial;"
+            "$partialItem=New-Item -ItemType Directory -Path $partial;"
             "if(($partialItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
             "{throw 'transport_partial_reparse'};$partialFull=$partialItem.FullName;"
             "foreach($entry in $entries){$relative=$entry.FullName.Replace('/','\\');"
@@ -691,7 +691,7 @@ class OperationalSourceOrchestrator:
             "Move-Item -LiteralPath $target -Destination $old;try{Move-Item -LiteralPath "
             "$source -Destination $target}catch{Move-Item -LiteralPath $old -Destination "
             "$target;throw};Remove-Item -LiteralPath $old -Recurse -Force}"
-            "else{New-Item -ItemType Directory -Force -LiteralPath (Split-Path -Parent "
+            "else{New-Item -ItemType Directory -Force -Path (Split-Path -Parent "
             "$target)|Out-Null;Move-Item -LiteralPath $source -Destination $target};"
             "@{status='tooling_adopted';generation=$i.generation}|ConvertTo-Json -Compress"
         )

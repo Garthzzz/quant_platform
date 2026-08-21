@@ -663,7 +663,7 @@ class OpenSSHColdRestore:
             exact_production_root_parent_guard_script()
             + "$root=$approvedRoot;"
             "if(@(Get-ChildItem -LiteralPath $root -Force).Count-ne 0){throw 'exact_d_root_not_empty'};"
-            f"New-Item -ItemType Directory -Force -LiteralPath {self._literal(str(import_parent))}|Out-Null;"
+            f"New-Item -ItemType Directory -Force -Path {self._literal(str(import_parent))}|Out-Null;"
             "@{status='prepared_empty_root';empty_root_precondition=$true}|ConvertTo-Json -Compress"
         )
         prepared = self._ssh(prepare)
@@ -702,7 +702,7 @@ class OpenSSHColdRestore:
             f"Assert-BootstrapFile {self._literal(str(python))} {python_size} {self._literal(python_hash)};"
             f"Assert-BootstrapFile {self._literal(str(tool))} {tool_size} {self._literal(tool_hash)};"
             f"$tmp={self._literal(str(runtime_tmp))};"
-            "New-Item -ItemType Directory -Force -LiteralPath $tmp|Out-Null;"
+            "New-Item -ItemType Directory -Force -Path $tmp|Out-Null;"
             "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
             f"$lines=& {self._literal(str(python))} -I -B {self._literal(str(tool))} "
             f"--bundle-root $bundle --empty-target-root $root --staged-under-target;"
@@ -714,7 +714,7 @@ class OpenSSHColdRestore:
             "Remove-Item -LiteralPath $tmp -Recurse -Force;"
             f"$audit={self._literal(str(audit_path))};"
             "$auditParent=Split-Path -Parent $audit;"
-            "New-Item -ItemType Directory -Force -LiteralPath $auditParent|Out-Null;"
+            "New-Item -ItemType Directory -Force -Path $auditParent|Out-Null;"
             f"$event=@{{schema_version='qrh-recovery-materialization-event/v1';event_id={self._literal(audit_id)};"
             "kind='cold_recovery_materialized';authority='evidence_only';fields=@{"
             f"bundle_id={self._literal(report.bundle_id)};release_id={self._literal(report.release_id)};"

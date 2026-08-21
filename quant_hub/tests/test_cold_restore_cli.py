@@ -319,6 +319,7 @@ class ColdRestorePrepareEmptyTests(unittest.TestCase):
             if arguments[0] == "scp":
                 return CommandResult(0, "")
             script = decode_ssh(arguments)
+            self.assertNotIn("New-Item -ItemType Directory -Force -LiteralPath", script)
             if "prepared_empty_root" in script:
                 return CommandResult(0, '{"status":"prepared_empty_root","empty_root_precondition":true}')
             return CommandResult(0, json.dumps(event))

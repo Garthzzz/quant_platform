@@ -233,6 +233,8 @@ class OperationalSourceTests(unittest.TestCase):
         self.assertIn("transport_entry_output_size", unpack)
         self.assertIn("transport_destination_too_long", unpack)
         self.assertIn("transport_extract_escape", unpack)
+        self.assertIn("New-Item -ItemType Directory -Path $partial", unpack)
+        self.assertNotIn("New-Item -ItemType Directory -LiteralPath", unpack)
         for powershell_script in (stage_probe, unpack):
             parsed = subprocess.run(
                 [
@@ -250,6 +252,7 @@ class OperationalSourceTests(unittest.TestCase):
             self.assertEqual(0, parsed.returncode, parsed.stderr)
         adoption = backend.ssh_calls[2]
         self.assertIn("existing_tooling_requires_explicit_replace", adoption)
+        self.assertNotIn("New-Item -ItemType Directory -Force -LiteralPath", adoption)
         self.assertIn("root_parent_reparse", adoption)
         self.assertLess(adoption.index("root_parent_reparse"), adoption.index("Move-Item"))
         script = base64_decode(seen[-1][-1])

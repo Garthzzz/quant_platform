@@ -196,6 +196,7 @@ class ColdBundleBuilderTests(unittest.TestCase):
             self.assertIn("root_full_path_differs", script)
             self.assertIn("root_parent_reparse", script)
             self.assertIn("recovery_tmp_escaped_exact_root", script)
+            self.assertNotIn("New-Item -ItemType Directory -Force -LiteralPath", script)
             self.assertLess(
                 script.index("root_parent_reparse"),
                 script.index("New-Item -ItemType Directory"),

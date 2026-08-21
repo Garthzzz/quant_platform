@@ -93,7 +93,7 @@ class ColdBundleBuilder:
             "$tmpFull=[IO.Path]::GetFullPath($tmp);"
             "if(-not $tmpFull.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
             "{throw 'recovery_tmp_escaped_exact_root'};"
-            "New-Item -ItemType Directory -Force -LiteralPath $tmp|Out-Null;"
+            "New-Item -ItemType Directory -Force -Path $tmp|Out-Null;"
             "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
             f"$a=@({rendered});$o=& $python @a;"
             "if($LASTEXITCODE-ne 0){throw 'cold_bundle_capture_failed'};"
