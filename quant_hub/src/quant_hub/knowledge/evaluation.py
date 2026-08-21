@@ -477,7 +477,12 @@ def compare_candidate_to_baseline(
 
 
 def bind_qrel_templates(path: Path, base: BaseSnapshot) -> QrelSuite:
-    """Bind human-readable fixture quotes to immutable current span/version IDs."""
+    """Bind human-readable fixture paths/quotes to immutable current IDs.
+
+    ``forbidden_logical_paths`` exists only in the human-authored template;
+    the bound qrel carries stable document IDs, so a forbidden-source check is
+    mechanically non-vacuous without hand-copying generated identities.
+    """
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("schema_version") != "qrh-qrel-template/v1" or type(payload.get("qrels")) is not list:
@@ -571,6 +576,39 @@ def bind_qrel_templates(path: Path, base: BaseSnapshot) -> QrelSuite:
             return tuple(rows)
 
         context = TaskContext.create(**raw.get("context", {}))
+        raw_forbidden_ids = raw.get("forbidden_document_ids", [])
+        raw_forbidden_paths = raw.get("forbidden_logical_paths", [])
+        if (
+            type(raw_forbidden_ids) is not list
+            or any(
+                not isinstance(value, str) or not value
+                for value in raw_forbidden_ids
+            )
+            or type(raw_forbidden_paths) is not list
+            or any(
+                not isinstance(value, str) or not value
+                for value in raw_forbidden_paths
+            )
+        ):
+            raise ValueError(
+                f"qrel forbidden sources are invalid:{raw.get('qrel_id')}"
+            )
+        known_document_ids = {
+            record.document_id for record in path_to_document.values()
+        }
+        if any(value not in known_document_ids for value in raw_forbidden_ids):
+            raise ValueError(
+                f"qrel forbidden document is unknown:{raw.get('qrel_id')}"
+            )
+        forbidden_document_ids = list(raw_forbidden_ids)
+        for logical_path in raw_forbidden_paths:
+            record = path_to_document.get(logical_path)
+            if record is None:
+                raise ValueError(
+                    "qrel forbidden path is not active:"
+                    f"{raw.get('qrel_id')}:{logical_path}"
+                )
+            forbidden_document_ids.append(record.document_id)
         qrels.append(
             Qrel(
                 qrel_id=raw["qrel_id"],
@@ -582,7 +620,9 @@ def bind_qrel_templates(path: Path, base: BaseSnapshot) -> QrelSuite:
                 positive_locators=bind(raw.get("positive_sources", [])),
                 negative_locators=bind(raw.get("negative_sources", [])),
                 expected_knowledge_kinds=tuple(raw.get("expected_knowledge_kinds", [])),
-                forbidden_document_ids=tuple(raw.get("forbidden_document_ids", [])),
+                forbidden_document_ids=tuple(
+                    sorted(set(forbidden_document_ids))
+                ),
                 required_citation_ids=tuple(raw.get("required_citation_ids", [])),
                 slices=tuple(raw.get("slices", [])),
                 include_history=bool(raw.get("include_history", False)),

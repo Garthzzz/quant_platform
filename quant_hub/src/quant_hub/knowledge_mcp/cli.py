@@ -69,6 +69,7 @@ def _parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--scope", choices=("user", "project"), required=True)
     uninstall.add_argument("--profile-root", type=Path, required=True)
     uninstall.add_argument("--project-root", type=Path)
+    uninstall.add_argument("--data-root", type=Path, required=True)
     return parser
 
 
@@ -104,19 +105,43 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "doctor":
             config, service = _client(arguments.client_config)
             startup = service.startup_probe()
-            observation = service.authority.probe()
-            local = MirrorStore(config.mirror_root).current()
+            try:
+                local = MirrorStore(config.mirror_root).current()
+            except (MirrorError, KeyError, TypeError, ValueError, OSError):
+                local = None
             fresh = (
                 startup["availability"] == "fresh"
                 and local is not None
-                and local.identity == observation.identity
+                and local.identity.to_dict() == startup["observed_identity"]
+                and not startup["transition_pending"]
+            )
+            status = (
+                "fresh"
+                if fresh
+                else (
+                    "transition_pending"
+                    if startup["transition_pending"]
+                    else (
+                        "unavailable"
+                        if startup["reason"]
+                        == "mirror_identity_or_transition_corrupt"
+                        else ("stale" if local else "unavailable")
+                    )
+                )
             )
             value = {
                 "schema_version": "qrh-mcp-doctor/v1",
-                "status": "fresh" if fresh else "stale",
-                "authority_identity": observation.identity.to_dict(),
+                "status": status,
+                "authority_identity": startup["observed_identity"],
                 "local_identity": local.identity.to_dict() if local else None,
-                "authority_verified_at": observation.verified_at,
+                "transition_pending": startup["transition_pending"],
+                "pending_from_identity": startup["pending_from_identity"],
+                "pending_to_identity": startup["pending_to_identity"],
+                "authority_verified_at": startup["authority_verified_at"],
+                "last_authority_verified_at": startup[
+                    "last_authority_verified_at"
+                ],
+                "reason": startup["reason"],
                 "cwd_independent": True,
                 "transport": "stdio",
             }
@@ -127,6 +152,7 @@ def main(argv: list[str] | None = None) -> int:
                 scope=arguments.scope,
                 profile_root=arguments.profile_root,
                 project_root=arguments.project_root,
+                data_root=arguments.data_root,
             )
     except (MirrorError, OSError, ProfileInstallError, TypeError, ValueError) as error:
         value = {

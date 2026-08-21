@@ -12,6 +12,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest.mock import patch
 
 from quant_hub.knowledge import ReferenceCompiler
 from quant_hub.knowledge.contracts import canonical_json
@@ -24,13 +25,25 @@ from quant_hub.knowledge.semantic import (
 from quant_hub.knowledge.retrieval import ArtifactKnowledgeIndex, TaskContext
 from quant_hub.knowledge_mcp.cli import main as mcp_cli
 from quant_hub.knowledge_mcp.evaluation import (
+    AcceptanceCaseDefinition,
+    QUALITY_DIMENSIONS,
     ToolChoiceCase,
     ToolTraceEvent,
+    build_acceptance_preregistration,
+    evaluate_codex_trace,
     evaluate_tool_choice,
+    load_codex_tool_trace,
+    score_response_markers,
+    validate_acceptance_preregistration_bytes,
 )
+import quant_hub.knowledge_mcp.install as install_module
 from quant_hub.knowledge_mcp.install import (
     AGENT_ROUTING_RULES,
+    BEGIN_AGENTS,
+    BEGIN_CONFIG,
     ClientConfig,
+    END_CONFIG,
+    ProfileInstallError,
     install_profile,
     uninstall_profile,
 )
@@ -106,6 +119,11 @@ class MCPFixture:
             + "\n",
             encoding="utf-8",
         )
+        self.secondary_source = self.reference / "validation.md"
+        self.secondary_source.write_text(
+            "# Validation\n\nUse walk-forward validation for time ordered data.\n",
+            encoding="utf-8",
+        )
         first = ReferenceCompiler(max_chunk_bytes=150).compile(self.reference)
         assert first.candidate_snapshot is not None
         self.snapshot1 = first.candidate_snapshot
@@ -115,6 +133,11 @@ class MCPFixture:
         self.source.write_text(
             self.source.read_text(encoding="utf-8")
             + "\n## Revision\n\nUse purged folds and record the embargo horizon.\n",
+            encoding="utf-8",
+        )
+        self.secondary_source.write_text(
+            self.secondary_source.read_text(encoding="utf-8")
+            + "\n## Revision\n\nRecord every out-of-sample boundary.\n",
             encoding="utf-8",
         )
         second = ReferenceCompiler(max_chunk_bytes=150).compile(
@@ -278,6 +301,147 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         after = service.search_quant_knowledge(query="leakage")
         self.assertEqual("release-r1", after["identity"]["release_id"])
 
+    def test_transition_ack_survives_stdio_restart_activation_and_rollback(self) -> None:
+        first_session = self.fixture.service()
+        first = first_session.search_quant_knowledge(query="leakage")
+        self.assertEqual("release-r1", first["identity"]["release_id"])
+        first_session.close()
+
+        self.fixture.activate(self.fixture.release2)
+        probe_only = self.fixture.service()
+        observed = probe_only.startup_probe()
+        self.assertTrue(observed["transition_pending"])
+        self.assertEqual("release-r1", observed["pending_from_identity"]["release_id"])
+        self.assertEqual("release-r2", observed["pending_to_identity"]["release_id"])
+        probe_only.close()
+
+        restarted = self.fixture.service()
+        changed = restarted.search_quant_knowledge(query="purged folds")
+        self.assertEqual("snapshot_refresh_required", changed["status"])
+        self.assertEqual("release-r1", changed["changed_from"]["release_id"])
+        self.assertEqual("release-r2", changed["changed_to"]["release_id"])
+        restarted.close()
+
+        second_restart = self.fixture.service()
+        self.assertEqual(
+            "snapshot_refresh_required",
+            second_restart.search_quant_knowledge(query="purged folds")["status"],
+        )
+        active_path = self.fixture.control / "active_release.json"
+        offline_path = self.fixture.control / "active_release.offline"
+        active_path.rename(offline_path)
+        offline_session = self.fixture.service()
+        offline_search = offline_session.search_quant_knowledge(
+            query="purged folds", allow_stale=True
+        )
+        self.assertEqual("stale", offline_search["availability"])
+        self.assertEqual("snapshot_refresh_required", offline_search["status"])
+        offline_updates = offline_session.list_knowledge_updates(
+            from_snapshot_id=self.fixture.snapshot1.snapshot_id,
+            allow_stale=True,
+        )
+        self.assertEqual("snapshot_refresh_unavailable", offline_updates["status"])
+        self.assertFalse(offline_updates["refresh_acknowledged"])
+        offline_session.close()
+        offline_path.rename(active_path)
+        updates = second_restart.list_knowledge_updates(
+            from_snapshot_id=self.fixture.snapshot1.snapshot_id,
+            limit=1,
+            budget_chars=500,
+        )
+        self.assertEqual("ok", updates["status"])
+        self.assertTrue(updates["truncated"])
+        self.assertTrue(updates["refresh_acknowledged"])
+        self.assertGreater(updates["update_count"], len(updates["updates"]))
+        self.assertEqual(updates["update_count"], sum(updates["update_summary"].values()))
+        self.assertEqual(self.fixture.snapshot2.snapshot_id, updates["to_snapshot_id"])
+        second_restart.close()
+
+        after_ack_restart = self.fixture.service()
+        refreshed = after_ack_restart.search_quant_knowledge(query="purged folds")
+        self.assertEqual("ok", refreshed["status"])
+        self.assertEqual("release-r2", refreshed["identity"]["release_id"])
+        after_ack_restart.close()
+
+        self.fixture.activate(self.fixture.release1)
+        rollback_probe = self.fixture.service()
+        self.assertTrue(rollback_probe.startup_probe()["transition_pending"])
+        rollback_probe.close()
+        rollback_session = self.fixture.service()
+        rollback = rollback_session.search_quant_knowledge(query="leakage")
+        self.assertEqual("snapshot_refresh_required", rollback["status"])
+        self.assertEqual("release-r2", rollback["changed_from"]["release_id"])
+        self.assertEqual("release-r1", rollback["changed_to"]["release_id"])
+        rollback_ack = rollback_session.list_knowledge_updates(
+            from_snapshot_id=self.fixture.snapshot2.snapshot_id,
+            limit=1,
+            budget_chars=500,
+        )
+        self.assertTrue(rollback_ack["refresh_acknowledged"])
+        rollback_session.close()
+        final_restart = self.fixture.service()
+        final = final_restart.search_quant_knowledge(query="leakage")
+        self.assertEqual("ok", final["status"])
+        self.assertEqual("release-r1", final["identity"]["release_id"])
+
+    def test_corrupt_durable_transition_fails_closed_before_authority_use(self) -> None:
+        initial = self.fixture.service()
+        self.assertEqual(
+            "ok", initial.search_quant_knowledge(query="leakage")["status"]
+        )
+        initial.close()
+        self.fixture.activate(self.fixture.release2)
+        probe = self.fixture.service()
+        self.assertTrue(probe.startup_probe()["transition_pending"])
+        probe.close()
+        pending = self.fixture.mirror / "pending_transition.json"
+        pending.write_text("{}", encoding="utf-8")
+
+        corrupt = self.fixture.service().search_quant_knowledge(query="purged folds")
+        self.assertEqual("unavailable", corrupt["availability"])
+        self.assertEqual("mirror_identity_or_transition_corrupt", corrupt["reason"])
+        self.assertIsNone(corrupt["identity"])
+        self.assertFalse(corrupt["transition_pending"])
+
+    def test_crash_between_pending_and_current_pointer_is_reconciled(self) -> None:
+        first = self.fixture.service().search_quant_knowledge(query="leakage")
+        r1 = first["identity"]
+        r2 = AuthorityIdentity(
+            "release-r2",
+            manifest_sha256(self.fixture.release2),
+            self.fixture.snapshot2.snapshot_id,
+        ).to_dict()
+        pending_path = self.fixture.mirror / "pending_transition.json"
+
+        def simulate_interrupted_transition() -> None:
+            pending_path.write_text(
+                canonical_json(
+                    {
+                        "schema_version": "qrh-user-mirror-pending-transition/v1",
+                        "from_identity": r1,
+                        "to_identity": r2,
+                    }
+                ),
+                encoding="utf-8",
+                newline="",
+            )
+
+        # If authority remained/reverted to the acknowledged endpoint, a new
+        # process clears the pre-current pending record without a false refresh.
+        simulate_interrupted_transition()
+        unchanged = self.fixture.service().search_quant_knowledge(query="leakage")
+        self.assertEqual("ok", unchanged["status"])
+        self.assertFalse(pending_path.exists())
+
+        # If authority completed the activation, a new process resumes the
+        # transition, adopts R2 and still requires explicit list acknowledgement.
+        simulate_interrupted_transition()
+        self.fixture.activate(self.fixture.release2)
+        resumed = self.fixture.service().search_quant_knowledge(query="purged folds")
+        self.assertEqual("snapshot_refresh_required", resumed["status"])
+        self.assertEqual("release-r1", resumed["changed_from"]["release_id"])
+        self.assertEqual("release-r2", resumed["changed_to"]["release_id"])
+
     def test_forged_authority_and_corrupt_mirror_never_return_fresh(self) -> None:
         service = self.fixture.service()
         fresh = service.search_quant_knowledge(query="leakage")
@@ -305,12 +469,15 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
             / "releases"
             / first["identity"]["manifest_sha256"]
         )
-        old_root.rename(old_root.with_name("retained-outside-scan"))
         self.fixture.activate(self.fixture.release2)
         self.assertEqual(
             "snapshot_refresh_required",
             service.search_quant_knowledge(query="leakage")["status"],
         )
+        # A retention fault after the new current artifact is safely staged
+        # removes only the comparison baseline. It must not deadlock the
+        # explicit acknowledgement path.
+        old_root.rename(old_root.with_name("retained-outside-scan"))
         updates = service.list_knowledge_updates(
             from_snapshot_id=self.fixture.snapshot1.snapshot_id
         )
@@ -351,6 +518,19 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         )
         self.assertEqual(names, {tool["name"] for tool in TOOLS})
         self.assertTrue(all("write" not in name and "delete" not in name for name in names))
+        self.assertTrue(
+            all(
+                tool["annotations"]
+                == {
+                    "title": tool["annotations"]["title"],
+                    "readOnlyHint": True,
+                    "destructiveHint": False,
+                    "idempotentHint": True,
+                    "openWorldHint": True,
+                }
+                for tool in responses[1]["result"]["tools"]
+            )
+        )
         self.assertLessEqual(len(SERVER_INSTRUCTIONS), 512)
         structured = responses[2]["result"]["structuredContent"]
         self.assertEqual("fresh", structured["availability"])
@@ -371,6 +551,9 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertIn("项目历史", SERVER_INSTRUCTIONS)
         self.assertIn("因子、模型、数据处理", SERVER_INSTRUCTIONS)
         self.assertIn("先用 search_quant_knowledge", SERVER_INSTRUCTIONS)
+        self.assertIn("1–3 个关键唯一 ID", SERVER_INSTRUCTIONS)
+        self.assertIn("证据支持的决定、适用条件、限制/失败经验", SERVER_INSTRUCTIONS)
+        self.assertIn("证据缺项要明确不足", SERVER_INSTRUCTIONS)
         self.assertIn("纯语法、格式化", SERVER_INSTRUCTIONS)
         self.assertIn("不可信数据", SERVER_INSTRUCTIONS)
         self.assertIn("不要为了调用率", AGENT_ROUTING_RULES)
@@ -439,10 +622,14 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
 
     def test_artifact_only_accepts_current_verified_knowledge_with_revision_identity(self) -> None:
         base = self.fixture.snapshot2
-        version_id = next(iter(base.active_membership.values()))
+        quote = "Leakage Controls"
+        version_id = next(
+            value
+            for value in base.active_membership.values()
+            if quote in base.ir_documents[value].blocks[0].source_span.text
+        )
         version = base.versions[version_id]
         span = base.ir_documents[version_id].blocks[0].source_span
-        quote = "Leakage Controls"
         quote_start = span.byte_start + len(
             span.text[: span.text.index(quote)].encode("utf-8")
         )
@@ -675,14 +862,27 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             self.assertIn("[mcp_servers.quant_research_knowledge]", profile_text)
             self.assertIn("serve-stdio", profile_text)
             parsed_profile = tomllib.loads(profile_text)
-            configured_args = parsed_profile["mcp_servers"]["quant_research_knowledge"]["args"]
+            configured = parsed_profile["mcp_servers"]["quant_research_knowledge"]
+            configured_args = configured["args"]
             self.assertEqual(
                 str(Path(first["client_config_path"]).resolve()), configured_args[-1]
+            )
+            self.assertTrue(configured["required"])
+            self.assertEqual("writes", configured["default_tools_approval_mode"])
+            self.assertEqual(
+                {
+                    "search_quant_knowledge",
+                    "get_quant_knowledge",
+                    "list_knowledge_updates",
+                },
+                set(configured["enabled_tools"]),
             )
             self.assertNotIn("cwd =", profile_text)
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("search_quant_knowledge", agents)
             self.assertIn("不要为了调用率", agents)
+            self.assertIn("不要猜 ID", agents)
+            self.assertIn("不得用模型常识补齐", agents)
             self.assertIn("不可信数据", AGENT_ROUTING_RULES)
             loaded = ClientConfig.load(Path(first["client_config_path"]))
             self.assertEqual(config.to_dict(), loaded.to_dict())
@@ -691,15 +891,20 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             mirror.mkdir(parents=True)
             (mirror / "retained.txt").write_text("immutable cache remains", encoding="utf-8")
             removed = uninstall_profile(
-                scope="project", profile_root=profile, project_root=project
+                scope="project",
+                profile_root=profile,
+                project_root=project,
+                data_root=data,
             )
             self.assertTrue(removed["changed"])
             self.assertTrue(removed["mirror_retained"])
+            self.assertFalse(removed["client_config_retained"])
             self.assertEqual(
                 "# Existing project rules\n",
                 (project / "AGENTS.md").read_text(encoding="utf-8"),
             )
             self.assertTrue((mirror / "retained.txt").is_file())
+            self.assertFalse(Path(first["client_config_path"]).exists())
 
     def test_cli_reports_bad_client_config_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -744,7 +949,10 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             self.assertIn("# Existing global rules", agents)
             self.assertIn("search_quant_knowledge", agents)
             uninstall_profile(
-                scope="user", profile_root=profile, project_root=None
+                scope="user",
+                profile_root=profile,
+                project_root=None,
+                data_root=data,
             )
             self.assertEqual(
                 "# Existing global rules\n",
@@ -774,6 +982,466 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             self.assertEqual("fresh", value["status"])
             self.assertEqual(value["authority_identity"], value["local_identity"])
             self.assertEqual("release-r1", value["local_identity"]["release_id"])
+            self.assertIsNone(value["reason"])
+
+            fixture.activate(fixture.release2)
+            for _restart in range(2):
+                output = StringIO()
+                with redirect_stdout(output):
+                    exit_code = mcp_cli(
+                        ["doctor", "--client-config", str(client_path)]
+                    )
+                self.assertEqual(2, exit_code)
+                transition = json.loads(output.getvalue())
+                self.assertEqual("transition_pending", transition["status"])
+                self.assertTrue(transition["transition_pending"])
+                self.assertEqual(
+                    "release-r1", transition["pending_from_identity"]["release_id"]
+                )
+                self.assertEqual(
+                    "release-r2", transition["pending_to_identity"]["release_id"]
+                )
+            # Doctor is observation-only. Returning authority to the still
+            # acknowledged R1 baseline clears the unacknowledged transition.
+            fixture.activate(fixture.release1)
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = mcp_cli(["doctor", "--client-config", str(client_path)])
+            self.assertEqual(0, exit_code)
+            restored = json.loads(output.getvalue())
+            self.assertEqual("fresh", restored["status"])
+            self.assertFalse(restored["transition_pending"])
+
+            (fixture.control / "active_release.json").rename(
+                fixture.control / "active_release.offline"
+            )
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = mcp_cli(["doctor", "--client-config", str(client_path)])
+            self.assertEqual(2, exit_code)
+            unavailable = json.loads(output.getvalue())
+            self.assertEqual("stale", unavailable["status"])
+            self.assertIsNone(unavailable["authority_identity"])
+            self.assertEqual(value["local_identity"], unavailable["local_identity"])
+            self.assertEqual(
+                "authority_unreachable_or_unverifiable", unavailable["reason"]
+            )
+
+            mirrored = (
+                fixture.mirror
+                / "releases"
+                / value["local_identity"]["manifest_sha256"]
+                / "content"
+                / "mcp_search.json"
+            )
+            mirrored.write_text("{}", encoding="utf-8")
+            output = StringIO()
+            with redirect_stdout(output):
+                exit_code = mcp_cli(["doctor", "--client-config", str(client_path)])
+            self.assertEqual(2, exit_code)
+            corrupt = json.loads(output.getvalue())
+            self.assertEqual("unavailable", corrupt["status"])
+            self.assertIsNone(corrupt["local_identity"])
+
+    def test_duplicate_managed_markers_fail_closed_without_rewriting_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            config_path = project / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            duplicate = (
+                f"{BEGIN_CONFIG}\nfirst\n{END_CONFIG}\n"
+                f"{BEGIN_CONFIG}\nsecond\n{END_CONFIG}\n"
+            )
+            config_path.write_text(duplicate, encoding="utf-8")
+            client = ClientConfig(
+                authority_active_path=root / "authority" / "active.json",
+                authority_release_root=root / "authority" / "releases",
+                artifact_release_root=root / "authority" / "releases",
+                mirror_root=root / "data" / "mirror",
+            )
+            with self.assertRaisesRegex(ProfileInstallError, "duplicated"):
+                install_profile(
+                    scope="project",
+                    profile_root=root / "profile",
+                    data_root=root / "data",
+                    project_root=project,
+                    client_config=client,
+                )
+            self.assertEqual(duplicate, config_path.read_text(encoding="utf-8"))
+
+    def test_invalid_agents_markers_fail_before_any_profile_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            config_path = project / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            config_path.write_text("[features]\nweb_search = true\n", encoding="utf-8")
+            agents_path = project / "AGENTS.md"
+            original_agents = "existing\n<!-- BEGIN QRH QUANT KNOWLEDGE MCP (managed) -->\nbroken\n"
+            agents_path.write_text(original_agents, encoding="utf-8")
+            data_root = root / "data"
+            client = ClientConfig(
+                authority_active_path=root / "authority" / "active.json",
+                authority_release_root=root / "authority" / "releases",
+                artifact_release_root=root / "authority" / "releases",
+                mirror_root=data_root / "mirror",
+            )
+            with self.assertRaisesRegex(ProfileInstallError, "incomplete"):
+                install_profile(
+                    scope="project",
+                    profile_root=root / "profile",
+                    data_root=data_root,
+                    project_root=project,
+                    client_config=client,
+                )
+            self.assertEqual(
+                "[features]\nweb_search = true\n",
+                config_path.read_text(encoding="utf-8"),
+            )
+            self.assertEqual(original_agents, agents_path.read_text(encoding="utf-8"))
+            self.assertFalse((data_root / "quant-research-knowledge" / "client.json").exists())
+
+    def test_reversed_managed_markers_are_rejected_before_any_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            config_path = project / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            reversed_markers = f"{END_CONFIG}\nbody\n{BEGIN_CONFIG}\n"
+            config_path.write_text(reversed_markers, encoding="utf-8")
+            data_root = root / "data"
+            client = ClientConfig(
+                authority_active_path=root / "authority" / "active.json",
+                authority_release_root=root / "authority" / "releases",
+                artifact_release_root=root / "authority" / "releases",
+                mirror_root=data_root / "mirror",
+            )
+            with self.assertRaisesRegex(ProfileInstallError, "reversed"):
+                install_profile(
+                    scope="project",
+                    profile_root=root / "profile",
+                    data_root=data_root,
+                    project_root=project,
+                    client_config=client,
+                )
+            self.assertEqual(reversed_markers, config_path.read_text(encoding="utf-8"))
+            self.assertFalse((project / "AGENTS.md").exists())
+            self.assertFalse((data_root / "quant-research-knowledge" / "client.json").exists())
+
+    def test_install_caught_failure_restores_exact_prior_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            config_path = project / ".codex" / "config.toml"
+            config_path.parent.mkdir()
+            config_path.write_bytes(b"[features]\nweb_search = true\n")
+            agents_path = project / "AGENTS.md"
+            agents_path.write_bytes(b"# original agents\n")
+            originals = (config_path.read_bytes(), agents_path.read_bytes())
+            data_root = root / "data"
+            client_path = data_root / "quant-research-knowledge" / "client.json"
+            client = ClientConfig(
+                authority_active_path=root / "authority" / "active.json",
+                authority_release_root=root / "authority" / "releases",
+                artifact_release_root=root / "authority" / "releases",
+                mirror_root=data_root / "mirror",
+            )
+            real_replace = install_module.os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected commit failure")
+                return real_replace(source, destination)
+
+            with patch.object(
+                install_module.os, "replace", side_effect=fail_second_replace
+            ):
+                with self.assertRaisesRegex(ProfileInstallError, "rolled back"):
+                    install_profile(
+                        scope="project",
+                        profile_root=root / "profile",
+                        data_root=data_root,
+                        project_root=project,
+                        client_config=client,
+                    )
+            self.assertFalse(client_path.exists())
+            self.assertEqual(originals[0], config_path.read_bytes())
+            self.assertEqual(originals[1], agents_path.read_bytes())
+
+    def test_uninstall_caught_failure_restores_exact_prior_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            project.mkdir()
+            data_root = root / "data"
+            client = ClientConfig(
+                authority_active_path=root / "authority" / "active.json",
+                authority_release_root=root / "authority" / "releases",
+                artifact_release_root=root / "authority" / "releases",
+                mirror_root=data_root / "mirror",
+            )
+            install_profile(
+                scope="project",
+                profile_root=root / "profile",
+                data_root=data_root,
+                project_root=project,
+                client_config=client,
+            )
+            config_path = project / ".codex" / "config.toml"
+            agents_path = project / "AGENTS.md"
+            client_path = data_root / "quant-research-knowledge" / "client.json"
+            originals = (
+                config_path.read_bytes(),
+                agents_path.read_bytes(),
+                client_path.read_bytes(),
+            )
+            real_replace = install_module.os.replace
+            calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected uninstall failure")
+                return real_replace(source, destination)
+
+            with patch.object(
+                install_module.os, "replace", side_effect=fail_second_replace
+            ):
+                with self.assertRaisesRegex(ProfileInstallError, "rolled back"):
+                    uninstall_profile(
+                        scope="project",
+                        profile_root=root / "profile",
+                        project_root=project,
+                        data_root=data_root,
+                    )
+            self.assertEqual(originals[0], config_path.read_bytes())
+            self.assertEqual(originals[1], agents_path.read_bytes())
+            self.assertEqual(originals[2], client_path.read_bytes())
+
+    def test_every_install_and_uninstall_crash_cut_is_fail_safe(self) -> None:
+        class SimulatedProcessStop(BaseException):
+            pass
+
+        def paths(root: Path):
+            project = root / "project"
+            data_root = root / "data"
+            config_path = project / ".codex" / "config.toml"
+            agents_path = project / "AGENTS.md"
+            client_path = data_root / "quant-research-knowledge" / "client.json"
+            return project, data_root, config_path, agents_path, client_path
+
+        def active_and_ready(config_path, agents_path, client_path):
+            config_text = (
+                config_path.read_text(encoding="utf-8")
+                if config_path.is_file()
+                else ""
+            )
+            agents_text = (
+                agents_path.read_text(encoding="utf-8")
+                if agents_path.is_file()
+                else ""
+            )
+            active = BEGIN_CONFIG in config_text
+            ready = client_path.is_file() and BEGIN_AGENTS in agents_text
+            return active, ready
+
+        # cut=0 stops before the first commit; cuts 1..3 stop immediately
+        # after client, AGENTS, config respectively.
+        for cut in range(4):
+            with self.subTest(operation="install", cut=cut), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project, data_root, config_path, agents_path, client_path = paths(root)
+                project.mkdir()
+                config_path.parent.mkdir()
+                config_path.write_text("[features]\nweb_search = true\n", encoding="utf-8")
+                agents_path.write_text("# existing\n", encoding="utf-8")
+                client = ClientConfig(
+                    authority_active_path=root / "authority" / "active.json",
+                    authority_release_root=root / "authority" / "releases",
+                    artifact_release_root=root / "authority" / "releases",
+                    mirror_root=data_root / "mirror",
+                )
+                real_replace = install_module.os.replace
+                calls = 0
+
+                def stop_at_install_cut(source, destination):
+                    nonlocal calls
+                    calls += 1
+                    if cut == 0 and calls == 1:
+                        raise SimulatedProcessStop()
+                    result = real_replace(source, destination)
+                    if calls == cut:
+                        raise SimulatedProcessStop()
+                    return result
+
+                with patch.object(
+                    install_module.os, "replace", side_effect=stop_at_install_cut
+                ):
+                    with self.assertRaises(SimulatedProcessStop):
+                        install_profile(
+                            scope="project",
+                            profile_root=root / "profile",
+                            data_root=data_root,
+                            project_root=project,
+                            client_config=client,
+                        )
+                active, ready = active_and_ready(
+                    config_path, agents_path, client_path
+                )
+                self.assertTrue(not active or ready)
+                self.assertEqual(cut == 3, active)
+
+        # Uninstall starts fully active. cut=0 therefore remains active with
+        # both dependencies; after config is removed every later cut is inert.
+        for cut in range(4):
+            with self.subTest(operation="uninstall", cut=cut), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project, data_root, config_path, agents_path, client_path = paths(root)
+                project.mkdir()
+                client = ClientConfig(
+                    authority_active_path=root / "authority" / "active.json",
+                    authority_release_root=root / "authority" / "releases",
+                    artifact_release_root=root / "authority" / "releases",
+                    mirror_root=data_root / "mirror",
+                )
+                install_profile(
+                    scope="project",
+                    profile_root=root / "profile",
+                    data_root=data_root,
+                    project_root=project,
+                    client_config=client,
+                )
+                real_replace = install_module.os.replace
+                calls = 0
+
+                def stop_at_uninstall_cut(source, destination):
+                    nonlocal calls
+                    calls += 1
+                    if cut == 0 and calls == 1:
+                        raise SimulatedProcessStop()
+                    result = real_replace(source, destination)
+                    if calls == cut:
+                        raise SimulatedProcessStop()
+                    return result
+
+                with patch.object(
+                    install_module.os, "replace", side_effect=stop_at_uninstall_cut
+                ):
+                    with self.assertRaises(SimulatedProcessStop):
+                        uninstall_profile(
+                            scope="project",
+                            profile_root=root / "profile",
+                            project_root=project,
+                            data_root=data_root,
+                        )
+                active, ready = active_and_ready(
+                    config_path, agents_path, client_path
+                )
+                self.assertTrue(not active or ready)
+                self.assertEqual(cut == 0, active)
+
+    def test_uninstall_never_reactivates_when_prerequisite_rollback_fails(self) -> None:
+        failure_combinations = (
+            frozenset(),
+            frozenset({"client"}),
+            frozenset({"agents"}),
+            frozenset({"client", "agents"}),
+        )
+        for failures in failure_combinations:
+            with self.subTest(failures=sorted(failures)), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                project = root / "project"
+                project.mkdir()
+                data_root = root / "data"
+                client = ClientConfig(
+                    authority_active_path=root / "authority" / "active.json",
+                    authority_release_root=root / "authority" / "releases",
+                    artifact_release_root=root / "authority" / "releases",
+                    mirror_root=data_root / "mirror",
+                )
+                install_profile(
+                    scope="project",
+                    profile_root=root / "profile",
+                    data_root=data_root,
+                    project_root=project,
+                    client_config=client,
+                )
+                config_path = project / ".codex" / "config.toml"
+                agents_path = project / "AGENTS.md"
+                client_path = data_root / "quant-research-knowledge" / "client.json"
+                real_replace = install_module.os.replace
+                real_unlink = Path.unlink
+                config_rollback_attempted = False
+
+                def injected_replace(source, destination):
+                    nonlocal config_rollback_attempted
+                    source_path = Path(source)
+                    destination_path = Path(destination)
+                    is_rollback = ".rollback-" in source_path.name
+                    if is_rollback and destination_path == config_path:
+                        config_rollback_attempted = True
+                    if (
+                        is_rollback
+                        and destination_path == client_path
+                        and "client" in failures
+                    ):
+                        raise OSError("injected client rollback failure")
+                    if (
+                        is_rollback
+                        and destination_path == agents_path
+                        and "agents" in failures
+                    ):
+                        raise OSError("injected AGENTS rollback failure")
+                    return real_replace(source, destination)
+
+                def injected_unlink(path, *args, **kwargs):
+                    candidate = Path(path)
+                    if (
+                        candidate.parent == client_path.parent
+                        and candidate.name.startswith(".client.json.partial-")
+                    ):
+                        raise OSError("injected client tombstone cleanup failure")
+                    return real_unlink(path, *args, **kwargs)
+
+                with patch.object(
+                    install_module.os, "replace", side_effect=injected_replace
+                ), patch.object(Path, "unlink", new=injected_unlink):
+                    with self.assertRaisesRegex(
+                        ProfileInstallError,
+                        "rolled back" if not failures else "incomplete",
+                    ):
+                        uninstall_profile(
+                            scope="project",
+                            profile_root=root / "profile",
+                            project_root=project,
+                            data_root=data_root,
+                        )
+
+                config_text = config_path.read_text(encoding="utf-8")
+                agents_text = agents_path.read_text(encoding="utf-8")
+                active = BEGIN_CONFIG in config_text
+                if failures:
+                    self.assertFalse(active)
+                    self.assertFalse(config_rollback_attempted)
+                else:
+                    self.assertTrue(active)
+                    self.assertTrue(config_rollback_attempted)
+                self.assertEqual("client" not in failures, client_path.is_file())
+                self.assertEqual("agents" not in failures, BEGIN_AGENTS in agents_text)
+                tombstones = tuple(
+                    client_path.parent.glob(".client.json.partial-*")
+                )
+                if "client" in failures:
+                    self.assertTrue(tombstones)
 
 
 class FakeOpenSSHRunner:
@@ -932,6 +1600,92 @@ class OpenSSHAuthorityTests(unittest.TestCase):
 
 
 class ToolChoiceEvaluationTests(unittest.TestCase):
+    def test_real_codex_jsonl_projection_is_closed_and_marker_scoring_is_reproducible(self) -> None:
+        identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
+        response = {
+            "availability": "fresh",
+            "identity": identity.to_dict(),
+            "status": "ok",
+        }
+        rows = (
+            {"type": "thread.started", "thread_id": "thread-1"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "unrelated",
+                    "tool": "read",
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "quant_research_knowledge",
+                    "tool": "search_quant_knowledge",
+                    "status": "completed",
+                    "error": None,
+                    "arguments": {"query": "fixture query"},
+                    "result": {
+                        "structured_content": {
+                            **response,
+                            "results": [{"object_id": "evidence-1"}],
+                        }
+                    },
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "quant_research_knowledge",
+                    "tool": "get_quant_knowledge",
+                    "status": "completed",
+                    "error": None,
+                    "arguments": {"object_id": "evidence-1"},
+                    "result": {"structured_content": response},
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": "purged split; five-day condition; source sha256 locator",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.jsonl"
+            path.write_text(
+                "".join(canonical_json(row) + "\n" for row in rows),
+                encoding="utf-8",
+                newline="",
+            )
+            trace = load_codex_tool_trace(path)
+        self.assertTrue(trace.turn_completed)
+        self.assertFalse(trace.failed_calls)
+        self.assertEqual(1, trace.unrelated_mcp_call_count)
+        self.assertEqual(
+            ("search_quant_knowledge", "get_quant_knowledge"),
+            tuple(event.tool_name for event in trace.events),
+        )
+        self.assertEqual(2, len(trace.raw_events))
+        self.assertEqual("fixture query", trace.raw_events[0].arguments["query"])
+        self.assertGreater(trace.raw_events[0].ordinal, 0)
+        self.assertFalse(trace.raw_events[0].failed)
+        self.assertEqual(1, len(trace.unrelated_mcp_calls))
+        markers = {
+            "grounded_decision": ("purged split",),
+            "condition_limitation_recognition": ("five-day condition",),
+            "citation_correctness": ("sha256 locator",),
+        }
+        self.assertEqual(
+            {dimension: 1.0 for dimension in QUALITY_DIMENSIONS},
+            score_response_markers(trace.final_response, markers=markers),
+        )
+
     def test_positive_negative_gain_identity_and_update_sequence_gate(self) -> None:
         identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
         fresh = {"availability": "fresh", "identity": identity.to_dict()}
@@ -1009,6 +1763,192 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             rejected.findings,
         )
         self.assertIn("unnecessary-search:meaningless_tool_call", rejected.findings)
+
+    def test_trace_state_machine_enforces_provenance_identity_and_budget(self) -> None:
+        identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
+        expected = identity.to_dict()
+
+        def call(tool, *, arguments, structured, status="completed", error=None):
+            return {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "quant_research_knowledge",
+                    "tool": tool,
+                    "status": status,
+                    "arguments": arguments,
+                    "error": error,
+                    "result": {"structured_content": structured},
+                },
+            }
+
+        good_rows = (
+            call(
+                "search_quant_knowledge",
+                arguments={"query": "fixture"},
+                structured={
+                    "availability": "fresh",
+                    "identity": expected,
+                    "results": [{"object_id": "returned-id"}],
+                },
+            ),
+            call(
+                "get_quant_knowledge",
+                arguments={"object_id": "returned-id"},
+                structured={"availability": "fresh", "identity": expected},
+            ),
+            {"type": "turn.completed"},
+        )
+        bad_rows = [
+            call(
+                "get_quant_knowledge",
+                arguments={"object_id": "guessed-id"},
+                structured={"availability": "fresh", "identity": expected},
+            )
+        ]
+        bad_rows.extend(
+            call(
+                "search_quant_knowledge",
+                arguments={"query": f"fixture-{index}"},
+                structured={
+                    "availability": "fresh",
+                    "identity": expected,
+                    "results": [{"object_id": f"result-{index}"}],
+                },
+            )
+            for index in range(6)
+        )
+        bad_rows.extend(
+            (
+                call(
+                    "search_quant_knowledge",
+                    arguments={"query": "invalid-budget"},
+                    structured={},
+                    status="failed",
+                    error={"message": "fixture failure"},
+                ),
+                {"type": "turn.completed"},
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good_path = root / "good.jsonl"
+            bad_path = root / "historical-v3-shape.jsonl"
+            good_path.write_text(
+                "".join(canonical_json(row) + "\n" for row in good_rows),
+                encoding="utf-8",
+                newline="",
+            )
+            bad_path.write_text(
+                "".join(canonical_json(row) + "\n" for row in bad_rows),
+                encoding="utf-8",
+                newline="",
+            )
+            good = evaluate_codex_trace(
+                load_codex_tool_trace(good_path),
+                should_call=True,
+                maximum_target_calls=2,
+                expected_identity=identity,
+            )
+            bad = evaluate_codex_trace(
+                load_codex_tool_trace(bad_path),
+                should_call=True,
+                maximum_target_calls=6,
+                expected_identity=identity,
+            )
+        self.assertEqual("PASS", good.status)
+        self.assertEqual("FAIL", bad.status)
+        self.assertIn("target_call_budget_exceeded", bad.findings)
+        self.assertIn("failed_target_call", bad.findings)
+        self.assertTrue(
+            any(value.startswith("get_without_prior_search_result") for value in bad.findings)
+        )
+
+    def test_future_preregistration_closes_marker_bytes_and_prompt_bindings(self) -> None:
+        markers = {
+            "grounded_decision": ("decision-marker",),
+            "condition_limitation_recognition": ("condition-marker", "limit-marker"),
+            "citation_correctness": ("citation-marker",),
+        }
+        cases = (
+            AcceptanceCaseDefinition(
+                case_id="implicit-factor-task",
+                prompt_bytes="independent quant research question".encode("utf-8"),
+                should_call=True,
+                required_sequence=("search_quant_knowledge", "get_quant_knowledge"),
+                maximum_target_calls=6,
+            ),
+            AcceptanceCaseDefinition(
+                case_id="plain-format-task",
+                prompt_bytes=b"format fixture.py",
+                should_call=False,
+                maximum_target_calls=0,
+            ),
+        )
+        first = build_acceptance_preregistration(
+            suite_id="future-independent-suite-v1",
+            cases=cases,
+            marker_definitions=markers,
+        )
+        second = build_acceptance_preregistration(
+            suite_id="future-independent-suite-v1",
+            cases=cases,
+            marker_definitions=markers,
+        )
+        self.assertEqual(first, second)
+        parsed = validate_acceptance_preregistration_bytes(first)
+        self.assertEqual("qrh-mcp-acceptance-preregistration/v1", parsed["schema_version"])
+        self.assertNotIn("independent quant research question", first.decode("utf-8"))
+        changed_markers = dict(markers)
+        changed_markers["grounded_decision"] = ("different-marker",)
+        changed = build_acceptance_preregistration(
+            suite_id="future-independent-suite-v1",
+            cases=cases,
+            marker_definitions=changed_markers,
+        )
+        self.assertNotEqual(first, changed)
+        self.assertNotEqual(
+            json.loads(first)["marker_definition_sha256"],
+            json.loads(changed)["marker_definition_sha256"],
+        )
+        open_envelope = json.loads(first)
+        open_envelope["unregistered"] = True
+        with self.assertRaisesRegex(ValueError, "closed canonical"):
+            validate_acceptance_preregistration_bytes(
+                canonical_json(open_envelope).encode("utf-8")
+            )
+        with self.assertRaisesRegex(ValueError, "canonical"):
+            validate_acceptance_preregistration_bytes(first + b"\n")
+        for scalar in ("single-marker", b"single-marker"):
+            invalid_markers = dict(markers)
+            invalid_markers["grounded_decision"] = scalar
+            with self.assertRaisesRegex(ValueError, "list/tuple"):
+                build_acceptance_preregistration(
+                    suite_id="future-independent-suite-v1",
+                    cases=cases,
+                    marker_definitions=invalid_markers,
+                )
+
+        # A malicious envelope can be perfectly canonical and recompute its
+        # hash while still using a JSON string instead of list[str]. Validator
+        # must reject that semantic ambiguity, not merely its byte encoding.
+        scalar_marker_definition = {
+            "grounded_decision": "single-marker",
+            "condition_limitation_recognition": ["condition-marker"],
+            "citation_correctness": ["citation-marker"],
+        }
+        scalar_bytes = canonical_json(scalar_marker_definition).encode("utf-8")
+        scalar_envelope = json.loads(first)
+        scalar_envelope["marker_definition_bytes_base64"] = base64.b64encode(
+            scalar_bytes
+        ).decode("ascii")
+        scalar_envelope["marker_definition_sha256"] = hashlib.sha256(
+            scalar_bytes
+        ).hexdigest()
+        with self.assertRaisesRegex(ValueError, "list/tuple"):
+            validate_acceptance_preregistration_bytes(
+                canonical_json(scalar_envelope).encode("utf-8")
+            )
 
 
 if __name__ == "__main__":

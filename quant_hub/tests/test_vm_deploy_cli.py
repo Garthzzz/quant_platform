@@ -409,6 +409,8 @@ class VMDeployCLITests(unittest.TestCase):
                 }
             }
             self.assertTrue(runtime.state_compatibility_probe(real_v39_shape))
+            self.assertFalse(any(state.glob("*.sqlite3-wal")))
+            self.assertFalse(any(state.glob("*.sqlite3-shm")))
 
             wrong_policy = json.loads(json.dumps(real_v39_shape))
             wrong_policy["state"]["compatibility"]["rollback_policy"] = "down_migrate"
@@ -421,6 +423,32 @@ class VMDeployCLITests(unittest.TestCase):
             missing = json.loads(json.dumps(real_v39_shape))
             del missing["state"]["compatibility"]["research_workspace"]
             self.assertFalse(runtime.state_compatibility_probe(missing))
+
+    def test_online_copy_allows_normal_wal_writer_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "comments.sqlite3"
+            destination = root / "candidate.sqlite3"
+            with closing(sqlite3.connect(source)) as connection:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("CREATE TABLE comment (id INTEGER PRIMARY KEY, body TEXT)")
+                connection.execute("INSERT INTO comment(body) VALUES ('before')")
+                connection.commit()
+                before = WindowsServiceRuntime._sqlite_source_identity(source)
+                self.assertIn("-wal", {row[0] for row in before})
+                with mock.patch.object(
+                    WindowsServiceRuntime,
+                    "_sqlite_source_identity",
+                    return_value=before,
+                ) as identity:
+                    WindowsServiceRuntime._online_copy(source, destination)
+                # A live WAL source is protected by SQLite's snapshot backup,
+                # not by requiring all production bytes to stop changing.
+                identity.assert_called_once_with(source)
+            with closing(sqlite3.connect(destination)) as copied:
+                self.assertEqual(
+                    [("before",)], copied.execute("SELECT body FROM comment").fetchall()
+                )
         with self.assertRaises(VMDeployCLIError):
             verify_runtime_environment(
                 Path(r"D:\quant\quant_platform"),

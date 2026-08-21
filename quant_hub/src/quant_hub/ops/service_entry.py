@@ -155,6 +155,29 @@ def _trusted_origins(port: int) -> tuple[str, ...]:
     return tuple(sorted(origins))
 
 
+def _generic_release_root(
+    release: Path, manifest: Mapping[str, object]
+) -> Path | None:
+    """Keep the byte-exact V39 renderer separate from generic research.
+
+    The frozen V39 manifest predates the generic artifact contract. It has
+    compatibility hashes named ``ir_sha256``/``knowledge_sha256``, but it does
+    not contain the generic source-object closure. Treating those legacy fields
+    as generic artifacts makes a valid V39 candidate fail before it can serve
+    its unchanged frontend.
+    """
+
+    application = manifest.get("application")
+    if not isinstance(application, dict):
+        raise ServiceEntryError("release application identity is missing")
+    source_kind = application.get("source_kind", "git")
+    if source_kind == "legacy_broadcast":
+        return None
+    if source_kind == "git":
+        return release
+    raise ServiceEntryError("release application source kind is invalid")
+
+
 def serve(
     vm_root: Path,
     *,
@@ -285,22 +308,22 @@ def serve(
         var_root=var_root,
         migration_root=migration,
     )
-    app = create_app(
-        settings,
-        {
-            "SECRET_KEY": _secret_key(session_path),
-            "TRUSTED_ORIGINS": _trusted_origins(
-                int(candidate_port) if candidate_probe else int(runtime["port"])
-            ),
-            "SESSION_COOKIE_SECURE": False,
-            "SESSION_COOKIE_HTTPONLY": True,
-            "SESSION_COOKIE_SAMESITE": "Lax",
-            "SESSION_COOKIE_NAME": "quant_hub_broadcast_session",
-            "COMMENT_DATABASE_PATH": comment_db,
-            "RESEARCH_WORKSPACE_DATABASE_PATH": workspace_db,
-            "GENERIC_RESEARCH_RELEASE_ROOT": release,
-        },
-    )
+    application_config: dict[str, object] = {
+        "SECRET_KEY": _secret_key(session_path),
+        "TRUSTED_ORIGINS": _trusted_origins(
+            int(candidate_port) if candidate_probe else int(runtime["port"])
+        ),
+        "SESSION_COOKIE_SECURE": False,
+        "SESSION_COOKIE_HTTPONLY": True,
+        "SESSION_COOKIE_SAMESITE": "Lax",
+        "SESSION_COOKIE_NAME": "quant_hub_broadcast_session",
+        "COMMENT_DATABASE_PATH": comment_db,
+        "RESEARCH_WORKSPACE_DATABASE_PATH": workspace_db,
+    }
+    generic_release_root = _generic_release_root(release, manifest)
+    if generic_release_root is not None:
+        application_config["GENERIC_RESEARCH_RELEASE_ROOT"] = generic_release_root
+    app = create_app(settings, application_config)
     access_gate.install_access_gate(
         app, access_gate.load_password_digest(digest_path)
     )

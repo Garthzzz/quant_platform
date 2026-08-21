@@ -1,0 +1,3 @@
+# 集成课题旧版
+
+方法证据：Use an expanding-window harmonic blend for forecast combination.

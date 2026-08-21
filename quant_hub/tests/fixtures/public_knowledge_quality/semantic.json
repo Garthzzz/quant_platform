@@ -1,0 +1,89 @@
+{
+  "schema_version": "qrh-public-development-knowledge/v1",
+  "items": [
+    {
+      "logical_path": "factor.md",
+      "kind": "method",
+      "quote": "方法证据：先按交易日对齐收益，再用 Rank IC 衡量横截面排序稳定性。 ^src:{cit_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}",
+      "text": "以秩统计量评估次序一致性。",
+      "applicability": {"market": ["A股"], "frequency": ["日频"], "data": ["因子暴露"], "objective": ["选股"]}
+    },
+    {
+      "logical_path": "factor.md",
+      "kind": "condition",
+      "quote": "条件证据：该流程仅适用于 A股、日频、因子暴露和选股任务。",
+      "text": "Only use the procedure for daily A-share factor-selection inputs.",
+      "applicability": {"market": ["A股"], "frequency": ["日频"], "data": ["因子暴露"], "objective": ["选股"]}
+    },
+    {
+      "logical_path": "factor.md",
+      "kind": "limitation",
+      "quote": "限制证据：在低信噪比与极端换手下，秩相关估计不稳定。",
+      "text": "Ordinal dependence becomes unstable under weak signal and excessive turnover.",
+      "applicability": {}
+    },
+    {
+      "logical_path": "model.md",
+      "kind": "method",
+      "quote": "Method evidence: select forecasting models with purged walk-forward validation and an embargo window. ^src:{cit_2222222222222222222222222222222222222222222222222222}",
+      "text": "按时间顺序的滚动样本外流程选择候选模型。",
+      "applicability": {"objective": ["模型选择"]}
+    },
+    {
+      "logical_path": "model.md",
+      "kind": "failure",
+      "quote": "Failure evidence: random train/test splitting leaks future observations into model selection.",
+      "text": "随机切分会造成未来数据泄漏。",
+      "applicability": {}
+    },
+    {
+      "logical_path": "data.md",
+      "kind": "method",
+      "quote": "方法证据：以实际披露时间构造 point-in-time 财报快照，晚到数据只进入下一可用交易日。 ^src:{cit_3333333333333333333333333333333333333333333333333333}",
+      "text": "Build availability-vintage panels before feature imputation.",
+      "applicability": {"data": ["因子暴露"], "objective": ["数据清洗"]}
+    },
+    {
+      "logical_path": "data.md",
+      "kind": "limitation",
+      "quote": "限制证据：报告期结束日不能替代可获得信息的披露时间。",
+      "text": "Period-end timestamps do not prove information availability.",
+      "applicability": {}
+    },
+    {
+      "logical_path": "backtest.md",
+      "kind": "failure",
+      "quote": "Failure evidence: a backtest that ignores capacity and measured turnover overstates implementable returns. ^src:{cit_4444444444444444444444444444444444444444444444444444}",
+      "text": "忽略容量约束会高估净收益。",
+      "applicability": {"objective": ["回测"]}
+    },
+    {
+      "logical_path": "backtest.md",
+      "kind": "method",
+      "quote": "方法证据：按成交额、实际换手率和滑点逐日扣减交易成本。",
+      "text": "Deduct implementation costs from daily net performance.",
+      "applicability": {"objective": ["回测"]}
+    },
+    {
+      "logical_path": "crypto.md",
+      "kind": "method",
+      "quote": "方法证据：使用订单簿不平衡预测加密货币下一分钟收益。",
+      "text": "Use microstructure imbalance for short-horizon prediction.",
+      "applicability": {"market": ["加密货币"], "frequency": ["分钟"], "data": ["订单簿"], "objective": ["短期预测"]}
+    },
+    {
+      "logical_path": "crypto.md",
+      "kind": "condition",
+      "quote": "条件证据：该流程适用于加密货币、分钟频率、订单簿和短期预测。",
+      "text": "The workflow requires crypto order-book observations at minute frequency.",
+      "applicability": {"market": ["加密货币"], "frequency": ["分钟"], "data": ["订单簿"], "objective": ["短期预测"]}
+    },
+    {
+      "logical_path": "history.md",
+      "kind": "method",
+      "quote": "方法证据：采用滚动中位数组合预测。",
+      "text": "Combine current forecasts with a rolling median.",
+      "applicability": {"objective": ["模型选择"]}
+    }
+  ]
+}

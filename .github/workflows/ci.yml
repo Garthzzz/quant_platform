@@ -73,6 +73,7 @@ jobs:
           tests.test_knowledge_semantic_cli
           tests.test_semantic_authority
           tests.test_knowledge_retrieval_eval
+          tests.test_knowledge_public_quality
           tests.test_knowledge_release_build
           tests.test_knowledge_mcp
           tests.test_generic_research_renderer

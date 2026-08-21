@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
 from dataclasses import dataclass, field
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -483,20 +483,45 @@ class WindowsServiceRuntime:
                     return False
             except OSError:
                 return False
-            uri = f"file:{database.as_posix()}?mode=ro"
             try:
-                with closing(sqlite3.connect(uri, uri=True)) as connection:
-                    version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            except (OSError, sqlite3.Error, TypeError, ValueError):
+                header = database.read_bytes()[:100]
+                if len(header) != 100 or header[:16] != b"SQLite format 3\x00":
+                    return False
+                # ``user_version`` is the unsigned big-endian word at offset
+                # 60. Reading the file header cannot create WAL/SHM sidecars in
+                # a quiescent restored checkpoint.
+                version = int.from_bytes(header[60:64], "big", signed=False)
+            except (OSError, TypeError, ValueError):
                 return False
             if version not in readable:
                 return False
         return True
 
     @staticmethod
+    def _sqlite_source_identity(source: Path) -> tuple[tuple[str, int, str], ...]:
+        rows: list[tuple[str, int, str]] = []
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(str(source) + suffix)
+            if not candidate.exists():
+                continue
+            ensure_no_reparse_components(candidate)
+            payload = candidate.read_bytes()
+            rows.append((suffix, len(payload), hashlib.sha256(payload).hexdigest()))
+        return tuple(rows)
+
+    @staticmethod
     def _online_copy(source: Path, destination: Path) -> None:
+        before = WindowsServiceRuntime._sqlite_source_identity(source)
+        suffixes = {row[0] for row in before}
+        # A freshly restored checkpoint has no sidecars. Immutable mode then
+        # copies the exact main database without manufacturing WAL/SHM in
+        # production state. A running D writer already owns sidecars; SQLite's
+        # backup API provides the consistent snapshot while concurrent writes
+        # remain allowed.
+        immutable_source = suffixes == {""}
+        query = "mode=ro&immutable=1" if immutable_source else "mode=ro"
         source_connection = sqlite3.connect(
-            f"file:{source.resolve().as_posix()}?mode=ro", uri=True, timeout=30
+            f"file:{source.resolve().as_posix()}?{query}", uri=True, timeout=30
         )
         destination_connection = sqlite3.connect(destination, timeout=30)
         try:
@@ -505,6 +530,8 @@ class WindowsServiceRuntime:
         finally:
             destination_connection.close()
             source_connection.close()
+        if immutable_source and WindowsServiceRuntime._sqlite_source_identity(source) != before:
+            raise VMDeployCLIError("candidate checkpoint changed production SQLite identity")
 
     @staticmethod
     def _loopback_port() -> int:
@@ -756,6 +783,12 @@ class WindowsServiceRuntime:
                     process.wait(timeout=5)
             ensure_no_reparse_components(probe_root)
             shutil.rmtree(probe_root)
+            try:
+                probe_parent.rmdir()
+            except OSError:
+                # A concurrent serialized probe or retained diagnostic makes
+                # the parent non-empty; never broaden cleanup beyond it.
+                pass
         if evidence is None or evidence["active_unchanged"] is not True:
             raise VMDeployCLIError("candidate probe did not preserve active authority")
         evidence["cleaned"] = not probe_root.exists()

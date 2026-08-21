@@ -39,6 +39,8 @@ from quant_hub.ops.release_identity import (
 SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v1"
 MIRROR_METADATA_SCHEMA = "qrh-user-knowledge-mirror/v1"
 MIRROR_POINTER_SCHEMA = "qrh-user-mirror-pointer/v1"
+MIRROR_ACKNOWLEDGED_SCHEMA = "qrh-user-mirror-acknowledged/v1"
+MIRROR_PENDING_TRANSITION_SCHEMA = "qrh-user-mirror-pending-transition/v1"
 SEARCH_ARTIFACT_RELATIVE_PATH = "content/mcp_search.json"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -75,6 +77,12 @@ class MirrorSnapshot:
     identity: AuthorityIdentity
     synced_at: str
     artifact: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorTransition:
+    from_identity: AuthorityIdentity
+    to_identity: AuthorityIdentity
 
 
 class AuthorityProbe(Protocol):
@@ -898,6 +906,8 @@ class MirrorStore:
         self.root = Path(root)
         self.releases_root = self.root / "releases"
         self.current_path = self.root / "current.json"
+        self.acknowledged_path = self.root / "acknowledged.json"
+        self.pending_transition_path = self.root / "pending_transition.json"
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -910,16 +920,198 @@ class MirrorStore:
             raise MirrorError("mirror manifest SHA-256 is invalid")
         return self.releases_root / identity.manifest_sha256
 
+    def _atomic_json(self, path: Path, value: Mapping[str, object]) -> None:
+        temporary = self.root / f".{path.name}.partial-{uuid4().hex}"
+        temporary.write_text(canonical_json(value), encoding="utf-8", newline="")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _closed_identity(value: object, *, label: str) -> AuthorityIdentity:
+        if not isinstance(value, dict) or set(value) != {
+            "release_id",
+            "manifest_sha256",
+            "snapshot_id",
+        }:
+            raise MirrorError(f"{label} identity is invalid")
+        if (
+            not isinstance(value["release_id"], str)
+            or not value["release_id"]
+            or not isinstance(value["snapshot_id"], str)
+            or not value["snapshot_id"]
+            or not isinstance(value["manifest_sha256"], str)
+            or not _SHA256.fullmatch(value["manifest_sha256"])
+        ):
+            raise MirrorError(f"{label} identity values are invalid")
+        try:
+            return AuthorityIdentity(**value)
+        except TypeError as error:
+            raise MirrorError(f"{label} identity is invalid") from error
+
+    def _acknowledged_identity(self) -> AuthorityIdentity | None:
+        if not self.acknowledged_path.exists():
+            return None
+        _regular_file(self.acknowledged_path)
+        value = _read_json(self.acknowledged_path)
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "identity",
+        }:
+            raise MirrorError("mirror acknowledged pointer fields are not closed")
+        if value["schema_version"] != MIRROR_ACKNOWLEDGED_SCHEMA:
+            raise MirrorError("mirror acknowledged pointer schema is invalid")
+        identity = self._closed_identity(
+            value["identity"], label="mirror acknowledged pointer"
+        )
+        return identity
+
+    def _pending_transition_record(self) -> MirrorTransition | None:
+        if not self.pending_transition_path.exists():
+            return None
+        _regular_file(self.pending_transition_path)
+        value = _read_json(self.pending_transition_path)
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "from_identity",
+            "to_identity",
+        }:
+            raise MirrorError("mirror pending transition fields are not closed")
+        if value["schema_version"] != MIRROR_PENDING_TRANSITION_SCHEMA:
+            raise MirrorError("mirror pending transition schema is invalid")
+        transition = MirrorTransition(
+            from_identity=self._closed_identity(
+                value["from_identity"], label="mirror pending from"
+            ),
+            to_identity=self._closed_identity(
+                value["to_identity"], label="mirror pending to"
+            ),
+        )
+        if transition.from_identity == transition.to_identity:
+            raise MirrorError("mirror pending transition cannot be a no-op")
+        return transition
+
+    def _transition_state(
+        self,
+    ) -> tuple[MirrorSnapshot | None, AuthorityIdentity | None, MirrorTransition | None]:
+        current = self.current()
+        acknowledged = self._acknowledged_identity()
+        pending = self._pending_transition_record()
+        if current is None:
+            if acknowledged is not None or pending is not None:
+                raise MirrorError("mirror transition state exists without current pointer")
+            return None, None, None
+        if acknowledged is None:
+            if pending is not None:
+                raise MirrorError("mirror pending transition has no acknowledged baseline")
+            # Legacy/current-only mirrors are treated as already acknowledged;
+            # the explicit pointer is backfilled before the next transition.
+            return current, current.identity, None
+        if pending is None:
+            if current.identity != acknowledged:
+                raise MirrorError("mirror current identity escaped acknowledged baseline")
+            return current, acknowledged, None
+        if (
+            pending.to_identity == acknowledged
+            and current.identity == acknowledged
+        ):
+            # Crash after the acknowledged pointer commit but before removing
+            # the now-stale pending record. It is already acknowledged.
+            return current, acknowledged, None
+        if pending.from_identity != acknowledged or current.identity not in {
+            pending.from_identity,
+            pending.to_identity,
+        }:
+            raise MirrorError("mirror pending transition is inconsistent")
+        return current, acknowledged, pending
+
+    def pending_transition(self) -> MirrorTransition | None:
+        """Return a validated, durable unacknowledged transition."""
+
+        _current, _acknowledged, pending = self._transition_state()
+        return pending
+
+    def _record_observed_identity(self, identity: AuthorityIdentity) -> None:
+        current, acknowledged, pending = self._transition_state()
+        if current is None:
+            self._write_pointer(identity)
+            self._write_acknowledged(identity)
+            return
+        assert acknowledged is not None
+        if not self.acknowledged_path.exists():
+            self._write_acknowledged(acknowledged)
+        # Remove only a stale record left after a completed acknowledgement.
+        raw_pending = self._pending_transition_record()
+        if (
+            raw_pending is not None
+            and raw_pending.to_identity == acknowledged
+            and current.identity == acknowledged
+        ):
+            self.pending_transition_path.unlink()
+            pending = None
+        if identity == acknowledged:
+            self._write_pointer(identity)
+            if pending is not None and self.pending_transition_path.exists():
+                self.pending_transition_path.unlink()
+            return
+        transition = MirrorTransition(acknowledged, identity)
+        self._write_pending_transition(transition)
+        # Pending is committed first. A crash here leaves current at either
+        # endpoint and is safely resumed without losing the old identity.
+        self._write_pointer(identity)
+
+    def _write_acknowledged(self, identity: AuthorityIdentity) -> None:
+        self._atomic_json(
+            self.acknowledged_path,
+            {
+                "schema_version": MIRROR_ACKNOWLEDGED_SCHEMA,
+                "identity": identity.to_dict(),
+            },
+        )
+
+    def _write_pending_transition(self, transition: MirrorTransition) -> None:
+        self._atomic_json(
+            self.pending_transition_path,
+            {
+                "schema_version": MIRROR_PENDING_TRANSITION_SCHEMA,
+                "from_identity": transition.from_identity.to_dict(),
+                "to_identity": transition.to_identity.to_dict(),
+            },
+        )
+
+    def acknowledge_transition(
+        self, from_identity: AuthorityIdentity, to_identity: AuthorityIdentity
+    ) -> None:
+        current, acknowledged, pending = self._transition_state()
+        if current is None or acknowledged is None:
+            raise MirrorError("mirror transition acknowledgement has no current state")
+        if pending is None:
+            if acknowledged == to_identity and current.identity == to_identity:
+                return
+            raise MirrorError("mirror has no matching pending transition")
+        if (
+            pending != MirrorTransition(from_identity, to_identity)
+            or acknowledged != from_identity
+            or current.identity != to_identity
+        ):
+            raise MirrorError("mirror transition acknowledgement identity mismatch")
+        # Acknowledged pointer commits first. If deletion is interrupted, the
+        # stale pending record is recognized as already acknowledged.
+        self._write_acknowledged(to_identity)
+        if self.pending_transition_path.exists():
+            self.pending_transition_path.unlink()
+
     def sync_from(
         self, identity: AuthorityIdentity, artifact_source: Path | ArtifactSource
     ) -> MirrorSnapshot:
         """Copy one exact release artifact via partial→immutable final."""
 
         self.initialize()
+        # Any corrupt pointer/ack/pending state fails closed before adopting a
+        # newly observed authority identity.
+        self._transition_state()
         final = self._release_path(identity)
         if final.exists():
             snapshot = self.load(identity)
-            self._write_pointer(identity)
+            self._record_observed_identity(identity)
             return snapshot
         partial = self.releases_root / f".{identity.manifest_sha256}.partial-{uuid4().hex}"
         partial.mkdir()
@@ -977,7 +1169,7 @@ class MirrorStore:
             # served, and avoiding recursive cleanup closes a reparse-swap race.
             raise
         snapshot = self.load(identity)
-        self._write_pointer(identity)
+        self._record_observed_identity(identity)
         return snapshot
 
     def _write_pointer(self, identity: AuthorityIdentity) -> None:

@@ -15,8 +15,8 @@ from .contracts import BaseSnapshot, Chunk, canonical_json
 from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
-INDEX_VERSION = "qrh-structured-lexical-index/v1.10-quant-bilingual"
-RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v2"
+INDEX_VERSION = "qrh-structured-lexical-index/v1.12-evidence-span-bound-bilingual"
+RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v3"
 
 # Only relations whose direction adds supporting context may introduce a new
 # evidence card.  Negative edges remain available as structured knowledge, but
@@ -24,16 +24,26 @@ RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v2"
 # or ``fails_under`` and can surface a method that the source explicitly rejects.
 _POSITIVE_EXPANSION_RELATIONS = frozenset({"supports", "requires", "extends"})
 
-_ALIASES = {
-    "ic": ("information coefficient", "信息系数"),
-    "rankic": ("rank ic", "秩相关", "spearman"),
-    "mse": ("mean squared error", "均方误差"),
-    "pca": ("principal component analysis", "主成分分析"),
-    "lstm": ("long short-term memory", "长短期记忆"),
-    "回测": ("backtest",),
-    "因子": ("factor",),
-}
 _ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    # Closed, symmetric acronym/name groups.  The former one-way expansion
+    # found ``information coefficient`` for an ``IC`` query, but not ``IC``
+    # evidence for the English long form.  Symmetric groups keep Chinese,
+    # English and formulas on one deterministic lexical identity without an
+    # embedding model or unrestricted synonym inference.
+    ("ic", "information coefficient", "信息系数"),
+    (
+        "rank ic",
+        "rankic",
+        "秩相关",
+        "spearman",
+        "spearman correlation",
+        "rank correlation",
+    ),
+    ("mse", "mean squared error", "均方误差"),
+    ("pca", "principal component analysis", "主成分分析"),
+    ("lstm", "long short-term memory", "长短期记忆"),
+    ("回测", "backtest"),
+    ("因子", "factor"),
     ("横截面", "cross-sectional", "cross sectional"),
     ("信噪比", "snr", "signal-to-noise ratio", "signal noise ratio"),
     ("前视偏差", "未来数据", "look-ahead bias", "lookahead bias", "future leakage"),
@@ -73,7 +83,8 @@ _ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
     ("财报", "earnings report", "financial statement", "accounting report"),
     ("真实 alpha", "真 alpha", "genuine alpha", "true alpha"),
     ("残差 alpha", "residual alpha", "incremental alpha"),
-    ("风格暴露", "style exposure", "factor exposure"),
+    ("风格暴露", "style exposure"),
+    ("因子暴露", "factor exposure", "factor exposures"),
     ("局部基函数", "local basis function", "piecewise linear encoding", "ple"),
     ("自由度", "degrees of freedom", "model freedom"),
     ("目标对齐", "target alignment", "target-aligned", "target-aware"),
@@ -145,7 +156,21 @@ _ASCII_QUESTION_WORDS = frozenset(
 # closed avoids weakening the fail-closed treatment of unknown capitalized
 # methods and instruments.
 _ASCII_LEADING_REQUEST_VERBS = frozenset(
-    {"compare", "describe", "explain", "outline", "summarize"}
+    {
+        "analyze",
+        "apply",
+        "assess",
+        "calculate",
+        "compare",
+        "describe",
+        "estimate",
+        "evaluate",
+        "explain",
+        "outline",
+        "summarize",
+        "test",
+        "validate",
+    }
 )
 _CJK_QUESTION_PHRASES = tuple(
     sorted(
@@ -265,6 +290,7 @@ class _Record:
     heading_labels: tuple[str, ...]
     canonical_span_id: str
     evidence_span_ids: tuple[str, ...]
+    source_evidence_texts: tuple[str, ...]
     locator: EvidenceLocator
     citation_ids: tuple[str, ...]
     active_status: str
@@ -275,6 +301,12 @@ class _Record:
     applicability: dict[str, tuple[str, ...]]
     relation: dict[str, str] | None
     terms: Counter[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AnchorSurface:
+    ascii_terms: frozenset[str]
+    cjk_text: str
 
 
 def _ascii_morphology(token: str) -> tuple[str, ...]:
@@ -342,19 +374,42 @@ def _alias_surface_present(surface: str, text: str) -> bool:
     return folded_surface in folded_text or compact_surface in compact_text
 
 
+def _alias_matcher(surface: str) -> tuple[str, str, bool]:
+    folded = surface.casefold()
+    compact = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded)
+    return folded, compact, bool(compact.isascii() and len(compact) <= 4)
+
+
+_ALIAS_MATCHERS = tuple(
+    tuple(_alias_matcher(surface) for surface in group)
+    for group in _ALIAS_GROUPS
+)
+_ALIAS_EXPANDED_TERMS = tuple(
+    tuple(
+        term
+        for surface in group
+        for term in _surface_terms(surface)
+    )
+    for group in _ALIAS_GROUPS
+)
+
+
 def _terms(text: str) -> tuple[str, ...]:
     folded = text.casefold()
     values = list(_surface_terms(text))
     expanded = list(values)
-    compact = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded)
-    for key, aliases in _ALIASES.items():
-        if key in values or key == compact:
-            for alias in aliases:
-                expanded.extend(_terms(alias) if alias != text else ())
-    for group in _ALIAS_GROUPS:
-        if any(_alias_surface_present(surface, text) for surface in group):
-            for surface in group:
-                expanded.extend(_surface_terms(surface))
+    compact_text = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded)
+    ascii_terms = frozenset(_ASCII_RE.findall(folded))
+    for matchers, alias_terms in zip(
+        _ALIAS_MATCHERS, _ALIAS_EXPANDED_TERMS, strict=True
+    ):
+        if any(
+            compact in ascii_terms
+            if short_ascii
+            else folded_surface in folded or compact in compact_text
+            for folded_surface, compact, short_ascii in matchers
+        ):
+            expanded.extend(alias_terms)
     return tuple(expanded)
 
 
@@ -520,16 +575,29 @@ def _longest_cjk_match(value: str, haystack: str) -> str | None:
 
 
 def _matched_anchor_groups(query: str, record_text: str) -> tuple[str, ...]:
-    folded_record = record_text.casefold()
-    record_ascii = set(_ASCII_RE.findall(folded_record))
-    record_cjk = "".join(_CJK_RE.findall(folded_record))
+    return _matched_prepared_anchor_groups(
+        _anchor_groups(query), _prepare_anchor_surface(record_text)
+    )
+
+
+def _prepare_anchor_surface(text: str) -> _AnchorSurface:
+    folded = text.casefold()
+    return _AnchorSurface(
+        ascii_terms=frozenset(_ASCII_RE.findall(folded)),
+        cjk_text="".join(_CJK_RE.findall(folded)),
+    )
+
+
+def _matched_prepared_anchor_groups(
+    groups: Sequence[str], surface: _AnchorSurface
+) -> tuple[str, ...]:
     matches: list[str] = []
-    for group in _anchor_groups(query):
+    for group in groups:
         if group.isascii():
-            if group in record_ascii:
+            if group in surface.ascii_terms:
                 matches.append(group)
             continue
-        matched = _longest_cjk_match(group, record_cjk)
+        matched = _longest_cjk_match(group, surface.cjk_text)
         if matched is not None:
             matches.append(matched)
     return tuple(dict.fromkeys(matches))
@@ -716,6 +784,18 @@ class KnowledgeIndex:
         self._initialize_search_runtime(started)
 
     def _initialize_search_runtime(self, started: float) -> None:
+        self._records_by_id = {record.record_id: record for record in self.records}
+        self._records_by_cluster = {
+            record.cluster_id: record
+            for record in self.records
+            if record.cluster_id
+        }
+        self._knowledge_records = tuple(
+            record for record in self.records if record.source_kind == "knowledge"
+        )
+        self._chunk_records = tuple(
+            record for record in self.records if record.source_kind == "chunk"
+        )
         self._active_corpus_terms = {
             term
             for record in self.records
@@ -734,6 +814,84 @@ class KnowledgeIndex:
             )
             for record in self.records
             if record.source_kind == "knowledge"
+        }
+        self._record_anchor_surfaces = {
+            record.record_id: _prepare_anchor_surface(
+                "\n".join(
+                    (
+                        record.title,
+                        *record.aliases,
+                        *record.heading_labels,
+                        record.knowledge_kind or "",
+                        record.text,
+                    )
+                )
+            )
+            for record in self.records
+        }
+        self._source_evidence_terms = {
+            record.record_id: frozenset(
+                _terms(record.source_evidence_texts[0])
+            )
+            for record in self._knowledge_records
+            if record.source_evidence_texts
+        }
+        self._document_anchor_surfaces = {
+            record.document_id: _prepare_anchor_surface(
+                "\n".join((record.title, *record.aliases))
+            )
+            for record in self.records
+        }
+        self._document_identity_values = {
+            record.document_id: frozenset(
+                (
+                    record.title.casefold(),
+                    *(value.casefold() for value in record.aliases),
+                )
+            )
+            for record in self.records
+        }
+        self._document_identity_raw = {
+            record.document_id: (record.title, *record.aliases)
+            for record in self.records
+        }
+        # A formal knowledge item and a deterministic source chunk remain
+        # distinct evidence cards, but their immutable byte locators can prove
+        # that they represent the same exact source passage.  This bridge lets
+        # an explicit kind request (method/condition/limitation/failure) return
+        # the accepted structured row even when its reviewed/model summary is
+        # phrased in another language.  It never creates relevance on its own:
+        # the containing source chunk must first pass every lexical, context,
+        # contrast, history and no-answer gate.
+        chunks_by_span: dict[tuple[str, str], list[_Record]] = defaultdict(list)
+        for chunk in self._chunk_records:
+            for span_id in chunk.evidence_span_ids:
+                chunks_by_span[(chunk.document_version_id, span_id)].append(chunk)
+        self._source_chunks_by_knowledge = {
+            record.record_id: tuple(
+                chunk.record_id
+                for chunk in chunks_by_span.get(
+                    (record.document_version_id, record.canonical_span_id), ()
+                )
+                if chunk.locator.byte_start <= record.locator.byte_start
+                and chunk.locator.byte_end >= record.locator.byte_end
+            )
+            for record in self._knowledge_records
+        }
+        limitations: dict[str, list[str]] = defaultdict(list)
+        failures: dict[str, list[str]] = defaultdict(list)
+        for record in self._knowledge_records:
+            if record.active_status != "active":
+                continue
+            if record.knowledge_kind == "limitation":
+                limitations[record.document_id].append(record.text)
+            elif record.knowledge_kind == "failure":
+                failures[record.document_id].append(record.text)
+        self._limitations_by_document = {
+            key: tuple(dict.fromkeys(values)) for key, values in limitations.items()
+        }
+        self._failures_by_document = {
+            key: tuple(dict.fromkeys(values)) for key, values in failures.items()
         }
         self._document_frequency = Counter(
             term for record in self.records for term in set(record.terms)
@@ -783,6 +941,7 @@ class KnowledgeIndex:
                     "heading_labels": list(record.heading_labels),
                     "canonical_span_id": record.canonical_span_id,
                     "evidence_span_ids": list(record.evidence_span_ids),
+                    "source_evidence_texts": list(record.source_evidence_texts),
                     "locator": asdict(record.locator),
                     "citation_ids": list(record.citation_ids),
                     "active_status": record.active_status,
@@ -871,6 +1030,7 @@ class KnowledgeIndex:
             heading_labels=_heading_labels(ir, chunk.heading_path),
             canonical_span_id=span.span_id,
             evidence_span_ids=tuple(chunk.ordered_span_ids),
+            source_evidence_texts=(),
             locator=EvidenceLocator(
                 span.span_id,
                 span.source_sha256,
@@ -943,6 +1103,7 @@ class KnowledgeIndex:
             heading_labels=_heading_labels(ir, heading_path),
             canonical_span_id=primary.span_id,
             evidence_span_ids=tuple(binding.span_id for binding in item.evidence),
+            source_evidence_texts=tuple(binding.quote for binding in item.evidence),
             locator=EvidenceLocator(
                 primary.span_id,
                 primary.source_sha256,
@@ -1217,75 +1378,20 @@ class KnowledgeIndex:
         query_terms = Counter(_terms(positive_query))
         fts_candidates = self._fts_candidate_ids(query_terms)
         query_folded = positive_query.casefold().strip()
-        rejected_document_ids: set[str] = set()
-        if contrast_negatives:
-            for candidate in self.records:
-                if not include_history and candidate.active_status != "active":
-                    continue
-                candidate_surface = self._knowledge_search_surfaces.get(
-                    candidate.record_id,
-                    "\n".join(
-                        (
-                            candidate.title,
-                            *candidate.aliases,
-                            *candidate.heading_labels,
-                            candidate.text,
-                        )
-                    ),
-                )
-                if any(
-                    _matched_anchor_groups(negative, candidate_surface)
-                    for negative in contrast_negatives
-                ):
-                    rejected_document_ids.add(candidate.document_id)
-        scored: list[tuple[_Record, float, list[str], list[str], list[str]]] = []
-        for record in self.records:
-            if not include_history and record.active_status != "active":
-                continue
-            if record.document_id in rejected_document_ids:
-                continue
-            record_search_text = self._knowledge_search_surfaces.get(
-                record.record_id, ""
+        positive_anchor_groups = _anchor_groups(positive_query)
+        negative_anchor_groups = tuple(
+            _anchor_groups(value) for value in contrast_negatives
+        )
+        document_anchors_by_id = {
+            document_id: _matched_prepared_anchor_groups(
+                positive_anchor_groups, surface
             )
-            if contrast_negatives and not record_search_text:
-                record_search_text = "\n".join(
-                    (
-                        record.title,
-                        *record.aliases,
-                        *record.heading_labels,
-                        record.text,
-                    )
-                )
-            positive_anchors = (
-                _matched_anchor_groups(positive_query, record_search_text)
-                if record_search_text
-                else ()
-            )
-            negative_anchors = tuple(
-                dict.fromkeys(
-                    anchor
-                    for negative in contrast_negatives
-                    for anchor in _matched_anchor_groups(negative, record_search_text)
-                )
-            )
-            # An explicit contrast is a hard constraint on the default positive
-            # evidence lane.  Generic positive words must never outvote a
-            # specifically rejected method and reintroduce it near the tail.
-            if negative_anchors:
-                continue
-            score, reasons = self._lexical_score(record, query_terms)
-            matched_terms = {
-                reason.removeprefix("lexical:")
-                for reason in reasons
-                if reason.startswith("lexical:")
-            }
-            document_anchors = _matched_anchor_groups(
-                positive_query,
-                "\n".join((record.title, *record.aliases)),
-            )
-            strong_document_anchors = tuple(
+            for document_id, surface in self._document_anchor_surfaces.items()
+        }
+        strong_document_anchors_by_id = {
+            document_id: tuple(
                 anchor
-                for anchor in document_anchors
+                for anchor in anchors
                 if any(
                     (
                         surface.strip().casefold() == anchor
@@ -1299,30 +1405,104 @@ class KnowledgeIndex:
                             )
                         )
                     )
-                    for surface in (record.title, *record.aliases)
+                    for surface in self._document_identity_raw[document_id]
                 )
             )
+            for document_id, anchors in document_anchors_by_id.items()
+        }
+        rejected_document_ids: set[str] = set()
+        if contrast_negatives:
+            for candidate in self.records:
+                if not include_history and candidate.active_status != "active":
+                    continue
+                if any(
+                    _matched_prepared_anchor_groups(
+                        groups,
+                        self._record_anchor_surfaces[candidate.record_id],
+                    )
+                    for groups in negative_anchor_groups
+                ):
+                    rejected_document_ids.add(candidate.document_id)
+        scored: list[tuple[_Record, float, list[str], list[str], list[str]]] = []
+        for record in self.records:
+            if not include_history and record.active_status != "active":
+                continue
+            if record.document_id in rejected_document_ids:
+                continue
+            record_search_text = self._knowledge_search_surfaces.get(
+                record.record_id, ""
+            )
+            positive_anchors = (
+                _matched_prepared_anchor_groups(
+                    positive_anchor_groups,
+                    self._record_anchor_surfaces[record.record_id],
+                )
+                if record_search_text
+                else ()
+            )
+            negative_anchors = tuple(
+                dict.fromkeys(
+                    anchor
+                    for groups in negative_anchor_groups
+                    for anchor in _matched_prepared_anchor_groups(
+                        groups,
+                        self._record_anchor_surfaces[record.record_id],
+                    )
+                )
+            )
+            # An explicit contrast is a hard constraint on the default positive
+            # evidence lane.  Generic positive words must never outvote a
+            # specifically rejected method and reintroduce it near the tail.
+            if negative_anchors:
+                continue
+            document_anchors = document_anchors_by_id[record.document_id]
+            strong_document_anchors = strong_document_anchors_by_id[
+                record.document_id
+            ]
+            document_route_bonus = (
+                min(4.5, 1.5 * len(document_anchors))
+                if document_anchors
+                else 0.0
+            )
+            exact_match = query_folded in {
+                record.document_id.casefold(),
+                record.document_version_id.casefold(),
+            } or query_folded in self._document_identity_values[record.document_id]
+            short_substring_match = (
+                len(query_folded) <= 3
+                and query_folded in record.text.casefold()
+            )
+            # FTS is a deterministic candidate router over the exact term bag.
+            # A row outside FTS, document identity and exact/short routing has
+            # zero lexical coverage and cannot pass the no-answer floor.  Skip
+            # its BM25/applicability work while preserving every accepted row.
+            if (
+                record.record_id not in fts_candidates
+                and not document_anchors
+                and not exact_match
+                and not short_substring_match
+            ):
+                continue
+            score, reasons = self._lexical_score(record, query_terms)
             if document_anchors:
                 # Route named research/method identity to its passages without
                 # injecting the H1 title into every passage's BM25 term bag.
                 # The bounded bonus selects a document; local headings/text
                 # must still compete for passage rank inside that document.
-                score += min(4.5, 1.5 * len(document_anchors))
+                score += document_route_bonus
                 reasons.extend(
                     f"route:document-anchor:{anchor}"
                     for anchor in document_anchors[:3]
                 )
-            exact_values = {
-                record.document_id.casefold(),
-                record.document_version_id.casefold(),
-                record.title.casefold(),
-                *(alias.casefold() for alias in record.aliases),
+            matched_terms = {
+                reason.removeprefix("lexical:")
+                for reason in reasons
+                if reason.startswith("lexical:")
             }
-            exact_match = query_folded in exact_values
             if exact_match:
                 score += 12.0
                 reasons.append("exact:id-alias-title")
-            elif len(query_folded) <= 3 and query_folded in record.text.casefold():
+            elif short_substring_match:
                 score += 0.75
                 reasons.append("short-substring-fallback")
             if record.record_id in fts_candidates:
@@ -1420,6 +1600,86 @@ class KnowledgeIndex:
             ):
                 scored.append((record, score, reasons, matches, conflicts))
 
+        if kind_preferences:
+            scored_ids = {record.record_id for record, *_rest in scored}
+            scored_chunks = {
+                record.record_id: (record, score, reasons, matches, conflicts)
+                for record, score, reasons, matches, conflicts in scored
+                if record.source_kind == "chunk"
+            }
+            for record in self._knowledge_records:
+                if (
+                    record.record_id in scored_ids
+                    or record.knowledge_kind not in kind_preferences
+                    or (not include_history and record.active_status != "active")
+                    or record.document_id in rejected_document_ids
+                ):
+                    continue
+                # The containing chunk is only a carrier for the immutable
+                # locator.  It may contain several source spans or unrelated
+                # clauses, so its lexical score cannot by itself establish
+                # relevance for this formal row.  At least one deterministic
+                # query term must occur in this knowledge item's canonical
+                # primary exact-evidence quote before kind promotion is allowed.
+                # Controlled bilingual aliases are part of the deterministic
+                # lexical identity, so a cross-language query may match the
+                # primary quote through that closed vocabulary.  It must still
+                # share at least one such term with this item's evidence;
+                # terms found only elsewhere in the carrier chunk do not count.
+                evidence_terms = set(query_terms).intersection(
+                    self._source_evidence_terms[record.record_id]
+                )
+                if not evidence_terms:
+                    continue
+                containing = [
+                    scored_chunks[chunk_id]
+                    for chunk_id in self._source_chunks_by_knowledge.get(
+                        record.record_id, ()
+                    )
+                    if chunk_id in scored_chunks
+                ]
+                if not containing:
+                    continue
+                negative_anchors = tuple(
+                    anchor
+                    for groups in negative_anchor_groups
+                    for anchor in _matched_prepared_anchor_groups(
+                        groups,
+                        self._record_anchor_surfaces[record.record_id],
+                    )
+                )
+                if negative_anchors:
+                    continue
+                applicability_bonus, matches, conflicts = self._applicability(
+                    record, context
+                )
+                if conflicts and not include_conflicts:
+                    continue
+                (
+                    source_record,
+                    source_score,
+                    _source_reasons,
+                    _source_matches,
+                    _source_conflicts,
+                ) = max(containing, key=lambda value: value[1])
+                promoted_score = max(
+                    minimum_score,
+                    source_score * 0.97 + applicability_bonus,
+                )
+                reasons = [
+                    f"intent_kind:{record.knowledge_kind}",
+                    "route:explicit-kind-intent",
+                    "route:formal-grounded-evidence",
+                    f"route:source-evidence-query-match:{record.canonical_span_id}",
+                    f"route:exact-source-evidence-kind:{source_record.record_id}",
+                ]
+                reasons.extend(
+                    f"applicability_conflict:{value}" for value in conflicts
+                )
+                scored.append(
+                    (record, promoted_score, reasons, matches, conflicts)
+                )
+
         # Expand only accepted, current, positive relations and do not let
         # relation paths multiply evidence weight.  A relation is a recall hint,
         # not a bypass around the query's explicit rejection or applicability
@@ -1428,15 +1688,15 @@ class KnowledgeIndex:
         # to their formal source record and are never inverted into a positive
         # target recommendation.
         relation_additions: list[tuple[_Record, float, list[str], list[str], list[str]]] = []
-        by_id = {record.record_id: record for record in self.records}
-        by_cluster = {record.cluster_id: record for record in self.records if record.cluster_id}
         for record, score, reasons, matches, conflicts in scored:
             if record.source_kind != "knowledge" or record.relation is None:
                 continue
             relation_type = record.relation["type"]
             if relation_type not in _POSITIVE_EXPANSION_RELATIONS:
                 continue
-            target = by_id.get(record.relation["target_id"]) or by_cluster.get(record.relation["target_id"])
+            target = self._records_by_id.get(
+                record.relation["target_id"]
+            ) or self._records_by_cluster.get(record.relation["target_id"])
             if target is None or (not include_history and target.active_status != "active"):
                 continue
             if target.document_id in rejected_document_ids:
@@ -1523,16 +1783,6 @@ class KnowledgeIndex:
                     resulting_spans,
                 )
 
-        limitations_by_document: dict[str, list[str]] = defaultdict(list)
-        failures_by_document: dict[str, list[str]] = defaultdict(list)
-        for record in self.records:
-            if record.active_status != "active" or record.source_kind != "knowledge":
-                continue
-            if record.knowledge_kind == "limitation":
-                limitations_by_document[record.document_id].append(record.text)
-            elif record.knowledge_kind == "failure":
-                failures_by_document[record.document_id].append(record.text)
-
         score_ordered = sorted(
             grouped.items(),
             key=lambda item: (-item[1][1], item[1][0].document_id, item[1][0].record_id),
@@ -1590,8 +1840,10 @@ class KnowledgeIndex:
                     applicability=record.applicability,
                     applicability_matches=tuple(sorted(matches)),
                     applicability_conflicts=tuple(sorted(conflicts)),
-                    limitations=tuple(dict.fromkeys(limitations_by_document[record.document_id])),
-                    failures=tuple(dict.fromkeys(failures_by_document[record.document_id])),
+                    limitations=self._limitations_by_document.get(
+                        record.document_id, ()
+                    ),
+                    failures=self._failures_by_document.get(record.document_id, ()),
                 )
             )
         answerable = bool(cards)
@@ -1622,6 +1874,7 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
         "heading_labels",
         "canonical_span_id",
         "evidence_span_ids",
+        "source_evidence_texts",
         "locator",
         "citation_ids",
         "active_status",
@@ -1682,6 +1935,7 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
                 "heading_path",
                 "heading_labels",
                 "evidence_span_ids",
+                "source_evidence_texts",
                 "citation_ids",
             )
             relation = raw["relation"]
@@ -1783,6 +2037,9 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
                     canonical_span_id=str(raw["canonical_span_id"]),
                     evidence_span_ids=tuple(
                         str(value) for value in raw["evidence_span_ids"]
+                    ),
+                    source_evidence_texts=tuple(
+                        str(value) for value in raw["source_evidence_texts"]
                     ),
                     locator=EvidenceLocator(**locator),
                     citation_ids=tuple(str(value) for value in raw["citation_ids"]),
@@ -1934,6 +2191,7 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
                     "heading_path": tuple(str(value) for value in source["heading_path"]),
                     "canonical_span_id": ordered_spans[0],
                     "evidence_span_ids": ordered_spans,
+                    "source_evidence_texts": (),
                     "citation_ids": tuple(str(value) for value in source["citation_ids"]),
                     "fact_status": "source_explicit",
                     "knowledge_kind": None,
@@ -1960,12 +2218,35 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
                 }
             else:
                 locator = source["source_locator"]
+                source_locators = source["source_locators"]
+                if (
+                    not isinstance(source_locators, list)
+                    or len(source_locators) != len(record.source_evidence_texts)
+                    or any(
+                        not isinstance(source_locator, Mapping)
+                        or not isinstance(source_locator.get("quote_sha256"), str)
+                        for source_locator in source_locators
+                    )
+                    or any(
+                        hashlib.sha256(text.encode("utf-8")).hexdigest()
+                        != source_locator["quote_sha256"]
+                        for text, source_locator in zip(
+                            record.source_evidence_texts,
+                            source_locators,
+                            strict=True,
+                        )
+                    )
+                ):
+                    raise ValueError(
+                        "retrieval record source evidence differs from canonical locators"
+                    )
                 expected_specific = {
                     "heading_path": tuple(str(value) for value in source["heading_path"]),
                     "canonical_span_id": str(locator["span_id"]),
                     "evidence_span_ids": tuple(
                         str(value) for value in source["source_span_ids"]
                     ),
+                    "source_evidence_texts": record.source_evidence_texts,
                     "citation_ids": tuple(str(value) for value in source["citation_ids"]),
                     "fact_status": str(source["fact_status"]),
                     "knowledge_kind": str(source["kind"]),

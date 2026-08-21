@@ -67,6 +67,86 @@ hash；只逐个删除 exact root child，永不删除 root、D 上级、sibling
 旧 C writer authority。inspect、apply-intent 和 applied evidence 自动追加到 off-host
 `RECOVERY_ROOT\evidence\prepare-empty`。
 
+### 一次性 qualification 重置
+
+如果 V39 qualification bundle 已成功物化、但隔离 candidate 在任何 activation 或
+writer handoff 之前失败，不得用普通 `prepare-empty` 绕过 active pointer，也不得原地
+替换 tooling。仅可对同一份已完整验证的 bundle 显式增加
+`--qualification-reset-materialized`，先 inspect、再用同一 nonce 与原样 inventory hash
+apply；其他参数与上例相同：
+
+```powershell
+qrh-cold-restore prepare-empty ... --mode inspect `
+  --qualification-reset-materialized `
+  --intent-nonce <ONE_TIME_RANDOM_NONCE>
+
+qrh-cold-restore prepare-empty ... --mode apply `
+  --qualification-reset-materialized `
+  --intent-nonce <SAME_ONE_TIME_RANDOM_NONCE> `
+  --expected-pre-delete-inventory-sha256 <INSPECTED_SHA256>
+```
+
+此模式只接受 `.240` exact D 根中的同一 V39 release/manifest、canonical active pointer、
+materialization event、operational bootstrap/tooling、restore tool 和 checkpoint 两库。
+`QuantResearchHub` 服务、任何 D-root 进程/监听、activation/writer-handoff journal 或 receipt、
+未知文件/目录、reparse/alternate stream、非零 WAL、异常 SHM、额外 state 都会拒绝执行。
+qualification 的 legacy deployment ID 是代码常量，不接受操作者提供另一个“V39”别名。
+off-host independence probe 必须绑定当前 bundle 的 exact closure inventory hash；同一
+verified recovery manifest 必须单向绑定该 closure、release manifest 和 checkpoint。
+D 资格重置还要求 failure-domain attestation 原始文件逐字节等于 canonical JSON；其
+file SHA-256 必须进入 inspection、apply-intent 与 applied 三份 closed evidence。apply 在
+写 intent 前和发出远端删除前均重新读取并验证同一 canonical bytes/file SHA，语义等价的
+空白或字段重排也视为 identity 改变并拒绝。
+D 内 materialization event 与 production host facts 则必须分别逐字节等于正式发布到
+off-host 的 canonical event 和 production-facts 文件（长度与 SHA-256 都相同），不能只做
+字段近似比较。
+
+当前真实失败路径必须恰好存在一份 `deploy-candidate_only` / `failed` VM write audit。
+audit 自身必须是 `write_atomic_new_json` 的 canonical bytes，且 `audit_id`、路径、closed
+declared write set、每条 `path/relative_path/change/entry_type/bytes/sha256` 都与当前残留
+机械一致。唯一可识别的残留是两库成对出现的零字节 WAL、标准 32 KiB SHM，以及空的
+`tmp\candidate-probes` / `tmp\deployment-cli`（允许 audit 记录现有 `state` 目录的 metadata
+变化）；缺少或多出 audit/残留都会拒绝。它们仍被纳入 inspect 的 exact inventory hash、
+逐 top-level subtree hash 和 apply 的 TOCTOU 复核。apply 只删除已复核的 exact root
+children，成功后保留空根，不生成 activation 或 recovery receipt，并须立即用同一 bundle
+重新 `restore`。
+
+Windows PowerShell 5.1 的 `Get-Item -Stream` 不足以证明目录 ADS 缺失；Microsoft 只从
+PowerShell 7.2 起声明目录 stream 支持。因此 reset 脚本通过 `Reflection.Emit` 在当前
+PowerShell 进程内直接声明 Win32 `FindFirstStreamW` / `FindNextStreamW` / `FindClose`，
+枚举 root、全部目录和文件；不使用 `Add-Type`、编译器、临时源码、pycache 或 D 内 Python。
+同一无写绑定还用 `GetShortPathNameW` 获取 exact root 的真实 long/short identity；D 进程与
+listener 检查统一归一 `/`、`\` 和 `\\?\` 前缀并按完整路径边界匹配，既不能用 8.3/extended
+路径绕过，也不能粗暴拒绝不属于项目根的其他 D 盘进程。任何 named stream、枚举错误或
+entry-count 差异都 fail closed。
+
+仅 inspect 在 release、operational bootstrap 的全部依赖、state、audit、目录、ADS、reparse、
+closed top-level 与未知项均已机械闭合后，才允许调用逐字节验证过的 D Python，以 stdin
+执行固定 probe，验证唯一 failed candidate audit 的 canonical bytes 与精确 scalar 类型；
+整个闭包随后再验一次。apply 消费这份 immutable inspection identity，只进行 exact inventory、
+subtree、C/D 运行态与 TOCTOU 重验，绝不执行 D Python；因此 tooling 已先被删除或 root 已空的
+同 intent 重试仍能由 off-script PowerShell 能力独立完成。
+API 语义见 [Get-Item -Stream](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.management/get-item)
+、[FindFirstStreamW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirststreamw)
+、[FindNextStreamW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextstreamw)
+与 [GetShortPathNameW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getshortpathnamew)。
+
+若 SSH 响应在删除后丢失，只能用同一 nonce、同一 inspected hash 和已存在的 off-host
+apply-intent 重试。空根可直接复核；若只完成了部分 top-level child 删除，则当前 top-level
+集合必须是原闭包的严格子集，且每个仍存在 child 的完整 subtree inventory hash 必须逐项
+等于 inspect 证据。未知 child、某个 child 内部仅删一部分、任何内容/ADS/reparse 变化均
+拒绝继续。每次 retry 仍重复 C V39、D service/process/listener 和完整 inventory 门禁，
+只继续删除剩余 exact root children；不创建第二个 intent。该分支仅用于本次“从未激活”
+的 qualification，不能作为活动生产根清空或 tooling 热更新接口。其证据单独位于
+`RECOVERY_ROOT\evidence\prepare-empty-qualification-reset`。
+
+旧 C V39 健康门禁必须把 8765 的唯一 listener owning PID 绑定到同一个 CIM process；
+`ExecutablePath` 与 Windows 官方 argv 解析后的 argv0 必须是同一个
+`C:\quant_platform` 内 Python，argv 必须恰好为 `<python> -I
+C:\quant_platform\tools\viewer\server.py`。server bytes/hash、`/deploymentz` 的严格字段集、
+PID、端口与固定 `quant-hub-v39-company-broadcast-20260731-hotfix1` identity 必须同时一致；
+仅在 CommandLine 中出现 C 路径子串不算通过。
+
 远端 materialization event 成功返回后，`restore` 会将 canonical、fsync、immutable
 副本写入显式 `--evidence-output`；该路径必须位于 Git 外
 `RECOVERY_ROOT\evidence\cold-materialization`。后续 independence probe 直接消费这份

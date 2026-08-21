@@ -100,8 +100,23 @@ class KnowledgeMCPService:
     def _resolve(self, *, allow_stale: bool) -> Resolution:
         try:
             local = self.store.current()
+            durable_pending = self.store.pending_transition()
         except (MirrorError, KeyError, TypeError, ValueError, OSError):
-            local = None
+            self._pending_transition = None
+            return Resolution(
+                availability="unavailable",
+                mirror=None,
+                local_identity=None,
+                observed_identity=None,
+                verified_at=None,
+                last_verified_at=self._last_verified_at,
+                reason="mirror_identity_or_transition_corrupt",
+            )
+        self._pending_transition = (
+            (durable_pending.from_identity, durable_pending.to_identity)
+            if durable_pending is not None
+            else None
+        )
         local_identity = local.identity if local else None
         try:
             observation = self.authority.probe()
@@ -116,10 +131,14 @@ class KnowledgeMCPService:
                 reason="authority_unreachable_or_unverifiable",
             )
         observed = observation.identity
-        if local_identity != observed:
+        if local_identity != observed or (
+            durable_pending is not None
+            and local_identity == durable_pending.from_identity
+        ):
             try:
                 local = self.store.sync_from(observed, self.artifact_release_root)
                 local_identity = local.identity
+                durable_pending = self.store.pending_transition()
             except (MirrorError, KeyError, TypeError, ValueError, OSError):
                 return Resolution(
                     availability="stale" if allow_stale and local else "unavailable",
@@ -131,12 +150,17 @@ class KnowledgeMCPService:
                     reason="mirror_missing_lagging_or_sync_failed",
                 )
         self._last_verified_at = observation.verified_at
-        changed_from = None
+        changed_from = (
+            durable_pending.from_identity if durable_pending is not None else None
+        )
+        self._pending_transition = (
+            (durable_pending.from_identity, durable_pending.to_identity)
+            if durable_pending is not None
+            else None
+        )
         if self._session_identity is None:
             self._session_identity = observed
         elif self._session_identity != observed:
-            changed_from = self._session_identity
-            self._pending_transition = (self._session_identity, observed)
             self._session_identity = observed
         return Resolution(
             availability="fresh",
@@ -151,6 +175,7 @@ class KnowledgeMCPService:
 
     def _base(self, resolution: Resolution) -> dict[str, Any]:
         identity = resolution.mirror.identity if resolution.mirror else None
+        pending = self._pending_transition
         return {
             "schema_version": SERVICE_SCHEMA,
             "availability": resolution.availability,
@@ -161,14 +186,15 @@ class KnowledgeMCPService:
             "last_authority_verified_at": resolution.last_verified_at,
             "mirror_synced_at": resolution.mirror.synced_at if resolution.mirror else None,
             "reason": resolution.reason,
+            "transition_pending": pending is not None,
+            "pending_from_identity": _identity(pending[0]) if pending else None,
+            "pending_to_identity": _identity(pending[1]) if pending else None,
             "source_is_untrusted_data": True,
         }
 
     def _blocked(self, resolution: Resolution) -> dict[str, Any] | None:
         if resolution.mirror is None:
             return {**self._base(resolution), "results": [], "truncated": False}
-        if resolution.availability != "fresh":
-            return None
         if self._pending_transition is None:
             return None
         old, new = self._pending_transition
@@ -509,6 +535,19 @@ class KnowledgeMCPService:
         resolution = self._resolve(allow_stale=allow_stale)
         if resolution.mirror is None:
             return {**self._base(resolution), "status": "unavailable", "updates": []}
+        if (
+            self._pending_transition is not None
+            and resolution.availability != "fresh"
+        ):
+            old_identity, new_identity = self._pending_transition
+            return {
+                **self._base(resolution),
+                "status": "snapshot_refresh_unavailable",
+                "updates": [],
+                "refresh_acknowledged": False,
+                "changed_from": old_identity.to_dict(),
+                "changed_to": new_identity.to_dict(),
+            }
         current = resolution.mirror
         previous = self.store.find_snapshot(from_snapshot_id)
         if previous is None:
@@ -520,6 +559,7 @@ class KnowledgeMCPService:
                 ):
                     # The caller acknowledged the transition; no retained
                     # baseline exists to enumerate, so search/get may restart.
+                    self.store.acknowledge_transition(old_identity, new_identity)
                     self._pending_transition = None
             return {
                 **self._base(resolution),
@@ -613,6 +653,10 @@ class KnowledgeMCPService:
                 str(row.get("change") or ""),
             )
         )
+        update_summary: dict[str, int] = {}
+        for row in updates:
+            change = str(row.get("change") or "unknown")
+            update_summary[change] = update_summary.get(change, 0) + 1
         request_hash = hashlib.sha256(
             canonical_json({"from_snapshot_id": from_snapshot_id}).encode()
         ).hexdigest()
@@ -643,20 +687,29 @@ class KnowledgeMCPService:
             used += row_size
             index += 1
         truncated = index < len(updates)
-        if not truncated and self._pending_transition is not None:
+        refresh_acknowledged = False
+        if self._pending_transition is not None:
             old_identity, new_identity = self._pending_transition
             if (
                 old_identity.snapshot_id == from_snapshot_id
                 and new_identity == current.identity
             ):
+                # A verified summary plus bounded sample acknowledges the
+                # identity transition. Exhaustive pagination remains an
+                # optional audit operation and must not block search/get.
+                self.store.acknowledge_transition(old_identity, new_identity)
                 self._pending_transition = None
+                refresh_acknowledged = True
         return {
             **self._base(resolution),
             "status": "ok",
             "from_snapshot_id": from_snapshot_id,
             "to_snapshot_id": current.identity.snapshot_id,
+            "update_count": len(updates),
+            "update_summary": update_summary,
             "updates": selected,
             "truncated": truncated,
+            "refresh_acknowledged": refresh_acknowledged,
             "continuation": self._cursor(
                 identity=current.identity,
                 tool="list_knowledge_updates",

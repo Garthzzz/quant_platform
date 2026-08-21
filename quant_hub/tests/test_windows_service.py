@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 
 from quant_hub.ops.release_identity import manifest_sha256
+from quant_hub.ops.service_entry import ServiceEntryError, _generic_release_root
 from quant_hub.ops.windows_service import (
     SERVICE_CLASS,
     ServiceSupervisor,
@@ -94,6 +95,23 @@ class FakeInstaller:
 
 
 class WindowsServiceTopologyTests(unittest.TestCase):
+    def test_legacy_v39_does_not_enable_generic_release_loader(self) -> None:
+        release = Path("release-v39")
+        self.assertIsNone(
+            _generic_release_root(
+                release,
+                {"application": {"source_kind": "legacy_broadcast"}},
+            )
+        )
+        self.assertEqual(
+            release,
+            _generic_release_root(release, {"application": {"source_kind": "git"}}),
+        )
+        with self.assertRaisesRegex(ServiceEntryError, "source kind is invalid"):
+            _generic_release_root(
+                release, {"application": {"source_kind": "other"}}
+            )
+
     def test_reviewed_login_surface_is_byte_exact_v39_template(self) -> None:
         self.assertEqual(
             "ca3d95b83af6778f5d7d77946af0af097ea8226eb0ba53d2afa5001f365e30f4",
@@ -498,7 +516,9 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                 for path in (self.root / "state").glob("*.sqlite3")
             },
         )
-        self.assertEqual([], list((self.root / "tmp" / "candidate-probes").iterdir()))
+        self.assertFalse(any((self.root / "state").glob("*.sqlite3-wal")))
+        self.assertFalse(any((self.root / "state").glob("*.sqlite3-shm")))
+        self.assertFalse((self.root / "tmp" / "candidate-probes").exists())
 
     def test_candidate_probe_rejects_wrong_one_time_login_and_cleans(self) -> None:
         release = self.releases["release-r2"]
@@ -537,7 +557,7 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         self.assertEqual(
             active_before, (self.root / "control" / "active_release.json").read_bytes()
         )
-        self.assertEqual([], list((self.root / "tmp" / "candidate-probes").iterdir()))
+        self.assertFalse((self.root / "tmp" / "candidate-probes").exists())
     def test_install_candidate_is_hashed_idempotent_and_d_root_configured(self) -> None:
         executable = (
             self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"

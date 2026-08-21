@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 from datetime import UTC, datetime
+import gzip
 import hashlib
 import json
 import os
@@ -29,7 +30,11 @@ from .publish_adapters import (
 )
 from .publish_runtime import RuntimePublishConfig
 from .recovery_bundle import RecoveryVerification, verify_recovery_bundle
-from .vm_boundary import PRODUCTION_WRITE_AREAS
+from .failure_domain import attest_failure_domain
+from .vm_boundary import (
+    PRODUCTION_WRITE_AREAS,
+    declared_production_vm_write_set,
+)
 
 
 class ColdRestoreCLIError(RuntimeError):
@@ -40,8 +45,261 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PREPARE_INSPECTION_SCHEMA = "qrh-prepare-empty-inspection/v1"
 _PREPARE_APPLY_SCHEMA = "qrh-prepare-empty-application/v1"
+_QUALIFICATION_RESET_INSPECTION_SCHEMA = (
+    "qrh-prepare-empty-qualification-reset-inspection/v1"
+)
+_QUALIFICATION_RESET_APPLY_SCHEMA = (
+    "qrh-prepare-empty-qualification-reset-application/v1"
+)
 _LEGACY_V39_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
 _TRANSFER_ATTEMPT_SCHEMA = "qrh-cold-restore-transfer-attempt/v1"
+
+# The D-root Python may run only after the complete operational/file closure is
+# proven.  It is used solely to prove the existing VM-write audit has the exact
+# canonical byte format emitted by write_atomic_new_json; ADS and argv checks
+# use the off-script Reflection.Emit Win32 binding below and never depend on D.
+_CANONICAL_AUDIT_PROBE = r'''import hashlib as h
+import json as j
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+audit = os.path.abspath(sys.argv[2])
+if os.path.commonpath([os.path.normcase(root), os.path.normcase(audit)]) != os.path.normcase(root):
+    raise RuntimeError("qualification_audit_path_escape")
+raw = open(audit, "rb").read()
+v = j.loads(raw.decode("utf-8"))
+canonical = (j.dumps(v, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+if raw != canonical:
+    raise RuntimeError("qualification_candidate_audit_not_canonical")
+declared = j.dumps(
+    v.get("declared_write_set"), ensure_ascii=False, sort_keys=True,
+    separators=(",", ":"), allow_nan=False,
+).encode("utf-8")
+strings = ("schema_version", "operation", "authority_root", "verdict", "audit_id", "outcome", "audit_record_path")
+writes = v.get("observed_writes")
+ok = all(type(v.get(n)) is str for n in strings) and type(v.get("declared_write_set")) is dict and type(writes) is list
+if ok:
+    ok = all(type(n) is str and type(p) is str for n, p in v["declared_write_set"].items())
+if ok:
+    ok = all(type(w) is dict and all(type(w.get(n)) is str for n in ("path", "relative_path", "change", "entry_type")) and type(w.get("bytes")) is int and (w.get("sha256") is None or type(w.get("sha256")) is str) for w in writes)
+if not ok:
+    raise RuntimeError("qualification_candidate_audit_scalar_type")
+print(j.dumps({
+    "canonical_json_sha256": h.sha256(raw).hexdigest(),
+    "declared_write_set_sha256": h.sha256(declared).hexdigest(),
+    "scalar_types_valid": True,
+}, sort_keys=True, separators=(",", ":")))
+'''
+
+
+def _qualification_native_probe_script() -> str:
+    """Return an in-memory Win32 binding with no Add-Type/compiler/temp use."""
+
+    return (
+        "function Initialize-QrhQualificationNative{"
+        "$an=New-Object Reflection.AssemblyName('QrhQualificationNative');"
+        "$ab=[AppDomain]::CurrentDomain.DefineDynamicAssembly($an,"
+        "[Reflection.Emit.AssemblyBuilderAccess]::Run);"
+        "$mb=$ab.DefineDynamicModule('q');$tb=$mb.DefineType('QrhNative',"
+        "[Reflection.TypeAttributes]'Public,Sealed,Abstract');"
+        "$ma=[Reflection.MethodAttributes]'Public,Static,PinvokeImpl';"
+        "$cc=[Reflection.CallingConventions]::Standard;"
+        "$wc=[Runtime.InteropServices.CallingConvention]::Winapi;"
+        "$uc=[Runtime.InteropServices.CharSet]::Unicode;"
+        "function Add-QrhPInvoke([string]$Name,[string]$Dll,[Type]$Return,"
+        "[Type[]]$Parameters){$method=$tb.DefinePInvokeMethod($Name,$Dll,$ma,$cc,"
+        "$Return,$Parameters,$wc,$uc);$method.SetImplementationFlags("
+        "$method.GetMethodImplementationFlags()-bor"
+        "[Reflection.MethodImplAttributes]::PreserveSig)};"
+        "Add-QrhPInvoke 'FindFirstStreamW' 'kernel32.dll' ([IntPtr]) "
+        "([Type[]]@([string],[int],[IntPtr],[int]));"
+        "Add-QrhPInvoke 'FindNextStreamW' 'kernel32.dll' ([bool]) "
+        "([Type[]]@([IntPtr],[IntPtr]));"
+        "Add-QrhPInvoke 'FindClose' 'kernel32.dll' ([bool]) "
+        "([Type[]]@([IntPtr]));"
+        "Add-QrhPInvoke 'GetLastError' 'kernel32.dll' ([uint32]) ([Type[]]@());"
+        "Add-QrhPInvoke 'GetShortPathNameW' 'kernel32.dll' ([uint32]) "
+        "([Type[]]@([string],[Text.StringBuilder],[uint32]));"
+        "Add-QrhPInvoke 'CommandLineToArgvW' 'shell32.dll' ([IntPtr]) "
+        "([Type[]]@([string],[IntPtr]));"
+        "Add-QrhPInvoke 'LocalFree' 'kernel32.dll' ([IntPtr]) "
+        "([Type[]]@([IntPtr]));return $tb.CreateType()};"
+        "$qrhNative=Initialize-QrhQualificationNative;"
+        "function Get-QrhRootVariants{"
+        "$long=$root.Replace('/','\\').TrimEnd('\\');"
+        "$buffer=New-Object Text.StringBuilder(32768);"
+        "$length=$qrhNative::GetShortPathNameW($long,$buffer,[uint32]$buffer.Capacity);"
+        "if($length-eq 0-or$length-ge$buffer.Capacity)"
+        "{throw 'qualification_root_short_path_unavailable'};"
+        "$short=$buffer.ToString().Replace('/','\\').TrimEnd('\\');"
+        "return @(@($long,$short)|Select-Object -Unique)};"
+        "$qrhRootVariants=@(Get-QrhRootVariants);"
+        "function Get-QrhWindowsArgv([string]$CommandLine){"
+        "if([string]::IsNullOrWhiteSpace($CommandLine))"
+        "{throw 'qualification_command_line_absent'};"
+        "$count=[Runtime.InteropServices.Marshal]::AllocHGlobal(4);"
+        "[Runtime.InteropServices.Marshal]::WriteInt32($count,0);"
+        "$pointer=[IntPtr]::Zero;try{$pointer=$qrhNative::CommandLineToArgvW("
+        "$CommandLine,$count);$length=[Runtime.InteropServices.Marshal]::ReadInt32($count);"
+        "if($pointer-eq[IntPtr]::Zero-or$length-lt 1-or$length-gt 32)"
+        "{throw 'qualification_command_line_invalid'};"
+        "$values=New-Object 'System.Collections.Generic.List[string]';"
+        "for($i=0;$i-lt$length;$i++){$item=[Runtime.InteropServices.Marshal]::ReadIntPtr("
+        "$pointer,$i*[IntPtr]::Size);[void]$values.Add("
+        "[Runtime.InteropServices.Marshal]::PtrToStringUni($item))};return @($values)}"
+        "finally{if($pointer-ne[IntPtr]::Zero){[void]$qrhNative::LocalFree($pointer)};"
+        "[Runtime.InteropServices.Marshal]::FreeHGlobal($count)}};"
+        "function Test-QrhExactLegacyArgv([object]$CommandLine,[object]$ExecutablePath,"
+        "[string]$Server){if($CommandLine-isnot[string]-or"
+        "$ExecutablePath-isnot[string]){return $false};try{"
+        "$argv=@(Get-QrhWindowsArgv $CommandLine);"
+        "$exeFull=[IO.Path]::GetFullPath($ExecutablePath).TrimEnd('\\');"
+        "$argvExe=[IO.Path]::GetFullPath([string]$argv[0]).TrimEnd('\\');"
+        "$serverFull=[IO.Path]::GetFullPath($Server).TrimEnd('\\');"
+        "$legacyRoot='C:\\quant_platform';"
+        "return $argv.Count-eq 3-and$exeFull.Equals($argvExe,"
+        "[StringComparison]::OrdinalIgnoreCase)-and"
+        "$exeFull.StartsWith($legacyRoot+'\\',[StringComparison]::OrdinalIgnoreCase)-and"
+        "@('python.exe','pythonw.exe')-contains([IO.Path]::GetFileName($exeFull)."
+        "ToLowerInvariant())-and$argv[1]-eq'-I'-and"
+        "([IO.Path]::GetFullPath([string]$argv[2]).TrimEnd('\\')).Equals($serverFull,"
+        "[StringComparison]::OrdinalIgnoreCase)}catch{return $false}};"
+        "function Test-QrhContainsDRoot([object]$Value){"
+        "if($Value-isnot[string]-or[string]::IsNullOrWhiteSpace($Value)){return $false};"
+        "$normalized=$Value.Replace('/','\\').Replace('\\\\?\\','');"
+        "foreach($candidate in $qrhRootVariants){$start=0;"
+        "while($start-lt$normalized.Length){$index=$normalized.IndexOf($candidate,$start,"
+        "[StringComparison]::OrdinalIgnoreCase);if($index-lt 0){break};"
+        "$beforeOk=$index-eq 0;if(-not$beforeOk){$before=$normalized[$index-1];"
+        "$beforeOk=[char]::IsWhiteSpace($before)-or"
+        "@([char]34,[char]39,[char]61)-contains$before};"
+        "$afterIndex=$index+$candidate.Length;$afterOk=$afterIndex-eq$normalized.Length;"
+        "if(-not$afterOk){$after=$normalized[$afterIndex];$afterOk=$after-eq[char]92-or"
+        "[char]::IsWhiteSpace($after)-or@([char]34,[char]39)-contains$after};"
+        "if($beforeOk-and$afterOk){return $true};$start=$index+1}};return $false};"
+        "function Assert-QrhNoAlternateStreams{"
+        "$paths=@((Get-Item -LiteralPath $root -Force -ErrorAction Stop))+"
+        "@(Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop);"
+        "$entryCount=0;$buffer=[Runtime.InteropServices.Marshal]::AllocHGlobal(600);try{"
+        "foreach($path in $paths){$handle=$qrhNative::FindFirstStreamW("
+        "$path.FullName,0,$buffer,0);if($handle-eq[IntPtr](-1)){"
+        "$error=$qrhNative::GetLastError();if($error-ne 38)"
+        "{throw ('qualification_stream_enumeration_failed:'+$error)};"
+        "$entryCount++;continue};"
+        "try{while($true){$name=[Runtime.InteropServices.Marshal]::PtrToStringUni("
+        "[IntPtr]::Add($buffer,8));if($name-ne'::$DATA')"
+        "{throw 'qualification_inventory_alternate_stream'};"
+        "if(-not$qrhNative::FindNextStreamW($handle,$buffer)){"
+        "$error=$qrhNative::GetLastError();if($error-ne 38)"
+        "{throw ('qualification_stream_enumeration_failed:'+$error)};break}}}"
+        "finally{[void]$qrhNative::FindClose($handle)};$entryCount++}}finally{"
+        "[Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)};return $entryCount};"
+    )
+
+
+def _qualification_replay_guard_script() -> str:
+    """Return the exact whole-top-level subset guard used after response loss."""
+
+    return (
+        "function Assert-ReplaySnapshot($snapshot){"
+        "$expected=@($contract.inspected_top_level_children);"
+        "if($expected.Count-lt 1){throw 'qualification_replay_contract_absent'};"
+        "$expectedByName=@{};foreach($item in $expected){"
+        "$keys=@($item.PSObject.Properties.Name|Sort-Object);"
+        "if(($keys-join ',')-ne'inventory_sha256,name'-or"
+        "$item.name-notmatch'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'-or"
+        "$item.inventory_sha256-notmatch'^[0-9a-f]{64}$'-or"
+        "$expectedByName.ContainsKey([string]$item.name))"
+        "{throw 'qualification_replay_contract_differs'};"
+        "$expectedByName[[string]$item.name]=[string]$item.inventory_sha256};"
+        "$actual=@($snapshot.top_level_children);"
+        "if($actual.Count-ge$expected.Count){throw 'qualification_replay_not_partial'};"
+        "foreach($item in $actual){if(-not$expectedByName.ContainsKey([string]$item.name))"
+        "{throw 'qualification_replay_unknown_top_level'};"
+        "if($expectedByName[[string]$item.name]-ne[string]$item.inventory_sha256)"
+        "{throw 'qualification_replay_partial_child_changed'}}};"
+    )
+
+
+def _qualification_closure_guard_script() -> str:
+    """Return the final file/directory closure gate run before D Python."""
+
+    return (
+        "function Assert-QrhClosedSnapshot($snapshot,$expectedFiles,$expectedDirectories){"
+        "foreach($relative in $snapshot.files.Keys){"
+        "if(-not$expectedFiles.Contains($relative)){throw 'qualification_unknown_file'}};"
+        "foreach($relative in $snapshot.directories){"
+        "if(-not$expectedDirectories.Contains($relative))"
+        "{throw 'qualification_unknown_directory'}}};"
+    )
+
+
+def _qualification_legacy_guard_script() -> str:
+    """Return the exact listener/process/deployment identity guard."""
+
+    return (
+        "function Assert-LegacyV39{"
+        "$listeners=@(Get-NetTCPConnection -LocalPort 8765 -State Listen "
+        "-ErrorAction Stop);$pids=@($listeners|Select-Object -ExpandProperty "
+        "OwningProcess -Unique);if($pids.Count-ne 1){throw 'legacy_listener_identity'};"
+        "$process=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$pids[0]) "
+        "-ErrorAction Stop);if($process.Count-ne 1){throw 'legacy_process_identity'};"
+        "$listenerPid=[int]$pids[0];$command=$process[0].CommandLine;"
+        "$executable=$process[0].ExecutablePath;"
+        "if($command-isnot[string]-or$executable-isnot[string])"
+        "{throw 'legacy_process_scalar_type'};"
+        "$exeFull=[IO.Path]::GetFullPath($executable).TrimEnd('\\');"
+        "$server='C:\\quant_platform\\tools\\viewer\\server.py';"
+        "if(-not(Test-QrhExactLegacyArgv $command $executable $server))"
+        "{throw 'listener_not_exact_legacy_argv'};"
+        "$exeItem=Get-Item -LiteralPath $exeFull -Force -ErrorAction Stop;"
+        "$serverItem=Get-Item -LiteralPath $server -Force -ErrorAction Stop;"
+        "$serverHash=(Get-FileHash -LiteralPath $server -Algorithm SHA256).Hash."
+        "ToLowerInvariant();"
+        "if($exeItem.PSIsContainer-or$serverItem.PSIsContainer-or"
+        "(($exeItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
+        "(($serverItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
+        "$serverItem.Length-ne[long]$contract.legacy_server_bytes-or"
+        "$serverHash-ne([string]$contract.legacy_server_sha256))"
+        "{throw 'listener_legacy_authority_differs'};"
+        "$response=Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "
+        "-Uri 'http://127.0.0.1:8765/deploymentz';"
+        "if($response.StatusCode-ne 200){throw 'legacy_deploymentz_status'};"
+        "$deployment=$response.Content|ConvertFrom-Json;"
+        "$deploymentKeys=@($deployment.PSObject.Properties.Name|Sort-Object);"
+        "if(($deploymentKeys-join ',')-ne'deployment_id,pid,port,schema_version,status'-or"
+        "$deployment.schema_version-isnot[string]-or$deployment.status-isnot[string]-or"
+        "$deployment.deployment_id-isnot[string]-or"
+        "$deployment.pid-isnot[int]-and$deployment.pid-isnot[long]-or"
+        "$deployment.port-isnot[int]-and$deployment.port-isnot[long]-or"
+        "$deployment.schema_version-ne'qrh-company-broadcast-health/v1'-or"
+        "$deployment.status-ne'ok'-or$deployment.pid-ne$listenerPid-or"
+        "$deployment.port-ne 8765-or"
+        "$deployment.deployment_id-ne$contract.legacy_deployment_id)"
+        "{throw 'legacy_deployment_id_differs'}};"
+    )
+
+
+def _qualification_no_d_execution_guard_script() -> str:
+    """Return the exact service/process/listener absence guard."""
+
+    return (
+        "function Assert-NoDExecution{"
+        "$services=@(Get-Service -Name 'QuantResearchHub' -ErrorAction SilentlyContinue);"
+        "if($services.Count-ne 0){throw 'qualification_service_exists'};"
+        "$processes=@(Get-CimInstance Win32_Process -ErrorAction Stop);"
+        "foreach($process in $processes){$command=$process.CommandLine;"
+        "$executable=$process.ExecutablePath;"
+        "if((Test-QrhContainsDRoot $command)-or(Test-QrhContainsDRoot $executable))"
+        "{throw 'qualification_d_process_exists'}};"
+        "$listeners=@(Get-NetTCPConnection -State Listen -ErrorAction Stop);"
+        "foreach($listener in $listeners){$owner=@($processes|Where-Object{"
+        "$_.ProcessId-eq$listener.OwningProcess});foreach($process in $owner){"
+        "$command=$process.CommandLine;$executable=$process.ExecutablePath;"
+        "if((Test-QrhContainsDRoot $command)-or(Test-QrhContainsDRoot $executable))"
+        "{throw 'qualification_d_listener_exists'}}}};"
+    )
 
 
 class OpenSSHColdRestore:
@@ -62,15 +320,36 @@ class OpenSSHColdRestore:
     def _literal(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
 
-    def _ssh(self, script: str) -> Mapping[str, object]:
+    def _ssh(
+        self, script: str, *, compressed: bool = False
+    ) -> Mapping[str, object]:
         target_guard = (
             "$ssh=($env:SSH_CONNECTION -split ' ');"
             f"if($ssh.Count-lt 3-or $ssh[2]-ne{self._literal(self.config.vm.target_address)})"
             "{throw 'ssh_target_address_differs'};"
         )
-        encoded = base64.b64encode(
-            (target_guard + script).encode("utf-16-le")
-        ).decode("ascii")
+        effective = target_guard + script
+        if compressed:
+            compressed_bytes = gzip.compress(effective.encode("utf-8"), mtime=0)
+            payload = base64.b64encode(compressed_bytes).decode("ascii")
+            payload_hash = hashlib.sha256(compressed_bytes).hexdigest()
+            effective = (
+                f"$b=[Convert]::FromBase64String({self._literal(payload)});"
+                f"if($b.Length-ne{len(compressed_bytes)})"
+                "{throw 'compressed_script_length_differs'};"
+                "$h=[Security.Cryptography.SHA256]::Create();try{"
+                "$d=([BitConverter]::ToString($h.ComputeHash($b))).Replace('-','')."
+                "ToLowerInvariant()}finally{$h.Dispose()};"
+                f"if($d-ne{self._literal(payload_hash)})"
+                "{throw 'compressed_script_hash_differs'};"
+                "$m=New-Object IO.MemoryStream(,$b);"
+                "$z=New-Object IO.Compression.GzipStream($m,"
+                "[IO.Compression.CompressionMode]::Decompress);"
+                "$r=New-Object IO.StreamReader($z,(New-Object Text.UTF8Encoding($false)));"
+                "try{$s=$r.ReadToEnd()}finally{$r.Dispose();$z.Dispose();$m.Dispose()};"
+                "&([scriptblock]::Create($s))"
+            )
+        encoded = base64.b64encode(effective.encode("utf-16-le")).decode("ascii")
         result = self.command_runner(
             (
                 "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
@@ -265,6 +544,380 @@ class OpenSSHColdRestore:
         ) != tool_identity:
             raise ColdRestoreCLIError("bootstrap identity changed during local seal")
         return bundle, report, restore_name, python_identity, tool_identity
+
+    def _qualification_reset_contract(
+        self,
+        bundle: Path,
+        report: RecoveryVerification,
+        restore_name: str,
+        *,
+        expected_legacy_deployment_id: str,
+    ) -> Mapping[str, object]:
+        """Derive the one-time reset contract from the verified bundle.
+
+        The remote side reads the already materialized release manifest and
+        operational bootstrap, after first binding both files to these hashes.
+        This keeps the bundle as the only large file inventory authority.
+        """
+
+        if expected_legacy_deployment_id != _LEGACY_V39_DEPLOYMENT_ID:
+            raise ColdRestoreCLIError(
+                "qualification reset is fixed to the exact legacy V39 deployment"
+            )
+        if (
+            not report.checkpoint_id
+            or not report.checkpoint_manifest_sha256
+            or _SAFE_ID.fullmatch(report.checkpoint_id) is None
+            or _SHA256.fullmatch(report.checkpoint_manifest_sha256) is None
+        ):
+            raise ColdRestoreCLIError(
+                "verified qualification checkpoint identity is absent"
+            )
+        try:
+            closure = json.loads(
+                (bundle / "closure_inventory.json").read_text(encoding="utf-8")
+            )
+            closure_bytes = (bundle / "closure_inventory.json").read_bytes()
+            closure_sha256 = hashlib.sha256(closure_bytes).hexdigest()
+            records = closure["files"]
+            by_path = {
+                str(item["path"]): item
+                for item in records
+                if isinstance(item, dict)
+            }
+            checkpoint_path = (
+                bundle / "checkpoints" / str(report.checkpoint_id)
+                / "checkpoint_manifest.json"
+            )
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            release_manifest_path = bundle / "release" / "release_manifest.json"
+            release_manifest = json.loads(
+                release_manifest_path.read_text(encoding="utf-8")
+            )
+            recovery_manifest_path = bundle / "recovery_manifest.json"
+            recovery_manifest_bytes = recovery_manifest_path.read_bytes()
+            recovery_manifest = json.loads(recovery_manifest_bytes.decode("utf-8"))
+            attestation_path = self.config.recovery.attestation_path.resolve(strict=True)
+            ensure_no_reparse_components(attestation_path)
+            attestation_bytes = attestation_path.read_bytes()
+            attestation = json.loads(attestation_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+            raise ColdRestoreCLIError(
+                "verified qualification bundle contract is unreadable"
+            ) from error
+
+        def record(relative: str) -> Mapping[str, object]:
+            item = by_path.get(relative)
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"path", "bytes", "sha256"}
+                or item.get("path") != relative
+                or not isinstance(item.get("bytes"), int)
+                or isinstance(item.get("bytes"), bool)
+                or int(item["bytes"]) < 0
+                or not isinstance(item.get("sha256"), str)
+                or _SHA256.fullmatch(str(item["sha256"])) is None
+            ):
+                raise ColdRestoreCLIError(
+                    "verified qualification bundle record is invalid"
+                )
+            return {
+                "path": relative,
+                "bytes": int(item["bytes"]),
+                "sha256": str(item["sha256"]),
+            }
+
+        application = release_manifest.get("application")
+        release_inventory = release_manifest.get("inventory")
+        release_files = (
+            release_inventory.get("files")
+            if isinstance(release_inventory, dict)
+            else None
+        )
+        legacy_server_records = [
+            item
+            for item in release_files or []
+            if isinstance(item, dict) and item.get("path") == "tools/viewer/server.py"
+        ]
+        if (
+            release_manifest.get("release_id") != report.release_id
+            or not isinstance(application, dict)
+            or application.get("source_kind") != "legacy_broadcast"
+            or application.get("legacy_deployment_id")
+            != expected_legacy_deployment_id
+            or len(legacy_server_records) != 1
+            or set(legacy_server_records[0]) != {"path", "bytes", "sha256"}
+            or not isinstance(legacy_server_records[0].get("bytes"), int)
+            or isinstance(legacy_server_records[0].get("bytes"), bool)
+            or int(legacy_server_records[0]["bytes"]) < 1
+            or not isinstance(legacy_server_records[0].get("sha256"), str)
+            or _SHA256.fullmatch(str(legacy_server_records[0]["sha256"])) is None
+        ):
+            raise ColdRestoreCLIError(
+                "qualification reset requires the exact legacy V39 bundle"
+            )
+        try:
+            rebuilt = attest_failure_domain(
+                production_facts=attestation["production"],
+                recovery_facts=attestation["recovery"],
+                independence_probe=attestation["independence_probe"],
+                observed_at=str(attestation["observed_at"]),
+            )
+            observed_at = datetime.fromisoformat(
+                str(attestation["observed_at"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ColdRestoreCLIError(
+                "qualification failure-domain attestation is invalid"
+            ) from error
+        expected_attestation_fields = {
+            "schema_version", "observed_at", "production_host_facts_sha256",
+            "recovery_host_facts_sha256", "production", "recovery",
+            "independence_probe", "verdict", "attestation_sha256",
+        }
+        probe = attestation.get("independence_probe")
+        production = attestation.get("production")
+        recovery = attestation.get("recovery")
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ColdRestoreCLIError(
+                "qualification failure-domain timestamp is not timezone-aware"
+            )
+        age = (datetime.now(UTC) - observed_at.astimezone(UTC)).total_seconds()
+        expected_event = {
+            "schema_version": "qrh-recovery-materialization-event/v1",
+            "event_id": f"cold-materialization-{report.bundle_id}",
+            "kind": "cold_recovery_materialized",
+            "authority": "evidence_only",
+            "fields": {
+                "bundle_id": report.bundle_id,
+                "release_id": report.release_id,
+                "manifest_sha256": report.release_manifest_sha256,
+                "empty_root_precondition": True,
+                "import_cleaned": True,
+                "runtime_tmp_cleaned": True,
+            },
+        }
+        event_path = (
+            self._recovery_root() / "evidence" / "cold-materialization"
+            / f"{report.bundle_id}.json"
+        )
+        production_facts_path = (
+            attestation_path.parent
+            / f"production-host-facts-{report.bundle_id}.json"
+        )
+        try:
+            for formal_path in (event_path, production_facts_path):
+                ensure_no_reparse_components(formal_path)
+                formal_info = formal_path.lstat()
+                if (
+                    formal_path.is_symlink()
+                    or not stat.S_ISREG(formal_info.st_mode)
+                    or formal_info.st_nlink != 1
+                ):
+                    raise ColdRestoreCLIError(
+                        "qualification formally published evidence is not immutable"
+                    )
+            event_bytes = event_path.read_bytes()
+            published_event = json.loads(event_bytes.decode("utf-8"))
+            production_facts_bytes = production_facts_path.read_bytes()
+            published_production = json.loads(
+                production_facts_bytes.decode("utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ColdRestoreCLIError(
+                "qualification formally published evidence is unreadable"
+            ) from error
+        expected_event_bytes = self._canonical_bytes(expected_event)
+        expected_facts_bytes = (
+            json.dumps(
+                production,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        if (
+            not isinstance(attestation, dict)
+            or attestation_bytes != self._canonical_bytes(attestation)
+            or set(attestation) != expected_attestation_fields
+            or attestation.get("attestation_sha256") != rebuilt.sha256
+            or any(
+                attestation.get(key) != value
+                for key, value in rebuilt.payload.items()
+            )
+            or not isinstance(probe, dict)
+            or probe.get("bundle_id") != report.bundle_id
+            or probe.get("release_id") != report.release_id
+            or probe.get("release_manifest_sha256")
+            != report.release_manifest_sha256
+            or probe.get("bundle_inventory_sha256") != closure_sha256
+            or probe.get("materialization_event_id") != expected_event["event_id"]
+            or probe.get("materialization_event_sha256")
+            != hashlib.sha256(expected_event_bytes).hexdigest()
+            or published_event != expected_event
+            or event_bytes != expected_event_bytes
+            or not isinstance(production, dict)
+            or published_production != production
+            or production_facts_bytes != expected_facts_bytes
+            or production.get("canonical_path") != str(self.config.vm.root)
+            or production.get("role") != "production"
+            or not isinstance(recovery, dict)
+            or Path(str(recovery.get("canonical_path"))).resolve(strict=True)
+            != self._recovery_root()
+            or age < 0
+            or age > self.config.recovery.attestation_max_age_seconds
+        ):
+            raise ColdRestoreCLIError(
+                "qualification failure-domain attestation identity differs"
+            )
+        if (
+            hashlib.sha256(recovery_manifest_bytes).hexdigest()
+            != report.recovery_manifest_sha256
+            or recovery_manifest.get("bundle_id") != report.bundle_id
+            or recovery_manifest.get("release")
+            != {
+                "release_id": report.release_id,
+                "manifest_sha256": report.release_manifest_sha256,
+            }
+            or recovery_manifest.get("checkpoint")
+            != {
+                "checkpoint_id": report.checkpoint_id,
+                "manifest_sha256": report.checkpoint_manifest_sha256,
+            }
+            or recovery_manifest.get("closure", {}).get("inventory_sha256")
+            != closure_sha256
+        ):
+            raise ColdRestoreCLIError(
+                "qualification recovery identity does not bind the attested closure"
+            )
+        state = checkpoint.get("state")
+        databases = state.get("databases") if isinstance(state, dict) else None
+        if not isinstance(databases, list):
+            raise ColdRestoreCLIError("qualification checkpoint databases are absent")
+        state_records: list[dict[str, object]] = []
+        for item in databases:
+            if not isinstance(item, dict):
+                raise ColdRestoreCLIError("qualification checkpoint database is invalid")
+            logical_name = item.get("logical_name")
+            relative_path = item.get("relative_path")
+            size = item.get("size_bytes")
+            digest = item.get("sha256")
+            if (
+                logical_name not in {"comments", "research_workspace"}
+                or relative_path != f"state/{logical_name}.sqlite3"
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 100
+                or not isinstance(digest, str)
+                or _SHA256.fullmatch(digest) is None
+            ):
+                raise ColdRestoreCLIError("qualification checkpoint database differs")
+            state_records.append(
+                {
+                    "logical_name": logical_name,
+                    "path": f"state/{logical_name}.sqlite3",
+                    "bytes": size,
+                    "sha256": digest,
+                }
+            )
+        if {item["logical_name"] for item in state_records} != {
+            "comments", "research_workspace"
+        } or len(state_records) != 2:
+            raise ColdRestoreCLIError(
+                "qualification checkpoint must contain exactly two state databases"
+            )
+        active = {
+            "schema_version": "qrh-active-release/v1",
+            "release_id": report.release_id,
+            "release_path": str(self.config.vm.root / "releases" / str(report.release_id)),
+            "manifest_sha256": report.release_manifest_sha256,
+        }
+        active_bytes = self._canonical_bytes(active)
+        release_bytes = release_manifest_path.read_bytes()
+        if hashlib.sha256(release_bytes).hexdigest() != report.release_manifest_sha256:
+            raise ColdRestoreCLIError("qualification release manifest bytes differ")
+        checkpoint_bytes = checkpoint_path.read_bytes()
+        if hashlib.sha256(checkpoint_bytes).hexdigest() != report.checkpoint_manifest_sha256:
+            raise ColdRestoreCLIError("qualification checkpoint manifest bytes differ")
+        bootstrap = record("operational/control/operational_bootstrap.json")
+        python = record("operational/tooling/python/python.exe")
+        tool = record(f"tools/restore/{restore_name}")
+        return {
+            "schema_version": "qrh-qualification-materialization-reset-contract/v1",
+            "bundle_id": report.bundle_id,
+            "release_id": report.release_id,
+            "release_manifest_sha256": report.release_manifest_sha256,
+            "release_manifest_bytes": len(release_bytes),
+            "checkpoint_id": report.checkpoint_id,
+            "checkpoint_manifest_sha256": report.checkpoint_manifest_sha256,
+            "recovery_manifest_sha256": report.recovery_manifest_sha256,
+            "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "legacy_server_bytes": int(legacy_server_records[0]["bytes"]),
+            "legacy_server_sha256": str(legacy_server_records[0]["sha256"]),
+            "closure_inventory_sha256": closure_sha256,
+            "recovery_manifest_bytes": len(recovery_manifest_bytes),
+            "active_sha256": hashlib.sha256(active_bytes).hexdigest(),
+            "active_bytes": len(active_bytes),
+            "operational_bootstrap_sha256": bootstrap["sha256"],
+            "operational_bootstrap_bytes": bootstrap["bytes"],
+            "python_sha256": python["sha256"],
+            "python_bytes": python["bytes"],
+            "restore_tool_path": f"tools/restore/{restore_name}",
+            "restore_tool_sha256": tool["sha256"],
+            "restore_tool_bytes": tool["bytes"],
+            "state": sorted(state_records, key=lambda item: str(item["logical_name"])),
+            "materialization_event_id": f"cold-materialization-{report.bundle_id}",
+            "materialization_event_sha256": hashlib.sha256(
+                expected_event_bytes
+            ).hexdigest(),
+            "materialization_event_bytes": len(event_bytes),
+            "failure_domain_attestation_sha256": rebuilt.sha256,
+            "failure_domain_attestation_file_sha256": hashlib.sha256(
+                attestation_bytes
+            ).hexdigest(),
+            "production_host_facts_sha256": production["facts_sha256"],
+            "production_host_facts_file_sha256": hashlib.sha256(
+                production_facts_bytes
+            ).hexdigest(),
+            "production_host_facts_bytes": len(production_facts_bytes),
+            "declared_write_set_sha256": hashlib.sha256(
+                self._canonical_bytes(declared_production_vm_write_set())
+            ).hexdigest(),
+        }
+
+    def _revalidate_qualification_attestation_file(
+        self, contract: Mapping[str, object]
+    ) -> None:
+        """Re-read the exact canonical attestation bytes before a bound action."""
+
+        expected = contract.get("failure_domain_attestation_file_sha256")
+        if not isinstance(expected, str) or _SHA256.fullmatch(expected) is None:
+            raise ColdRestoreCLIError(
+                "qualification attestation file binding is absent"
+            )
+        try:
+            path = self.config.recovery.attestation_path.resolve(strict=True)
+            ensure_no_reparse_components(path)
+            info = path.lstat()
+            raw = path.read_bytes()
+            value = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ColdRestoreCLIError(
+                "qualification attestation file cannot be revalidated"
+            ) from error
+        if (
+            path.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or not isinstance(value, dict)
+            or raw != self._canonical_bytes(value)
+            or hashlib.sha256(raw).hexdigest() != expected
+        ):
+            raise ColdRestoreCLIError(
+                "qualification attestation file changed or is not canonical"
+            )
 
     def _transfer_attempt(
         self, bundle: Path, report: RecoveryVerification
@@ -626,6 +1279,412 @@ class OpenSSHColdRestore:
             "|ConvertTo-Json -Compress"
         )
 
+    def _qualification_reset_script(
+        self,
+        *,
+        contract: Mapping[str, object],
+        intent_nonce_sha256: str,
+        apply: bool,
+        expected_inventory_sha256: str | None,
+    ) -> str:
+        """Inspect/reset one exact, materialized, never-activated V39 root."""
+
+        if _SHA256.fullmatch(intent_nonce_sha256) is None:
+            raise ColdRestoreCLIError("qualification reset nonce hash is invalid")
+        if apply:
+            if (
+                not isinstance(expected_inventory_sha256, str)
+                or _SHA256.fullmatch(expected_inventory_sha256) is None
+            ):
+                raise ColdRestoreCLIError(
+                    "qualification reset inventory hash is invalid"
+                )
+        elif expected_inventory_sha256 is not None:
+            raise ColdRestoreCLIError(
+                "qualification reset inspection cannot claim an inventory hash"
+            )
+        remote_fields = {
+            "active_bytes", "active_sha256", "bundle_id",
+            "declared_write_set_sha256", "legacy_deployment_id",
+            "legacy_server_bytes", "legacy_server_sha256",
+            "materialization_event_bytes", "materialization_event_id",
+            "materialization_event_sha256", "operational_bootstrap_bytes",
+            "operational_bootstrap_sha256", "production_host_facts_bytes",
+            "production_host_facts_file_sha256", "python_bytes", "python_sha256",
+            "release_id", "release_manifest_bytes", "release_manifest_sha256",
+            "restore_tool_bytes", "restore_tool_path", "restore_tool_sha256", "state",
+        }
+        if apply:
+            remote_fields.add("inspected_top_level_children")
+        if not remote_fields.issubset(contract):
+            raise ColdRestoreCLIError("qualification reset remote contract is incomplete")
+        contract_bytes = self._canonical_bytes(
+            {key: contract[key] for key in sorted(remote_fields)}
+        )
+        contract_literal = self._literal(contract_bytes.decode("utf-8"))
+        # The destructive application consumes the immutable inspection hash and
+        # never executes D tooling.  Canonical audit execution is inspection-only,
+        # after that inspection has closed the whole root twice.
+        probe_assignment = (
+            f"$probeSource={self._literal(_CANONICAL_AUDIT_PROBE)};"
+            if not apply else ""
+        )
+        audit_probe_script = (
+            "function Invoke-QualificationAuditProbe([string]$AuditRelative){"
+            "$python=Join-Path $root 'tooling\\python\\python.exe';"
+            "$pythonItem=Get-Item -LiteralPath $python -Force -ErrorAction Stop;"
+            "if($pythonItem.PSIsContainer-or(($pythonItem.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
+            "$pythonItem.Length-ne[long]$contract.python_bytes)"
+            "{throw 'qualification_python_identity_differs'};"
+            "$pythonHash=(Get-FileHash -LiteralPath $python -Algorithm SHA256).Hash."
+            "ToLowerInvariant();if($pythonHash-ne[string]$contract.python_sha256)"
+            "{throw 'qualification_python_identity_differs'};"
+            "$audit=Join-Path $root $AuditRelative.Replace('/','\\');"
+            "$bootstrap=\"import sys;exec(compile(sys.stdin.read(),"
+            "'<qualification-audit-probe>','exec'))\";"
+            "$oldBytecode=$env:PYTHONDONTWRITEBYTECODE;"
+            "$oldPreference=$ErrorActionPreference;try{"
+            "$env:PYTHONDONTWRITEBYTECODE='1';$ErrorActionPreference='Continue';"
+            "$raw=$probeSource|&$python -I -B -c $bootstrap $root $audit 2>&1;"
+            "$probeExit=$LASTEXITCODE}finally{$ErrorActionPreference=$oldPreference;"
+            "$env:PYTHONDONTWRITEBYTECODE=$oldBytecode};if($probeExit-ne 0){throw "
+            "('qualification_audit_probe_failed:'+[string]($raw-join ' '))};"
+            "$value=([string]($raw-join ''))|ConvertFrom-Json;"
+            "$keys=@($value.PSObject.Properties.Name|Sort-Object);"
+            "if(($keys-join ',')-ne'canonical_json_sha256,declared_write_set_sha256,"
+            "scalar_types_valid'-or$value.scalar_types_valid-ne$true)"
+            "{throw 'qualification_audit_probe_shape'};return $value};"
+            if not apply else ""
+        )
+        expected_hash = self._literal(expected_inventory_sha256 or "")
+        intent_hash = self._literal(intent_nonce_sha256)
+        schema = (
+            _QUALIFICATION_RESET_APPLY_SCHEMA
+            if apply else _QUALIFICATION_RESET_INSPECTION_SCHEMA
+        )
+        common = (
+            "$ErrorActionPreference='Stop';"
+            + exact_production_root_parent_guard_script()
+            + "$root=$rootFull;"
+            + f"$contractJson={contract_literal};"
+            + probe_assignment
+            + f"$expectedHash={expected_hash};$intentHash={intent_hash};"
+            "$contract=$contractJson|ConvertFrom-Json;"
+            + _qualification_native_probe_script()
+            + _qualification_legacy_guard_script()
+            + _qualification_no_d_execution_guard_script()
+            + audit_probe_script
+            + "function Get-CanonicalRootInventory{"
+            "$rootItem=Get-Item -LiteralPath $root -Force -ErrorAction Stop;"
+            "if(-not$rootItem.PSIsContainer-or(($rootItem.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'exact_root_type'};"
+            "$records=New-Object 'System.Collections.Generic.List[string]';"
+            "$files=@{};$directories=New-Object 'System.Collections.Generic.HashSet[string]' "
+            "([StringComparer]::Ordinal);$fileCount=0;$directoryCount=0;$bytes=[long]0;"
+            "$all=@(Get-ChildItem -LiteralPath $root -Force -Recurse);"
+            "foreach($item in $all){if(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0){throw 'qualification_inventory_reparse'};"
+            "$relative=$item.FullName.Substring($root.Length).TrimStart('\\').Replace('\\','/');"
+            "if(-not$relative-or$relative.Contains('../')-or$relative.Contains(':'))"
+            "{throw 'qualification_inventory_relative_path'};"
+            "if($item.PSIsContainer){$directoryCount++;[void]$directories.Add($relative);"
+            "[void]$records.Add('D'+[char]9+$relative+[char]10);continue};"
+            "$streams=@(Get-Item -LiteralPath $item.FullName -Stream * -ErrorAction Stop);"
+            "if($streams.Count-ne 1-or$streams[0].Stream-ne':$DATA')"
+            "{throw 'qualification_inventory_alternate_stream'};"
+            "$fileCount++;$bytes+=[long]$item.Length;"
+            "$hash=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash."
+            "ToLowerInvariant();if($files.ContainsKey($relative))"
+            "{throw 'qualification_duplicate_path'};"
+            "$files[$relative]=[pscustomobject]@{bytes=[long]$item.Length;sha256=$hash};"
+            "[void]$records.Add('F'+[char]9+$relative+[char]9+$item.Length+[char]9+"
+            "$hash+[char]10)};"
+            "$streamCount=Assert-QrhNoAlternateStreams;"
+            "if([long]$streamCount-ne([long]$fileCount+[long]$directoryCount+1))"
+            "{throw 'qualification_win32_probe_entry_count'};"
+            "$records.Sort([StringComparer]::Ordinal);$text=[string]::Concat($records);"
+            "$payload=(New-Object Text.UTF8Encoding($false)).GetBytes($text);"
+            "$hasher=[Security.Cryptography.SHA256]::Create();try{"
+            "$hash=([BitConverter]::ToString($hasher.ComputeHash($payload))).Replace('-','')."
+            "ToLowerInvariant()}finally{$hasher.Dispose()};"
+            "$topChildren=New-Object 'System.Collections.Generic.List[object]';"
+            "$top=@(Get-ChildItem -LiteralPath $root -Force|Sort-Object Name);"
+            "foreach($child in $top){$name=[string]$child.Name;"
+            "$childRecords=@($records|Where-Object{$record=[string]$_;"
+            "$parts=$record.Split([char]9);if($parts.Count-lt 2){$false}else{"
+            "$relative=$parts[1].TrimEnd([char]10);$relative-eq$name-or"
+            "$relative.StartsWith($name+'/',[StringComparison]::Ordinal)}});"
+            "$childText=[string]::Concat($childRecords);"
+            "$childPayload=(New-Object Text.UTF8Encoding($false)).GetBytes($childText);"
+            "$childHasher=[Security.Cryptography.SHA256]::Create();try{"
+            "$childHash=([BitConverter]::ToString($childHasher.ComputeHash($childPayload)))."
+            "Replace('-','').ToLowerInvariant()}finally{$childHasher.Dispose()};"
+            "[void]$topChildren.Add([pscustomobject]@{name=$name;"
+            "inventory_sha256=$childHash})};"
+            "return [pscustomobject]@{inventory_sha256=$hash;files=$files;"
+            "directories=$directories;file_count=$fileCount;directory_count=$directoryCount;"
+            "total_bytes=$bytes;top_level_count=$top.Count;"
+            "top_level_children=@($topChildren)}};"
+            + _qualification_replay_guard_script()
+            + _qualification_closure_guard_script()
+            +
+            "function Assert-OriginalTopClosure($snapshot){"
+            "$expected=@($contract.inspected_top_level_children);"
+            "$actual=@($snapshot.top_level_children);if($expected.Count-ne$actual.Count)"
+            "{throw 'qualification_original_top_count_differs'};"
+            "for($i=0;$i-lt$expected.Count;$i++){if("
+            "[string]$expected[$i].name-ne[string]$actual[$i].name-or"
+            "[string]$expected[$i].inventory_sha256-ne"
+            "[string]$actual[$i].inventory_sha256)"
+            "{throw 'qualification_original_top_closure_differs'}}};"
+            "function Assert-QualificationSnapshot($snapshot){"
+            "$expectedFiles=New-Object 'System.Collections.Generic.HashSet[string]' "
+            "([StringComparer]::Ordinal);$expectedDirectories=New-Object "
+            "'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal);"
+            "function Add-ExpectedFile([string]$Relative,[long]$Bytes,[string]$Sha256){"
+            "if(-not$snapshot.files.ContainsKey($Relative)){throw 'qualification_expected_file_absent'};"
+            "$observed=$snapshot.files[$Relative];if($observed.bytes-ne$Bytes-or"
+            "$observed.sha256-ne$Sha256){throw 'qualification_expected_file_differs'};"
+            "if(-not$expectedFiles.Add($Relative)){throw 'qualification_duplicate_expected_file'};"
+            "$cursor=$Relative;while($cursor.Contains('/')){$cursor=$cursor.Substring(0,"
+            "$cursor.LastIndexOf('/'));[void]$expectedDirectories.Add($cursor)}};"
+            "$releaseBase='releases/'+$contract.release_id;"
+            "$releaseManifest=$releaseBase+'/release_manifest.json';"
+            "Add-ExpectedFile $releaseManifest ([long]$contract.release_manifest_bytes) "
+            "([string]$contract.release_manifest_sha256);"
+            "$releasePath=Join-Path $root $releaseManifest.Replace('/','\\');"
+            "$manifest=[IO.File]::ReadAllText($releasePath,(New-Object Text.UTF8Encoding($false)))"
+            "|ConvertFrom-Json;if($manifest.schema_version-ne'qrh-release-manifest/v1'-or"
+            "$manifest.release_id-ne$contract.release_id){throw 'qualification_release_identity'};"
+            "$releaseRecords=@($manifest.inventory.files);if($releaseRecords.Count-lt 1)"
+            "{throw 'qualification_release_inventory_empty'};foreach($record in $releaseRecords){"
+            "Add-ExpectedFile ($releaseBase+'/'+[string]$record.path) ([long]$record.bytes) "
+            "([string]$record.sha256)};"
+            "$bootstrap='control/operational_bootstrap.json';"
+            "Add-ExpectedFile $bootstrap ([long]$contract.operational_bootstrap_bytes) "
+            "([string]$contract.operational_bootstrap_sha256);"
+            "$bootstrapPath=Join-Path $root $bootstrap.Replace('/','\\');"
+            "$operational=[IO.File]::ReadAllText($bootstrapPath,(New-Object "
+            "Text.UTF8Encoding($false)))|ConvertFrom-Json;"
+            "if($operational.schema_version-ne'qrh-operational-bootstrap/v1'-or"
+            "$operational.authority_root-ne$root){throw 'qualification_operational_identity'};"
+            "foreach($record in @($operational.files)){"
+            "$relative=[string]$record.path;if(-not($relative.StartsWith('tooling/')-or"
+            "$relative.StartsWith('control/'))){throw 'qualification_operational_path'};"
+            "Add-ExpectedFile $relative ([long]$record.bytes) ([string]$record.sha256)};"
+            "Add-ExpectedFile 'control/active_release.json' ([long]$contract.active_bytes) "
+            "([string]$contract.active_sha256);"
+            "foreach($record in @($contract.state)){Add-ExpectedFile ([string]$record.path) "
+            "([long]$record.bytes) ([string]$record.sha256)};"
+            "Add-ExpectedFile ([string]$contract.restore_tool_path) "
+            "([long]$contract.restore_tool_bytes) ([string]$contract.restore_tool_sha256);"
+            "$eventRelative='audit/events/'+$contract.materialization_event_id+'.json';"
+            "Add-ExpectedFile $eventRelative ([long]$contract.materialization_event_bytes) "
+            "([string]$contract.materialization_event_sha256);"
+            "$factsRelative='audit/evidence/production-host-facts.json';"
+            "Add-ExpectedFile $factsRelative ([long]$contract.production_host_facts_bytes) "
+            "([string]$contract.production_host_facts_file_sha256);"
+            "$writeAudits=@($snapshot.files.Keys|Where-Object{"
+            "$_.StartsWith('audit/events/vm-write-audit-')-and$_.EndsWith('.json')});"
+            "if($writeAudits.Count-ne 1){throw 'qualification_candidate_audit_count'};"
+            "foreach($auditRelative in $writeAudits){"
+            "$auditPath=Join-Path $root $auditRelative.Replace('/','\\');"
+            "$audit=[IO.File]::ReadAllText($auditPath,(New-Object Text.UTF8Encoding($false)))"
+            "|ConvertFrom-Json;$keys=@($audit.PSObject.Properties.Name|Sort-Object);"
+            "if(($keys-join ',')-ne'audit_id,audit_record_path,authority_root,declared_write_set,"
+            "observed_writes,operation,outcome,schema_version,verdict'-or"
+            "$audit.schema_version-ne'qrh-production-vm-write-audit/v1'-or"
+            "$audit.operation-ne'deploy-candidate_only'-or$audit.outcome-ne'failed'-or"
+            "$audit.authority_root-ne$root-or$audit.verdict-ne'pass'-or"
+            "$audit.audit_id-notmatch'^vm-write-audit-[0-9a-f]{32}$'-or"
+            "$auditRelative-ne('audit/events/'+$audit.audit_id+'.json')-or"
+            "$audit.audit_record_path-ne($root+'\\'+$auditRelative.Replace('/','\\')))"
+            "{throw 'qualification_candidate_audit_identity'};"
+            "$residues=@('state/comments.sqlite3-wal','state/comments.sqlite3-shm',"
+            "'state/research_workspace.sqlite3-wal','state/research_workspace.sqlite3-shm',"
+            "'tmp','tmp/candidate-probes','tmp/deployment-cli');$seen=@{};"
+            "foreach($write in @($audit.observed_writes)){"
+            "$writeKeys=@($write.PSObject.Properties.Name|Sort-Object);"
+            "$relative=[string]$write.relative_path;if(($writeKeys-join ',')-ne"
+            "'bytes,change,entry_type,path,relative_path,sha256'-or"
+            "$seen.ContainsKey($relative)-or(@('state')+$residues)-notcontains$relative-or"
+            "$write.path-ne($root+'\\'+$relative.Replace('/','\\')))"
+            "{throw 'qualification_candidate_audit_write_shape'};"
+            "if($relative-eq'state'){if($write.change-ne'modified'-or"
+            "$write.entry_type-ne'directory'-or[long]$write.bytes-ne 0-or$null-ne$write.sha256)"
+            "{throw 'qualification_candidate_audit_state_shape'}}"
+            "elseif($relative.StartsWith('tmp')){if($write.change-ne'created'-or"
+            "$write.entry_type-ne'directory'-or[long]$write.bytes-ne 0-or$null-ne$write.sha256-or"
+            "-not$snapshot.directories.Contains($relative))"
+            "{throw 'qualification_candidate_audit_directory_shape'}}"
+            "else{if($write.change-ne'created'-or$write.entry_type-ne'file'-or"
+            "-not$snapshot.files.ContainsKey($relative)-or"
+            "[long]$write.bytes-ne[long]$snapshot.files[$relative].bytes-or"
+            "[string]$write.sha256-ne[string]$snapshot.files[$relative].sha256)"
+            "{throw 'qualification_candidate_audit_file_shape'}};$seen[$relative]=$true};"
+            "foreach($relative in $residues){if(-not$seen.ContainsKey($relative))"
+            "{throw 'qualification_candidate_audit_residue_unbound'}};"
+            "$auditRecord=$snapshot.files[$auditRelative];Add-ExpectedFile $auditRelative "
+            "([long]$auditRecord.bytes) ([string]$auditRecord.sha256)};"
+            "$sidecars=@('state/comments.sqlite3-wal','state/comments.sqlite3-shm',"
+            "'state/research_workspace.sqlite3-wal','state/research_workspace.sqlite3-shm');"
+            "foreach($name in @('comments','research_workspace')){"
+            "$wal='state/'+$name+'.sqlite3-wal';$shm='state/'+$name+'.sqlite3-shm';"
+            "$hasWal=$snapshot.files.ContainsKey($wal);$hasShm=$snapshot.files.ContainsKey($shm);"
+            "if(-not$hasWal-or-not$hasShm){throw 'qualification_candidate_sidecar_pair_incomplete'};"
+            "if($snapshot.files[$wal].bytes-ne 0-or"
+            "$snapshot.files[$wal].sha256-ne"
+            "'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')"
+            "{throw 'qualification_candidate_sidecar_wal_nonzero'};"
+            "if($snapshot.files[$shm].bytes-ne 32768)"
+            "{throw 'qualification_candidate_sidecar_shm_shape'};"
+            "[void]$expectedFiles.Add($wal);[void]$expectedFiles.Add($shm)};"
+            "foreach($relative in $expectedFiles){$cursor=$relative;while($cursor.Contains('/')){"
+            "$cursor=$cursor.Substring(0,$cursor.LastIndexOf('/'));"
+            "[void]$expectedDirectories.Add($cursor)}};"
+            "foreach($relative in @('tmp','tmp/candidate-probes','tmp/deployment-cli')){"
+            "[void]$expectedDirectories.Add($relative);"
+            "if(-not$snapshot.directories.Contains($relative))"
+            "{throw 'qualification_candidate_directory_absent'}};"
+            "Assert-QrhClosedSnapshot $snapshot $expectedFiles $expectedDirectories;"
+            "$top=@(Get-ChildItem -LiteralPath $root -Force);foreach($item in $top){"
+            "if(@('audit','control','releases','state','tmp','tooling','tools')-notcontains$item.Name)"
+            "{throw 'qualification_unknown_top_level'}};"
+            "$forbidden=@('control/pending_activation.json','control/writer_handoff_pending.json',"
+            "'control/writer_handoff_terminal.json','control/writer_handoff_journal.json');"
+            "foreach($relative in $forbidden){if($snapshot.files.ContainsKey($relative))"
+            "{throw 'qualification_pending_authority_exists'}};"
+            "foreach($relative in $snapshot.files.Keys){if("
+            "($relative.StartsWith('audit/receipts/')-or$relative.StartsWith('control/'))-and"
+            "($relative-match'(?i)(activation|recovery).*(receipt|journal)|"
+            "(receipt|journal).*(activation|recovery)|writer[_-]handoff'))"
+            "{throw 'qualification_authority_receipt_or_journal_exists'}};"
+            "$canonicalAudit=Invoke-QualificationAuditProbe $auditRelative;"
+            "if($canonicalAudit.canonical_json_sha256-ne"
+            "$snapshot.files[$auditRelative].sha256)"
+            "{throw 'qualification_candidate_audit_canonical_hash'};"
+            "if($canonicalAudit.declared_write_set_sha256-ne"
+            "$contract.declared_write_set_sha256)"
+            "{throw 'qualification_candidate_audit_declared_set'}};"
+            "Assert-NoDExecution;Assert-LegacyV39;"
+        )
+        if apply:
+            # Apply is byte-identity-only: the immutable off-host inspection
+            # already ran the semantic/root closure twice.  Keep replay and
+            # original-top guards, but do not ship unreachable inspect-only
+            # code or execute any D tooling during deletion/retry.
+            common = common.replace(_qualification_closure_guard_script(), "", 1)
+            start = common.index("function Assert-QualificationSnapshot($snapshot){")
+            end = common.index("Assert-NoDExecution;Assert-LegacyV39;", start)
+            common = common[:start] + common[end:]
+        else:
+            # Inspection cannot be a response-loss replay and therefore has no
+            # use for the destructive-only subset/original-top guards.
+            common = common.replace(_qualification_replay_guard_script(), "", 1)
+            start = common.index("function Assert-OriginalTopClosure($snapshot){")
+            end = common.index("function Assert-QualificationSnapshot($snapshot){", start)
+            common = common[:start] + common[end:]
+        common += "$first=Get-CanonicalRootInventory;"
+        if apply:
+            common += (
+                "$isReplay=$first.inventory_sha256-ne$expectedHash;"
+                "if($isReplay){Assert-ReplaySnapshot $first}"
+                "else{Assert-OriginalTopClosure $first};"
+                "if($first.top_level_count-eq 0){Assert-NoDExecution;Assert-LegacyV39;"
+                "$emptyAgain=Get-CanonicalRootInventory;Assert-ReplaySnapshot $emptyAgain;"
+                "if($emptyAgain.inventory_sha256-ne$first.inventory_sha256)"
+                "{throw 'qualification_empty_root_changed'};"
+                "Assert-NoDExecution;Assert-LegacyV39;[ordered]@{"
+                f"schema_version={self._literal(schema)};status='prepared_empty_root';"
+                "intent_nonce_sha256=$intentHash;pre_delete_inventory_sha256=$expectedHash;"
+                "remaining_pre_delete_inventory_sha256=$first.inventory_sha256;"
+                "deleted_child_count=0;remaining_child_count=0;"
+                "legacy_deployment_id=$contract.legacy_deployment_id;"
+                "bundle_id=$contract.bundle_id;root_exists=$true;root_empty=$true;"
+                "old_c_v39_healthy=$true;service_absent=$true;d_execution_absent=$true;"
+                "qualification_reset_materialized=$true;never_activated=$true;"
+                "response_recovered=$true}|ConvertTo-Json -Compress;exit};"
+            )
+        else:
+            common += "Assert-QualificationSnapshot $first;"
+        common += (
+            "Assert-NoDExecution;Assert-LegacyV39;"
+            "$second=Get-CanonicalRootInventory;"
+        )
+        if apply:
+            common += (
+                "if($isReplay){Assert-ReplaySnapshot $second}"
+                "else{Assert-OriginalTopClosure $second};"
+            )
+        else:
+            common += "Assert-QualificationSnapshot $second;"
+        common += (
+            "if($first.inventory_sha256-ne$second.inventory_sha256)"
+            "{throw 'qualification_inventory_changed_during_inspection'};"
+        )
+        if not apply:
+            return common + (
+                "[ordered]@{"
+                f"schema_version={self._literal(schema)};status='inspected_not_deleted';"
+                "intent_nonce_sha256=$intentHash;inventory_sha256=$second.inventory_sha256;"
+                "file_count=$second.file_count;directory_count=$second.directory_count;"
+                "total_bytes=$second.total_bytes;top_level_count=$second.top_level_count;"
+                "top_level_children=@($second.top_level_children);"
+                "legacy_deployment_id=$contract.legacy_deployment_id;"
+                "bundle_id=$contract.bundle_id;old_c_v39_healthy=$true;service_absent=$true;"
+                "d_execution_absent=$true;qualification_reset_materialized=$true;"
+                "never_activated=$true;deleted=$false}|ConvertTo-Json -Compress"
+            )
+        return common + (
+            "if(-not$isReplay-and$second.inventory_sha256-ne$expectedHash)"
+            "{throw 'qualification_pre_delete_inventory_differs'};"
+            "Assert-NoDExecution;Assert-LegacyV39;"
+            "$third=Get-CanonicalRootInventory;if($isReplay){Assert-ReplaySnapshot $third}"
+            "else{Assert-OriginalTopClosure $third};"
+            "if($third.inventory_sha256-ne$second.inventory_sha256)"
+            "{throw 'qualification_pre_delete_inventory_changed'};"
+            "$children=@(Get-ChildItem -LiteralPath $root -Force|Sort-Object FullName);"
+            "foreach($child in $children){$full=[IO.Path]::GetFullPath($child.FullName);"
+            "$parent=[IO.Path]::GetFullPath((Split-Path -Parent $full)).TrimEnd('\\');"
+            "if(-not$parent.Equals($root,[StringComparison]::OrdinalIgnoreCase)-or"
+            "$full.Equals($root,[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'qualification_delete_target_not_exact_child'};"
+            "$current=Get-Item -LiteralPath $full -Force -ErrorAction Stop;"
+            "if(($current.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'qualification_delete_target_reparse'}};"
+            "$fourth=Get-CanonicalRootInventory;if($isReplay){Assert-ReplaySnapshot $fourth}"
+            "else{Assert-OriginalTopClosure $fourth};"
+            "if($fourth.inventory_sha256-ne$second.inventory_sha256)"
+            "{throw 'qualification_pre_delete_inventory_changed_after_child_preflight'};"
+            "$confirmed=@(Get-ChildItem -LiteralPath $root -Force|Sort-Object FullName);"
+            "if(($children.FullName-join[char]10)-ne($confirmed.FullName-join[char]10))"
+            "{throw 'qualification_pre_delete_child_set_changed'};"
+            "Assert-NoDExecution;Assert-LegacyV39;"
+            "foreach($child in $children){$current=Get-Item -LiteralPath $child.FullName "
+            "-Force -ErrorAction Stop;if(($current.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'qualification_delete_target_reparse'};"
+            "Remove-Item -LiteralPath $child.FullName -Recurse -Force};"
+            + exact_production_root_parent_guard_script()
+            + "$root=$rootFull;$postRoot=Get-Item -LiteralPath $root -Force -ErrorAction Stop;"
+            "if(-not$postRoot.PSIsContainer-or(($postRoot.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
+            "@(Get-ChildItem -LiteralPath $root -Force).Count-ne 0)"
+            "{throw 'qualification_exact_root_not_empty_after_prepare'};"
+            "Assert-NoDExecution;Assert-LegacyV39;Assert-NoDExecution;Assert-LegacyV39;"
+            "[ordered]@{"
+            f"schema_version={self._literal(schema)};status='prepared_empty_root';"
+            "intent_nonce_sha256=$intentHash;pre_delete_inventory_sha256=$expectedHash;"
+            "remaining_pre_delete_inventory_sha256=$second.inventory_sha256;"
+            "deleted_child_count=$children.Count;legacy_deployment_id=$contract.legacy_deployment_id;"
+            "remaining_child_count=0;"
+            "bundle_id=$contract.bundle_id;root_exists=$true;root_empty=$true;"
+            "old_c_v39_healthy=$true;service_absent=$true;d_execution_absent=$true;"
+            "qualification_reset_materialized=$true;never_activated=$true;"
+            "response_recovered=$isReplay}|ConvertTo-Json -Compress"
+        )
+
     @staticmethod
     def _prepare_identity(value: Mapping[str, object], *, apply: bool) -> None:
         schema = _PREPARE_APPLY_SCHEMA if apply else _PREPARE_INSPECTION_SCHEMA
@@ -683,13 +1742,436 @@ class OpenSSHColdRestore:
             ):
                 raise ColdRestoreCLIError("prepare-empty inspection gates differ")
 
-    def inspect_prepare_empty(
+    @staticmethod
+    def _qualification_reset_identity(
+        value: Mapping[str, object], *, apply: bool
+    ) -> None:
+        schema = (
+            _QUALIFICATION_RESET_APPLY_SCHEMA
+            if apply else _QUALIFICATION_RESET_INSPECTION_SCHEMA
+        )
+        status = "prepared_empty_root" if apply else "inspected_not_deleted"
+        if value.get("schema_version") != schema or value.get("status") != status:
+            raise ColdRestoreCLIError(
+                "qualification reset remote evidence schema differs"
+            )
+        if any(
+            value.get(field) is not True
+            for field in (
+                "old_c_v39_healthy", "service_absent", "d_execution_absent",
+                "qualification_reset_materialized", "never_activated",
+            )
+        ):
+            raise ColdRestoreCLIError("qualification reset remote gates differ")
+        if (
+            not isinstance(value.get("intent_nonce_sha256"), str)
+            or _SHA256.fullmatch(str(value["intent_nonce_sha256"])) is None
+            or not isinstance(value.get("bundle_id"), str)
+            or _SAFE_ID.fullmatch(str(value["bundle_id"])) is None
+            or not isinstance(value.get("legacy_deployment_id"), str)
+            or value.get("legacy_deployment_id") != _LEGACY_V39_DEPLOYMENT_ID
+        ):
+            raise ColdRestoreCLIError("qualification reset identity is absent")
+        if apply:
+            if (
+                not isinstance(value.get("pre_delete_inventory_sha256"), str)
+                or _SHA256.fullmatch(
+                    str(value["pre_delete_inventory_sha256"])
+                ) is None
+                or not isinstance(value.get("deleted_child_count"), int)
+                or isinstance(value.get("deleted_child_count"), bool)
+                or int(value["deleted_child_count"]) < 0
+                or not isinstance(value.get("remaining_child_count"), int)
+                or isinstance(value.get("remaining_child_count"), bool)
+                or int(value["remaining_child_count"]) != 0
+                or not isinstance(
+                    value.get("remaining_pre_delete_inventory_sha256"), str
+                )
+                or _SHA256.fullmatch(
+                    str(value["remaining_pre_delete_inventory_sha256"])
+                ) is None
+                or value.get("root_exists") is not True
+                or value.get("root_empty") is not True
+                or not isinstance(value.get("response_recovered"), bool)
+            ):
+                raise ColdRestoreCLIError(
+                    "qualification reset post-delete gates differ"
+                )
+        elif (
+            not isinstance(value.get("inventory_sha256"), str)
+            or _SHA256.fullmatch(str(value["inventory_sha256"])) is None
+            or value.get("deleted") is not False
+            or any(
+                not isinstance(value.get(field), int)
+                or isinstance(value.get(field), bool)
+                or int(value[field]) < 0
+                for field in (
+                    "file_count", "directory_count", "total_bytes", "top_level_count"
+                )
+            )
+        ):
+            raise ColdRestoreCLIError(
+                "qualification reset inspection gates differ"
+            )
+        if not apply:
+            children = value.get("top_level_children")
+            if (
+                not isinstance(children, list)
+                or len(children) != value.get("top_level_count")
+                or not children
+            ):
+                raise ColdRestoreCLIError(
+                    "qualification reset top-level closure is absent"
+                )
+            names: list[str] = []
+            for child in children:
+                if (
+                    not isinstance(child, dict)
+                    or set(child) != {"name", "inventory_sha256"}
+                    or not isinstance(child.get("name"), str)
+                    or _SAFE_ID.fullmatch(str(child["name"])) is None
+                    or not isinstance(child.get("inventory_sha256"), str)
+                    or _SHA256.fullmatch(str(child["inventory_sha256"])) is None
+                ):
+                    raise ColdRestoreCLIError(
+                        "qualification reset top-level closure differs"
+                    )
+                names.append(str(child["name"]))
+            if names != sorted(names) or len(names) != len(set(names)):
+                raise ColdRestoreCLIError(
+                    "qualification reset top-level closure is not canonical"
+                )
+
+    def _inspect_qualification_reset(
         self,
         bundle_root: Path,
         *,
         intent_nonce: str,
         expected_legacy_deployment_id: str,
     ) -> Mapping[str, object]:
+        bundle, report, restore_name, _python, _tool = self._verified_bundle(
+            bundle_root
+        )
+        if len(intent_nonce) < 16 or _SAFE_ID.fullmatch(intent_nonce) is None:
+            raise ColdRestoreCLIError("qualification reset intent nonce is invalid")
+        if expected_legacy_deployment_id != _LEGACY_V39_DEPLOYMENT_ID:
+            raise ColdRestoreCLIError(
+                "qualification reset is fixed to the exact legacy V39 deployment"
+            )
+        contract = self._qualification_reset_contract(
+            bundle,
+            report,
+            restore_name,
+            expected_legacy_deployment_id=expected_legacy_deployment_id,
+        )
+        nonce_hash = hashlib.sha256(intent_nonce.encode("utf-8")).hexdigest()
+        evidence = (
+            self._recovery_root() / "evidence"
+            / "prepare-empty-qualification-reset"
+            / f"{nonce_hash}.inspection.json"
+        )
+        if os.path.lexists(evidence):
+            raise ColdRestoreCLIError(
+                "qualification reset intent nonce was already inspected"
+            )
+        result = self._ssh(
+            self._qualification_reset_script(
+                contract=contract,
+                intent_nonce_sha256=nonce_hash,
+                apply=False,
+                expected_inventory_sha256=None,
+            ),
+            compressed=True,
+        )
+        self._qualification_reset_identity(result, apply=False)
+        if any(
+            (
+                result.get("legacy_deployment_id")
+                != expected_legacy_deployment_id,
+                result.get("intent_nonce_sha256") != nonce_hash,
+                result.get("bundle_id") != report.bundle_id,
+            )
+        ):
+            raise ColdRestoreCLIError("qualification reset inspection binding differs")
+        self._revalidate_qualification_attestation_file(contract)
+        recorded = {
+            "schema_version": (
+                "qrh-prepare-empty-qualification-reset-offhost-inspection/v1"
+            ),
+            "authority": "evidence_only",
+            "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "intent_nonce_sha256": nonce_hash,
+            "bundle_id": report.bundle_id,
+            "release_id": report.release_id,
+            "release_manifest_sha256": report.release_manifest_sha256,
+            "checkpoint_id": report.checkpoint_id,
+            "checkpoint_manifest_sha256": report.checkpoint_manifest_sha256,
+            "recovery_manifest_sha256": report.recovery_manifest_sha256,
+            "materialization_event_id": contract["materialization_event_id"],
+            "materialization_event_sha256": contract[
+                "materialization_event_sha256"
+            ],
+            "failure_domain_attestation_sha256": contract[
+                "failure_domain_attestation_sha256"
+            ],
+            "failure_domain_attestation_file_sha256": contract[
+                "failure_domain_attestation_file_sha256"
+            ],
+            "production_host_facts_sha256": contract[
+                "production_host_facts_sha256"
+            ],
+            "production_host_facts_file_sha256": contract[
+                "production_host_facts_file_sha256"
+            ],
+            "closure_inventory_sha256": contract["closure_inventory_sha256"],
+            "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "pre_delete_inventory_sha256": result["inventory_sha256"],
+            "top_level_children": result["top_level_children"],
+            "remote_gates": {
+                "qualification_reset_materialized": True,
+                "never_activated": True,
+                "service_absent": True,
+                "d_execution_absent": True,
+                "old_c_v39_healthy": True,
+                "deleted": False,
+            },
+        }
+        evidence_hash = self._write_immutable_evidence(evidence, recorded)
+        return {
+            "status": "inspected_not_deleted",
+            "qualification_reset_materialized": True,
+            "intent_nonce_sha256": nonce_hash,
+            "pre_delete_inventory_sha256": result["inventory_sha256"],
+            "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "bundle_id": report.bundle_id,
+            "evidence_sha256": evidence_hash,
+        }
+
+    def _apply_qualification_reset(
+        self,
+        bundle_root: Path,
+        *,
+        intent_nonce: str,
+        expected_pre_delete_inventory_sha256: str,
+        expected_legacy_deployment_id: str,
+    ) -> Mapping[str, object]:
+        bundle, report, restore_name, _python, _tool = self._verified_bundle(
+            bundle_root
+        )
+        if len(intent_nonce) < 16 or _SAFE_ID.fullmatch(intent_nonce) is None:
+            raise ColdRestoreCLIError("qualification reset intent nonce is invalid")
+        if _SHA256.fullmatch(expected_pre_delete_inventory_sha256) is None:
+            raise ColdRestoreCLIError(
+                "qualification reset inventory hash is invalid"
+            )
+        if expected_legacy_deployment_id != _LEGACY_V39_DEPLOYMENT_ID:
+            raise ColdRestoreCLIError(
+                "qualification reset is fixed to the exact legacy V39 deployment"
+            )
+        contract = self._qualification_reset_contract(
+            bundle,
+            report,
+            restore_name,
+            expected_legacy_deployment_id=expected_legacy_deployment_id,
+        )
+        nonce_hash = hashlib.sha256(intent_nonce.encode("utf-8")).hexdigest()
+        evidence_root = (
+            self._recovery_root() / "evidence"
+            / "prepare-empty-qualification-reset"
+        )
+        inspection_path = evidence_root / f"{nonce_hash}.inspection.json"
+        try:
+            ensure_no_reparse_components(inspection_path)
+            inspection_info = inspection_path.lstat()
+            inspection_bytes = inspection_path.read_bytes()
+            inspection = json.loads(inspection_bytes.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ColdRestoreCLIError(
+                "matching qualification reset inspection evidence is absent"
+            ) from error
+        remote_gates = {
+            "qualification_reset_materialized": True,
+            "never_activated": True,
+            "service_absent": True,
+            "d_execution_absent": True,
+            "old_c_v39_healthy": True,
+            "deleted": False,
+        }
+        expected_inspection = {
+            "intent_nonce_sha256": nonce_hash,
+            "bundle_id": report.bundle_id,
+            "release_id": report.release_id,
+            "release_manifest_sha256": report.release_manifest_sha256,
+            "checkpoint_id": report.checkpoint_id,
+            "checkpoint_manifest_sha256": report.checkpoint_manifest_sha256,
+            "recovery_manifest_sha256": report.recovery_manifest_sha256,
+            "materialization_event_id": contract["materialization_event_id"],
+            "materialization_event_sha256": contract[
+                "materialization_event_sha256"
+            ],
+            "failure_domain_attestation_sha256": contract[
+                "failure_domain_attestation_sha256"
+            ],
+            "failure_domain_attestation_file_sha256": contract[
+                "failure_domain_attestation_file_sha256"
+            ],
+            "production_host_facts_sha256": contract[
+                "production_host_facts_sha256"
+            ],
+            "production_host_facts_file_sha256": contract[
+                "production_host_facts_file_sha256"
+            ],
+            "closure_inventory_sha256": contract["closure_inventory_sha256"],
+            "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "pre_delete_inventory_sha256": expected_pre_delete_inventory_sha256,
+            "top_level_children": inspection.get("top_level_children"),
+        }
+        if (
+            inspection_path.is_symlink()
+            or not stat.S_ISREG(inspection_info.st_mode)
+            or inspection_info.st_nlink != 1
+            or not isinstance(inspection, dict)
+            or inspection_bytes != self._canonical_bytes(inspection)
+            or set(inspection) != {
+                "schema_version", "authority", "recorded_at", "remote_gates",
+                *expected_inspection,
+            }
+            or inspection.get("schema_version")
+            != "qrh-prepare-empty-qualification-reset-offhost-inspection/v1"
+            or inspection.get("authority") != "evidence_only"
+            or inspection.get("remote_gates") != remote_gates
+            or any(
+                inspection.get(key) != value
+                for key, value in expected_inspection.items()
+            )
+        ):
+            raise ColdRestoreCLIError(
+                "qualification reset inspection does not authorize this deletion"
+            )
+        self._revalidate_qualification_attestation_file(contract)
+        intent_path = evidence_root / f"{nonce_hash}.apply-intent.json"
+        applied_path = evidence_root / f"{nonce_hash}.applied.json"
+        if os.path.lexists(applied_path):
+            raise ColdRestoreCLIError(
+                "qualification reset intent nonce was already applied"
+            )
+        intent_static = {
+            **expected_inspection,
+            "inspection_evidence_sha256": hashlib.sha256(inspection_bytes).hexdigest(),
+        }
+        if os.path.lexists(intent_path):
+            try:
+                ensure_no_reparse_components(intent_path)
+                intent_info = intent_path.lstat()
+                intent_bytes = intent_path.read_bytes()
+                intent = json.loads(intent_bytes.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
+                raise ColdRestoreCLIError(
+                    "qualification reset apply intent is invalid"
+                ) from error
+            if (
+                intent_path.is_symlink()
+                or not stat.S_ISREG(intent_info.st_mode)
+                or intent_info.st_nlink != 1
+                or not isinstance(intent, dict)
+                or intent_bytes != self._canonical_bytes(intent)
+                or set(intent) != {
+                    "schema_version", "authority", "recorded_at", *intent_static,
+                }
+                or intent.get("schema_version")
+                != "qrh-prepare-empty-qualification-reset-offhost-apply-intent/v1"
+                or intent.get("authority") != "coordination_only"
+                or any(intent.get(key) != value for key, value in intent_static.items())
+            ):
+                raise ColdRestoreCLIError(
+                    "qualification reset apply intent retry differs"
+                )
+            intent_hash = hashlib.sha256(intent_bytes).hexdigest()
+        else:
+            intent = {
+                "schema_version": (
+                    "qrh-prepare-empty-qualification-reset-offhost-apply-intent/v1"
+                ),
+                "authority": "coordination_only",
+                "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                **intent_static,
+            }
+            intent_hash = self._write_immutable_evidence(intent_path, intent)
+        contract = {
+            **contract,
+            "inspected_top_level_children": inspection["top_level_children"],
+        }
+        self._revalidate_qualification_attestation_file(contract)
+        result = self._ssh(
+            self._qualification_reset_script(
+                contract=contract,
+                intent_nonce_sha256=nonce_hash,
+                apply=True,
+                expected_inventory_sha256=expected_pre_delete_inventory_sha256,
+            ),
+            compressed=True,
+        )
+        self._qualification_reset_identity(result, apply=True)
+        if any(
+            (
+                result.get("legacy_deployment_id")
+                != expected_legacy_deployment_id,
+                result.get("intent_nonce_sha256") != nonce_hash,
+                result.get("bundle_id") != report.bundle_id,
+                result.get("pre_delete_inventory_sha256")
+                != expected_pre_delete_inventory_sha256,
+            )
+        ):
+            raise ColdRestoreCLIError("qualification reset apply binding differs")
+        applied = {
+            "schema_version": (
+                "qrh-prepare-empty-qualification-reset-offhost-applied/v1"
+            ),
+            "authority": "evidence_only",
+            "recorded_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            **expected_inspection,
+            "apply_intent_sha256": intent_hash,
+            "root_exists": True,
+            "root_empty": True,
+            "old_c_v39_healthy": True,
+            "response_recovered": bool(result["response_recovered"]),
+            "remaining_pre_delete_inventory_sha256": result[
+                "remaining_pre_delete_inventory_sha256"
+            ],
+            "remaining_child_count": result["remaining_child_count"],
+            "deleted_child_count": result["deleted_child_count"],
+        }
+        applied_hash = self._write_immutable_evidence(applied_path, applied)
+        return {
+            "status": "prepared_empty_root",
+            "qualification_reset_materialized": True,
+            "intent_nonce_sha256": nonce_hash,
+            "pre_delete_inventory_sha256": expected_pre_delete_inventory_sha256,
+            "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "bundle_id": report.bundle_id,
+            "response_recovered": bool(result["response_recovered"]),
+            "remaining_pre_delete_inventory_sha256": result[
+                "remaining_pre_delete_inventory_sha256"
+            ],
+            "remaining_child_count": result["remaining_child_count"],
+            "deleted_child_count": result["deleted_child_count"],
+            "evidence_sha256": applied_hash,
+        }
+
+    def inspect_prepare_empty(
+        self,
+        bundle_root: Path,
+        *,
+        intent_nonce: str,
+        expected_legacy_deployment_id: str,
+        qualification_reset_materialized: bool = False,
+    ) -> Mapping[str, object]:
+        if qualification_reset_materialized:
+            return self._inspect_qualification_reset(
+                bundle_root,
+                intent_nonce=intent_nonce,
+                expected_legacy_deployment_id=expected_legacy_deployment_id,
+            )
         _bundle, report, _restore, _python, _tool = self._verified_bundle(bundle_root)
         if len(intent_nonce) < 16 or _SAFE_ID.fullmatch(intent_nonce) is None:
             raise ColdRestoreCLIError("prepare-empty intent nonce is invalid")
@@ -747,7 +2229,17 @@ class OpenSSHColdRestore:
         intent_nonce: str,
         expected_pre_delete_inventory_sha256: str,
         expected_legacy_deployment_id: str,
+        qualification_reset_materialized: bool = False,
     ) -> Mapping[str, object]:
+        if qualification_reset_materialized:
+            return self._apply_qualification_reset(
+                bundle_root,
+                intent_nonce=intent_nonce,
+                expected_pre_delete_inventory_sha256=(
+                    expected_pre_delete_inventory_sha256
+                ),
+                expected_legacy_deployment_id=expected_legacy_deployment_id,
+            )
         _bundle, report, _restore, _python, _tool = self._verified_bundle(bundle_root)
         if len(intent_nonce) < 16 or _SAFE_ID.fullmatch(intent_nonce) is None:
             raise ColdRestoreCLIError("prepare-empty intent nonce is invalid")
@@ -1020,6 +2512,14 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--intent-nonce", required=True)
     prepare.add_argument("--expected-legacy-deployment-id", required=True)
     prepare.add_argument("--expected-pre-delete-inventory-sha256")
+    prepare.add_argument(
+        "--qualification-reset-materialized",
+        action="store_true",
+        help=(
+            "one-time reset of the exact materialized, never-activated "
+            "qualification root; ordinary empty-root preparation remains unchanged"
+        ),
+    )
     args = parser.parse_args(argv)
     config = RuntimePublishConfig.load(args.config, expected_project_root=args.project_root)
     operator = OpenSSHColdRestore(config)
@@ -1034,6 +2534,9 @@ def main(argv: list[str] | None = None) -> int:
             args.bundle_root,
             intent_nonce=args.intent_nonce,
             expected_legacy_deployment_id=args.expected_legacy_deployment_id,
+            qualification_reset_materialized=(
+                args.qualification_reset_materialized
+            ),
         )
     else:
         if args.expected_pre_delete_inventory_sha256 is None:
@@ -1045,6 +2548,9 @@ def main(argv: list[str] | None = None) -> int:
                 args.expected_pre_delete_inventory_sha256
             ),
             expected_legacy_deployment_id=args.expected_legacy_deployment_id,
+            qualification_reset_materialized=(
+                args.qualification_reset_materialized
+            ),
         )
     print(json.dumps(result, sort_keys=True))
     return 0
