@@ -59,6 +59,18 @@
 .qrh-generic__body img { height: auto; max-width: 100%; }
 .qrh-generic__references ol, .qrh-generic__versions ol { padding-left: 1.4rem; }
 .qrh-generic__references li, .qrh-generic__versions li { margin-block: .75rem; overflow-wrap: anywhere; }
+.qrh-generic__comment-note { color: var(--generic-muted); max-width: 78ch; }
+.qrh-generic__comment-form { background: var(--generic-paper); border: 1px solid var(--generic-line); border-radius: .65rem; display: grid; gap: .9rem; margin-block: 1rem 1.5rem; padding: 1rem; }
+.qrh-generic__comment-form fieldset { border: 0; display: flex; flex-wrap: wrap; gap: .85rem; margin: 0; padding: 0; }
+.qrh-generic__comment-form label { display: grid; gap: .3rem; }
+.qrh-generic__comment-form fieldset label { display: inline-flex; }
+.qrh-generic__comment-form input[type="text"], .qrh-generic__comment-form select, .qrh-generic__comment-form textarea { border: 1px solid #a9bcb6; border-radius: .35rem; font: inherit; max-width: 100%; padding: .55rem; width: 100%; }
+.qrh-generic__comment-form textarea { resize: vertical; }
+.qrh-generic__comment-list { display: grid; gap: .75rem; padding-left: 1.4rem; }
+.qrh-generic__comment-list li { background: var(--generic-paper); border-left: .2rem solid var(--generic-accent); padding: .75rem 1rem; }
+.qrh-generic__comment-list--unresolved li { border-left-color: #a26b19; }
+.qrh-generic__comment-list p { margin-block: 0 .4rem; white-space: pre-wrap; }
+.qrh-generic__comment-list small { color: var(--generic-muted); overflow-wrap: anywhere; }
 
 @media (max-width: 860px) {
   .qrh-generic { padding-inline: 1rem; }

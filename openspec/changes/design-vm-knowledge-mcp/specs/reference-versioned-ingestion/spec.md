@@ -73,6 +73,10 @@
 - **WHEN** 维护者决定使用新的模型、prompt 或输出 schema
 - **THEN** 系统 SHALL 通过显式、可审计的定向 recompile campaign 生成新 generation，保留旧 generation，且不得在普通发布中静默重写历史结果
 
+#### Scenario: 旧 queued job 已无法按原编译身份重放
+- **WHEN** 当前 compiler 无法复现旧 job 绑定的 partition/request closure
+- **THEN** 系统 SHALL 以 actor/reason 审计记录 `superseded_identity`、保持旧 payload 不可变，并为明确选择的受影响 source versions 建立新 targeted jobs；不得把升级伪装成 ordinary changed-only 或就地修改旧 job
+
 #### Scenario: Rolling alias 的实际 revision 漂移
 - **WHEN** 官方 alias→revision 证据变化，或 API 返回 model/system_fingerprint 与 generation 的 identity contract 不一致且无法证明仍为同一 revision
 - **THEN** 新输出 SHALL 进入 `provider_identity_drift` 隔离状态，系统 SHALL 建立新 generation 并要求显式 targeted recompile 选择受影响 source versions，且不得与旧语义知识混用
@@ -88,9 +92,17 @@ DeepSeek 超时、API 失败、非法结构、证据 span 无法定位或机械�
 - **WHEN** 文档的确定性 IR、页面和 lexical index 均已通过而语义 job 超时
 - **THEN** candidate MAY 作为明确标记 `pending` 或 `failed_retryable` 的基础 snapshot 激活，当前版本不得继承上一 source version 的语义知识冒充最新结果
 
+#### Scenario: Provider 持续返回少量字节而不触发 socket inactivity timeout
+- **WHEN** 单个语义 job 超过启动前由 immutable `part_count` 派生并记录的整体 wall-clock deadline（v1 为 `min(1800, 360*part_count)` 秒），即使连接仍有零星流量
+- **THEN** operator SHALL 终止隔离 worker，把仍 running job 审计为 `failed_retryable/wall_clock_timeout`，且该 job SHALL 保持 0 candidate/0 formal item；不得无限等待、留下后台请求或仅依赖 socket timeout
+
 #### Scenario: 后续语义候选通过验证
 - **WHEN** 同一 source version 的语义 generation 完成机械验证或人工接受
 - **THEN** 系统 SHALL 生成并验证新的 enriched snapshot，再通过正常 release 激活流程统一更新页面、搜索与 MCP
+
+#### Scenario: 已成功版本的后续 targeted job 失败
+- **WHEN** 同一 source version 已有成功且被当前 snapshot 选中的 generation，后续 targeted job 失败、非法或仍在等待
+- **THEN** 系统 SHALL 保留该成功 generation 与正式知识，失败尝试只进入审计；不得因“最新 job”非成功而撤回当前知识，也不得旁路 release 激活直接改变页面、搜索或 MCP
 
 ### Requirement: 来源文本在模型边界内始终是不可信数据
 DeepSeek 编译器 SHALL 将研究正文放入结构化 data envelope，固定 system/developer 指令与严格 JSON schema；模型调用 SHALL 无工具、文件系统、网络、部署或凭据访问权限，且正文中的“忽略指令”、工具调用、secret 请求或输出协议修改 SHALL 仅作为待分析文本处理。

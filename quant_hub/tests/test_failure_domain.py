@@ -2,18 +2,22 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from quant_hub.ops.failure_domain import (
     FACTS_SCHEMA,
     PROBE_SCHEMA,
     FailureDomainError,
     attest_failure_domain,
+    build_independence_probe,
     canonical_bytes,
     collect_host_facts,
 )
+from quant_hub.ops.recovery_bundle import RecoveryVerification
 
 
 def facts(role: str, machine: str, volume: str) -> dict[str, object]:
@@ -40,7 +44,13 @@ def probe() -> dict[str, object]:
         "production_root_available": False,
         "recovery_bundle_readable": True,
         "closure_verified": True,
+        "empty_root_precondition": True,
+        "bundle_id": "bundle-v39",
+        "release_id": "release-v39",
+        "release_manifest_sha256": "c" * 64,
         "bundle_inventory_sha256": "a" * 64,
+        "materialization_event_id": "cold-materialization-bundle-v39",
+        "materialization_event_sha256": "d" * 64,
         "probe_tool_sha256": "b" * 64,
     }
 
@@ -95,6 +105,72 @@ class FailureDomainTests(unittest.TestCase):
         self.assertEqual(FACTS_SCHEMA, result["schema_version"])
         self.assertEqual(64, len(str(result["facts_sha256"])))
         self.assertNotIn("credential", str(result).casefold())
+
+    def test_probe_is_derived_from_verified_bundle_and_empty_d_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary) / "recovery"
+            bundle = recovery / "cold-recovery-bundle-v39"
+            bundle.mkdir(parents=True)
+            inventory = bundle / "closure_inventory.json"
+            inventory.write_bytes(b'{"closed":true}\n')
+            event = recovery / "materialization.json"
+            event_value = {
+                "schema_version": "qrh-recovery-materialization-event/v1",
+                "event_id": "cold-materialization-bundle-v39",
+                "kind": "cold_recovery_materialized",
+                "authority": "evidence_only",
+                "fields": {
+                    "bundle_id": "bundle-v39",
+                    "release_id": "release-v39",
+                    "manifest_sha256": "c" * 64,
+                    "empty_root_precondition": True,
+                    "import_cleaned": True,
+                    "runtime_tmp_cleaned": True,
+                },
+            }
+            event.write_text(json.dumps(event_value), encoding="utf-8")
+            tool = recovery / "failure_domain_cli.py"
+            tool.write_text("# reviewed probe tool\n", encoding="utf-8")
+            report = RecoveryVerification(
+                valid=True,
+                bundle_id="bundle-v39",
+                release_id="release-v39",
+                release_manifest_sha256="c" * 64,
+                checkpoint_id="checkpoint-v39",
+                checkpoint_manifest_sha256="e" * 64,
+                recovery_manifest_sha256="f" * 64,
+                errors=(),
+            )
+            with patch(
+                "quant_hub.ops.recovery_bundle.verify_recovery_bundle",
+                return_value=report,
+            ):
+                result = build_independence_probe(
+                    recovery_root=recovery,
+                    bundle_root=bundle,
+                    materialization_event_path=event,
+                    probe_tool_path=tool,
+                )
+            self.assertFalse(result["production_root_available"])
+            self.assertTrue(result["empty_root_precondition"])
+            self.assertEqual("bundle-v39", result["bundle_id"])
+            self.assertEqual(
+                hashlib.sha256(event.read_bytes()).hexdigest(),
+                result["materialization_event_sha256"],
+            )
+
+            event_value["fields"]["release_id"] = "another-release"
+            event.write_text(json.dumps(event_value), encoding="utf-8")
+            with patch(
+                "quant_hub.ops.recovery_bundle.verify_recovery_bundle",
+                return_value=report,
+            ), self.assertRaisesRegex(FailureDomainError, "does not bind"):
+                build_independence_probe(
+                    recovery_root=recovery,
+                    bundle_root=bundle,
+                    materialization_event_path=event,
+                    probe_tool_path=tool,
+                )
 
 
 if __name__ == "__main__":

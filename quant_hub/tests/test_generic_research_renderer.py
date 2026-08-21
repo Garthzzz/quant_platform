@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import replace
 import hashlib
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from quant_hub.app import create_app
+from quant_hub.config import ConfigurationError
 from quant_hub.generic_research import (
     GenericCatalogError,
     GenericKnowledgeCard,
@@ -204,6 +207,9 @@ class RealQ5GenericRendererAcceptanceTests(SettingsTestCase):
                     "SECRET_KEY": "generic-renderer-test-only",
                     "TRUSTED_ORIGINS": ("http://localhost",),
                     "GENERIC_RESEARCH_CATALOG": catalog,
+                    "COMMENT_DATABASE_PATH": str(
+                        Path(directory) / "external-state" / "comments.sqlite3"
+                    ),
                 },
             )
             client = app.test_client()
@@ -324,6 +330,206 @@ class GenericCitationInteractionTests(SettingsTestCase):
         self.assertIn(f'data-citation-id="{citation_id}"', html)
         self.assertIn("data-citation-dialog", html)
         self.assertIn("data-endpoint-prefix=\"/api/v1/evidence/citations/\"", html)
+
+
+class GenericCommentPersistenceAcceptanceTests(SettingsTestCase):
+    @staticmethod
+    def _database_facts(path: Path) -> dict[str, list[tuple[object, ...]]]:
+        with closing(sqlite3.connect(path)) as connection:
+            return {
+                "comments": connection.execute(
+                    "SELECT comment_id,research_id,actor_id,body,created_at,updated_at,revision,deleted_at FROM comment ORDER BY comment_id"
+                ).fetchall(),
+                "events": connection.execute(
+                    "SELECT comment_event_id,comment_id,event_type,old_body_hash,new_body_hash,actor_id,revision,occurred_at FROM comment_event ORDER BY comment_event_id"
+                ).fetchall(),
+                "targets": connection.execute(
+                    "SELECT comment_target_id,comment_id,target_kind,research_id,document_id,origin_document_version_id,origin_source_sha256,origin_start_byte,origin_end_byte,origin_exact_bytes_sha256,origin_structural_context_sha256,origin_locator_json,created_at FROM comment_target ORDER BY comment_id"
+                ).fetchall(),
+                "actors": connection.execute(
+                    "SELECT actor_id,actor_kind,display_name,created_at FROM actor ORDER BY actor_id"
+                ).fetchall(),
+            }
+
+    def _app(self, catalog: GenericResearchCatalog, database: Path):
+        return create_app(
+            self.settings,
+            {
+                "TESTING": True,
+                "SECRET_KEY": "generic-comment-test-only",
+                "TRUSTED_ORIGINS": ("http://localhost",),
+                "COMMENT_DATABASE_PATH": str(database),
+                "GENERIC_RESEARCH_CATALOG": catalog,
+            },
+        )
+
+    @staticmethod
+    def _post_comment(client, document_id: str, payload: dict[str, object], key: str):
+        page = client.get(f"/knowledge/research/{document_id}/")
+        token = re.search(
+            r'<meta name="csrf-token" content="([A-Za-z0-9_-]{43})">',
+            page.get_data(as_text=True),
+        )
+        assert token is not None
+        return client.post(
+            f"/knowledge/research/{document_id}/comments",
+            json=payload,
+            headers={
+                "Origin": "http://localhost",
+                "X-CSRF-Token": token.group(1),
+                "Idempotency-Key": key,
+            },
+        )
+
+    def test_nonempty_ui_comments_survive_code_revision_move_and_release_rollback(self) -> None:
+        legacy_before = _legacy_hashes()
+        database = self.project / "external-state" / "comments.sqlite3"
+        with tempfile.TemporaryDirectory() as directory:
+            intake = Path(directory) / "intake"
+            intake.mkdir()
+            source = intake / "factor.md"
+            v1 = (
+                "# 因子稳定性\n\n"
+                "## 方法\n\n收益率必须滞后一日。\n\n"
+                "## 限制\n\n旧限制只适用于高流动性样本。\n"
+            ).encode("utf-8")
+            source.write_bytes(v1)
+            first = ReferenceCompiler().compile(intake)
+            assert first.candidate_snapshot is not None
+            snapshot_v1 = first.candidate_snapshot
+            document_id, version_v1 = next(iter(snapshot_v1.active_membership.items()))
+            catalog_v1 = GenericResearchCatalog(snapshot_v1, {_sha256_bytes(v1): v1})
+
+            app_v1 = self._app(catalog_v1, database)
+            client_v1 = app_v1.test_client()
+            html_v1 = client_v1.get(
+                f"/knowledge/research/{document_id}/"
+            ).get_data(as_text=True)
+            self.assertIn("张正泽", html_v1)
+            self.assertIn("宋定坤", html_v1)
+            self.assertIn("其他", html_v1)
+            paragraph_anchor = next(
+                option
+                for option in catalog_v1.page(document_id).comment_anchor_options
+                if "旧限制" in option.label
+            )
+            document_response = self._post_comment(
+                client_v1,
+                document_id,
+                {
+                    "actor_kind": "zhang_zhengze",
+                    "display_name": None,
+                    "content": "整篇研究的稳定评论。",
+                    "version_id": version_v1,
+                    "target_kind": "document",
+                    "anchor_span_id": None,
+                },
+                "generic-document-comment-0001",
+            )
+            self.assertEqual(201, document_response.status_code, document_response.json)
+            block_response = self._post_comment(
+                client_v1,
+                document_id,
+                {
+                    "actor_kind": "song_dingkun",
+                    "display_name": None,
+                    "content": "这条限制需要继续核验。",
+                    "version_id": version_v1,
+                    "target_kind": "block",
+                    "anchor_span_id": paragraph_anchor.span_id,
+                },
+                "generic-block-comment-0001",
+            )
+            self.assertEqual(201, block_response.status_code, block_response.json)
+            before = self._database_facts(database)
+            self.assertEqual(2, len(before["comments"]))
+            self.assertEqual(2, len(before["events"]))
+
+            # A new code process reopens the same release-external authority.
+            reopened = self._app(catalog_v1, database).test_client()
+            reopened_html = reopened.get(
+                f"/knowledge/research/{document_id}/"
+            ).get_data(as_text=True)
+            self.assertIn("整篇研究的稳定评论。", reopened_html)
+            self.assertIn("这条限制需要继续核验。", reopened_html)
+            self.assertEqual(2, reopened_html.count('data-resolution-status="resolved_current"'))
+
+            # Revise the source, then move the unchanged revision.  Compiler
+            # history preserves document identity; the old block must not be
+            # fuzzy-attached to the semantically similar new text.
+            v2 = v1.replace(
+                "旧限制只适用于高流动性样本。".encode("utf-8"),
+                "新限制只适用于高流动性且低冲击成本样本。".encode("utf-8"),
+            )
+            source.write_bytes(v2)
+            revised = ReferenceCompiler().compile(intake, previous=snapshot_v1)
+            assert revised.candidate_snapshot is not None
+            snapshot_v2 = revised.candidate_snapshot
+            version_v2 = snapshot_v2.active_membership[document_id]
+            moved_source = intake / "renamed-factor.md"
+            source.rename(moved_source)
+            moved = ReferenceCompiler().compile(intake, previous=snapshot_v2)
+            assert moved.candidate_snapshot is not None
+            snapshot_moved = moved.candidate_snapshot
+            self.assertEqual(version_v2, snapshot_moved.active_membership[document_id])
+            self.assertIn("renamed-factor.md", snapshot_moved.documents[document_id].aliases)
+            catalog_moved = GenericResearchCatalog(
+                snapshot_moved,
+                {_sha256_bytes(v1): v1, _sha256_bytes(v2): v2},
+            )
+            moved_client = self._app(catalog_moved, database).test_client()
+            current_html = moved_client.get(
+                f"/knowledge/research/{document_id}/"
+            ).get_data(as_text=True)
+            self.assertIn(
+                f'data-comment-snapshot-id="{snapshot_moved.snapshot_id}"',
+                current_html,
+            )
+            self.assertRegex(
+                current_html, r'data-comment-manifest-sha256="[0-9a-f]{64}"'
+            )
+            self.assertIn('data-comment-group="unresolved"', current_html)
+            self.assertIn('data-resolution-status="unresolved"', current_html)
+            self.assertIn("这条限制需要继续核验。", current_html)
+            self.assertIn("未解析／历史定位", current_html)
+            self.assertIn('data-resolution-status="resolved_current"', current_html)
+
+            history_html = moved_client.get(
+                f"/knowledge/research/{document_id}/versions/{version_v1}/"
+            ).get_data(as_text=True)
+            self.assertIn('data-resolution-status="resolved_history"', history_html)
+            self.assertIn("这条限制需要继续核验。", history_html)
+
+            # D-prior code/content rollback selects v1 while retaining current
+            # state. Both exact anchors resolve again and no fact/event changes.
+            rollback_client = self._app(catalog_v1, database).test_client()
+            rollback_html = rollback_client.get(
+                f"/knowledge/research/{document_id}/"
+            ).get_data(as_text=True)
+            self.assertEqual(2, rollback_html.count('data-resolution-status="resolved_current"'))
+            self.assertEqual(before, self._database_facts(database))
+
+        self.assertEqual(legacy_before, _legacy_hashes())
+
+    def test_production_generic_catalog_requires_explicit_external_comment_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = b"# Comment config\n\nProduction state is external.\n"
+            (root / "config.md").write_bytes(source)
+            report = ReferenceCompiler().compile(root)
+        assert report.candidate_snapshot is not None
+        catalog = GenericResearchCatalog(
+            report.candidate_snapshot,
+            {_sha256_bytes(source): source},
+        )
+        with self.assertRaisesRegex(ConfigurationError, "COMMENT_DATABASE_PATH"):
+            create_app(
+                self.settings,
+                {
+                    "TESTING": False,
+                    "GENERIC_RESEARCH_CATALOG": catalog,
+                },
+            )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,150 @@
+{
+  "schema_version": "qrh-qrel-template/v1",
+  "qrels": [
+    {
+      "qrel_id": "dev-factor-rank-ic",
+      "split": "development",
+      "category": "factor",
+      "query": "rank IC 如何筛选低噪声横截面因子",
+      "context": {"market": "A股", "frequency": "日频", "objective": "选股"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "factor.md", "quote": "使用 Rank IC 筛选横截面因子"}],
+      "negative_sources": [{"logical_path": "crypto.md", "quote": "订单簿不平衡预测下一分钟收益"}],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["formula_alias", "cross_language"]
+    },
+    {
+      "qrel_id": "dev-factor-hard-negative",
+      "split": "development",
+      "category": "factor",
+      "query": "分钟级订单簿不平衡信号",
+      "context": {"market": "加密货币", "frequency": "分钟", "data": "订单簿"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "crypto.md", "quote": "订单簿不平衡预测下一分钟收益"}],
+      "negative_sources": [{"logical_path": "factor.md", "quote": "使用 Rank IC 筛选横截面因子"}],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["hard_negative", "condition_conflict"]
+    },
+    {
+      "qrel_id": "dev-data-winsorize",
+      "split": "development",
+      "category": "data",
+      "query": "极端值缩尾和截面标准化",
+      "context": {"data": "因子暴露"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "data.md", "quote": "先缩尾再做截面标准化"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["cross_language"]
+    },
+    {
+      "qrel_id": "dev-model-walk-forward",
+      "split": "development",
+      "category": "model",
+      "query": "walk forward 时间序列模型选择",
+      "context": {"objective": "模型选择"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "model.md", "quote": "使用 walk-forward 滚动验证选择模型"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["cross_language"]
+    },
+    {
+      "qrel_id": "dev-backtest-cost",
+      "split": "development",
+      "category": "backtest",
+      "query": "回测交易成本与换手率",
+      "context": {"objective": "回测"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "backtest.md", "quote": "按成交额和换手率扣除交易成本"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["miscitation"]
+    },
+    {
+      "qrel_id": "dev-no-answer",
+      "split": "development",
+      "category": "model",
+      "query": "量子退火预测火星期货",
+      "context": {},
+      "answerable": false,
+      "positive_sources": [],
+      "negative_sources": [],
+      "expected_knowledge_kinds": [],
+      "slices": ["no_answer"]
+    },
+    {
+      "qrel_id": "dev-factor-history",
+      "split": "development",
+      "category": "factor",
+      "query": "已废弃的原始均值信号",
+      "context": {},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "legacy.md", "quote": "原始均值信号仅供历史复盘"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["historical_deprecated"],
+      "include_history": true
+    },
+    {
+      "qrel_id": "dev-data-hard-negative",
+      "split": "development",
+      "category": "data",
+      "query": "订单簿数据清洗不是截面因子缩尾",
+      "context": {"data": "订单簿"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "crypto.md", "quote": "订单簿不平衡预测下一分钟收益"}],
+      "negative_sources": [{"logical_path": "data.md", "quote": "先缩尾再做截面标准化"}],
+      "expected_knowledge_kinds": ["method"],
+      "slices": ["hard_negative", "condition_conflict"]
+    },
+    {
+      "qrel_id": "holdout-factor-limit",
+      "split": "holdout",
+      "category": "factor",
+      "query": "横截面 Rank IC 在低 SNR 下有什么限制",
+      "context": {"market": "A股", "frequency": "日频"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "factor.md", "quote": "低 SNR 下 Rank IC 排序不稳定"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["limitation"],
+      "slices": ["hard_negative"]
+    },
+    {
+      "qrel_id": "holdout-model-leakage",
+      "split": "holdout",
+      "category": "model",
+      "query": "模型选择怎样避免时间泄漏",
+      "context": {"objective": "模型选择"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "model.md", "quote": "随机切分会造成时间泄漏"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["failure"],
+      "slices": ["miscitation"]
+    },
+    {
+      "qrel_id": "holdout-backtest-capacity",
+      "split": "holdout",
+      "category": "backtest",
+      "query": "策略容量不足时回测为什么虚高",
+      "context": {"objective": "回测"},
+      "answerable": true,
+      "positive_sources": [{"logical_path": "backtest.md", "quote": "忽略容量会高估可实现收益"}],
+      "negative_sources": [],
+      "expected_knowledge_kinds": ["failure"],
+      "slices": ["historical_deprecated"]
+    },
+    {
+      "qrel_id": "holdout-no-answer",
+      "split": "holdout",
+      "category": "data",
+      "query": "卫星图像中的火星矿产标签清洗",
+      "context": {},
+      "answerable": false,
+      "positive_sources": [],
+      "negative_sources": [],
+      "expected_knowledge_kinds": [],
+      "slices": ["no_answer"]
+    }
+  ]
+}

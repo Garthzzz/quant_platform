@@ -36,9 +36,10 @@
     "vm": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ssh_alias", "root"],
+      "required": ["ssh_alias", "target_address", "root"],
       "properties": {
         "ssh_alias": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+        "target_address": {"const": "10.5.1.240"},
         "root": {"const": "D:\\quant\\quant_platform"}
       }
     }

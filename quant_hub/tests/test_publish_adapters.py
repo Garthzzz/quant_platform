@@ -4,10 +4,12 @@ import hashlib
 import json
 import base64
 from pathlib import Path, PureWindowsPath
+import subprocess
 import tempfile
 import unittest
 
 from quant_hub.ops.publish_adapters import (
+    ActivationAuthorization,
     CONFIG_SCHEMA,
     CommandResult,
     GitHubExactSHACI,
@@ -21,9 +23,11 @@ from quant_hub.ops.publish_adapters import (
     ReleaseMaterial,
     SecretValue,
     VMDeploymentAdapter,
+    _powershell_package_inventory_verification_script,
 )
 from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_identity import manifest_sha256
+from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
 
 
 COMMIT = "1" * 40
@@ -42,7 +46,11 @@ def config_value() -> dict[str, object]:
             "poll_interval_seconds": 1,
             "timeout_seconds": 10,
         },
-        "vm": {"ssh_alias": "honghu-vm", "root": r"D:\quant\quant_platform"},
+        "vm": {
+            "ssh_alias": "honghu-vm",
+            "target_address": "10.5.1.240",
+            "root": r"D:\quant\quant_platform",
+        },
     }
 
 
@@ -75,6 +83,7 @@ class ProductionConfigTests(unittest.TestCase):
     def test_config_is_closed_contains_no_secret_and_root_is_exact(self) -> None:
         config = ProductionPublishConfig.parse(config_value())
         self.assertEqual(PureWindowsPath(r"D:\quant\quant_platform"), config.vm.root)
+        self.assertEqual("10.5.1.240", config.vm.target_address)
         self.assertEqual("github-actions-read", config.github.credential_target)
         value = config_value()
         value["github"]["token"] = "must-not-be-accepted"
@@ -86,6 +95,15 @@ class ProductionConfigTests(unittest.TestCase):
             value = config_value()
             value["vm"]["root"] = forbidden
             with self.subTest(root=forbidden), self.assertRaises(PublishAdapterError):
+                ProductionPublishConfig.parse(value)
+
+    def test_second_recovery_vm_is_rejected(self) -> None:
+        for forbidden in ("10.5.1.223", "10.5.1.235"):
+            value = config_value()
+            value["vm"]["target_address"] = forbidden
+            with self.subTest(address=forbidden), self.assertRaisesRegex(
+                PublishAdapterError, "10.5.1.240"
+            ):
                 ProductionPublishConfig.parse(value)
 
     def test_secret_value_never_renders_plaintext(self) -> None:
@@ -290,16 +308,51 @@ class FakeInvoker:
             "release_manifest_sha256": kwargs["release_manifest_sha256"],
             "publish_candidate_sha256": self.candidate_hash,
             "status": "activated" if self.result_mode == "activate" else "candidate_validated",
-            "receipt_id": (
+            "evidence_id": (
                 "activation-1" if self.result_mode == "activate" else "candidate-validation-1"
             ),
-            "receipt_type": (
-                "activation" if self.result_mode == "activate" else "candidate_validation"
+            "evidence_type": (
+                "activation_receipt"
+                if self.result_mode == "activate"
+                else "candidate_validation_event"
             ),
         }
 
 
 class VMDeploymentAdapterTests(unittest.TestCase):
+    def test_powershell_inventory_matches_python_and_dependency_tamper_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "quant_hub"
+            (package / "ops").mkdir(parents=True)
+            dependency = package / "ops" / "deployment.py"
+            dependency.write_bytes(b"reviewed dependency\n")
+            (package / "__init__.py").write_bytes(b"reviewed package\n")
+            expected = quant_hub_package_inventory_sha256(package)
+            literal = str(package).replace("'", "''")
+            script = (
+                "$ErrorActionPreference='Stop';"
+                f"$packageFull='{literal}';"
+                "$candidate=[pscustomobject]@{"
+                f"quant_hub_package_inventory_sha256='{expected}'"
+                "};"
+                + _powershell_package_inventory_verification_script()
+                + "Write-Output 'verified'"
+            )
+            verified = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(0, verified.returncode, verified.stderr)
+            self.assertEqual("verified", verified.stdout.strip())
+
+            dependency.write_bytes(b"tampered dependency\n")
+            rejected = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(0, rejected.returncode)
+            self.assertIn("package_inventory_hash_mismatch", rejected.stderr)
+
     def test_controller_invocation_is_bound_to_exact_d_root_and_identity(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
         invoker = FakeInvoker()
@@ -308,9 +361,15 @@ class VMDeploymentAdapterTests(unittest.TestCase):
             "candidate_manifest_sha256": CANDIDATE_HASH,
             "deployment_mode": "activate",
         }
-        result = VMDeploymentAdapter(config, invoker=invoker)(candidate)
+        result = VMDeploymentAdapter(
+            config,
+            invoker=invoker,
+            activation_authorization_resolver=lambda *_: ActivationAuthorization(
+                "attempt-1", "protection-1"
+            ),
+        )(candidate)
         self.assertEqual("activated", result.status)
-        self.assertEqual("activation", result.receipt_type)
+        self.assertEqual("activation_receipt", result.evidence_type)
         self.assertEqual(PureWindowsPath(r"D:\quant\quant_platform"), invoker.called["vm_root"])
 
     def test_candidate_validation_requires_explicit_candidate_only_mode(self) -> None:
@@ -327,7 +386,11 @@ class VMDeploymentAdapterTests(unittest.TestCase):
         default_candidate = {**candidate, "deployment_mode": "activate"}
         with self.assertRaisesRegex(PublishAdapterError, "requested mode"):
             VMDeploymentAdapter(
-                config, invoker=FakeInvoker(result_mode="candidate_only")
+                config,
+                invoker=FakeInvoker(result_mode="candidate_only"),
+                activation_authorization_resolver=lambda *_: ActivationAuthorization(
+                    "attempt-1", "protection-1"
+                ),
             )(default_candidate)
 
     def test_controller_identity_mismatch_is_rejected(self) -> None:
@@ -338,7 +401,23 @@ class VMDeploymentAdapterTests(unittest.TestCase):
             "deployment_mode": "activate",
         }
         with self.assertRaisesRegex(PublishAdapterError, "another identity"):
-            VMDeploymentAdapter(config, invoker=FakeInvoker("3" * 64))(candidate)
+            VMDeploymentAdapter(
+                config,
+                invoker=FakeInvoker("3" * 64),
+                activation_authorization_resolver=lambda *_: ActivationAuthorization(
+                    "attempt-1", "protection-1"
+                ),
+            )(candidate)
+
+    def test_default_activation_without_recovery_authorization_is_rejected(self) -> None:
+        config = ProductionPublishConfig.parse(config_value()).vm
+        candidate = {
+            "release": {"release_id": "release-1", "manifest_sha256": "a" * 64},
+            "candidate_manifest_sha256": CANDIDATE_HASH,
+            "deployment_mode": "activate",
+        }
+        with self.assertRaisesRegex(PublishAdapterError, "protection is unavailable"):
+            VMDeploymentAdapter(config, invoker=FakeInvoker())(candidate)
 
     def test_ssh_invoker_uses_fixed_module_and_argv_without_shell(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
@@ -355,8 +434,8 @@ class VMDeploymentAdapterTests(unittest.TestCase):
                         "release_manifest_sha256": "a" * 64,
                         "publish_candidate_sha256": CANDIDATE_HASH,
                         "status": "activated",
-                        "receipt_id": "activation-1",
-                        "receipt_type": "activation",
+                        "evidence_id": "activation-1",
+                        "evidence_type": "activation_receipt",
                     }
                 ),
             )
@@ -367,6 +446,8 @@ class VMDeploymentAdapterTests(unittest.TestCase):
             release_manifest_sha256="a" * 64,
             publish_candidate_sha256=CANDIDATE_HASH,
             deployment_mode="activate",
+            deployment_attempt_id="attempt-1",
+            recovery_protection_receipt_id="protection-1",
         )
         self.assertEqual("release-1", value["release_id"])
         self.assertEqual("ssh", calls[0][0])
@@ -374,11 +455,28 @@ class VMDeploymentAdapterTests(unittest.TestCase):
         self.assertIn("quant_hub.ops.vm_deploy_cli", script)
         self.assertIn("PYTHONDONTWRITEBYTECODE", script)
         self.assertIn("ReparsePoint", script)
+        self.assertIn(r"D:\quant\quant_platform\tooling\python\python.exe", script)
+        self.assertIn("deployment_cli_module_sha256", script)
+        self.assertIn("package_inventory_hash_mismatch", script)
+        self.assertIn("& $python @cli", script)
+        self.assertNotIn("& python", script)
+        self.assertIn("SSH_CONNECTION", script)
+        self.assertLess(script.index("SSH_CONNECTION"), script.index("New-Item"))
         self.assertIn(r"D:\quant\quant_platform\tmp\deployment-cli", script)
         self.assertNotIn("C:\\", script)
+        parsed = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "[void][scriptblock]::Create([Console]::In.ReadToEnd())"],
+            input=script, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(0, parsed.returncode, parsed.stderr)
 
 
 class OpenSSHVMBackendTests(unittest.TestCase):
+    @staticmethod
+    def _script(call) -> str:
+        return base64.b64decode(call[-1]).decode("utf-16le")
+
     def test_remote_scripts_enforce_root_and_reparse_checks_before_writes(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
         calls = []
@@ -402,18 +500,106 @@ class OpenSSHVMBackendTests(unittest.TestCase):
             local.write_bytes(b"sealed-payload")
             backend.upload(local, target / "payload.bin")
         scripts = [
-            base64.b64decode(call[-1]).decode("utf-16le")
+            self._script(call)
             for call in calls
             if call[0] == "ssh"
         ]
         self.assertTrue(all("D:\\quant\\quant_platform" in script for script in scripts))
+        self.assertTrue(all("SSH_CONNECTION" in script for script in scripts))
+        self.assertTrue(
+            all(
+                script.index("SSH_CONNECTION") < script.index("New-Item")
+                for script in scripts
+                if "New-Item" in script
+            )
+        )
         self.assertTrue(all("ReparsePoint" in script for script in scripts))
+        self.assertTrue(all("root_full_path_differs" in script for script in scripts))
+        self.assertTrue(all("root_parent_reparse" in script for script in scripts))
         self.assertTrue(all("C:\\quant_platform" not in script for script in scripts))
         self.assertTrue(all("\\reference\\" not in script.casefold() for script in scripts))
+        for script in scripts:
+            for write_operation in ("New-Item", "Move-Item", "Remove-Item"):
+                if write_operation in script:
+                    self.assertLess(
+                        script.index("root_parent_reparse"),
+                        script.index(write_operation),
+                    )
+            parsed = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    "[void][scriptblock]::Create([Console]::In.ReadToEnd())",
+                ],
+                input=script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, parsed.returncode, parsed.stderr)
         scp = next(call for call in calls if call[0] == "scp")
+        self.assertIn("HostName=10.5.1.240", scp)
         self.assertIn("D:/quant/quant_platform/incoming/", scp[-1])
         self.assertIn(".payload.bin.upload.partial", scp[-1])
         self.assertTrue(any("Get-FileHash" in script and "Move-Item" in script for script in scripts))
+
+    def test_wrong_server_identity_blocks_before_scp_or_remote_write(self) -> None:
+        config = ProductionPublishConfig.parse(config_value()).vm
+        calls = []
+
+        def runner(arguments):
+            calls.append(list(arguments))
+            if arguments[0] == "ssh":
+                script = self._script(arguments)
+                self.assertIn("ssh_target_address_differs", script)
+                self.assertLess(script.index("SSH_CONNECTION"), script.index("New-Item"))
+                return CommandResult(1, "")
+            self.fail("SCP must not run after server identity rejection")
+
+        backend = OpenSSHVMBackend(config, command_runner=runner)
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "payload.bin"
+            local.write_bytes(b"sealed-payload")
+            with self.assertRaisesRegex(PublishAdapterError, "SSH command failed"):
+                backend.upload(
+                    local,
+                    PureWindowsPath(
+                        r"D:\quant\quant_platform\incoming\release-1.partial\payload.bin"
+                    ),
+                )
+        self.assertEqual(["ssh"], [call[0] for call in calls])
+
+    def test_d_quant_parent_reparse_fails_before_transport_or_move(self) -> None:
+        config = ProductionPublishConfig.parse(config_value()).vm
+        calls: list[list[str]] = []
+
+        def runner(arguments):
+            call = list(arguments)
+            calls.append(call)
+            self.assertEqual("ssh", call[0])
+            script = self._script(call)
+            self.assertIn("root_parent_reparse", script)
+            self.assertIn("target_escaped_exact_root", script)
+            self.assertIn("Split-Path -Parent $rootCursor", script)
+            self.assertLess(
+                script.index("root_parent_reparse"), script.index("New-Item")
+            )
+            self.assertNotIn("Move-Item", script)
+            # Fake the remote Get-Item check reporting D:\quant as a junction.
+            return CommandResult(1, r"root_parent_reparse:D:\quant")
+
+        backend = OpenSSHVMBackend(config, command_runner=runner)
+        with tempfile.TemporaryDirectory() as temporary:
+            local = Path(temporary) / "payload.bin"
+            local.write_bytes(b"sealed-payload")
+            with self.assertRaisesRegex(PublishAdapterError, "SSH command failed"):
+                backend.upload(
+                    local,
+                    PureWindowsPath(
+                        r"D:\quant\quant_platform\incoming\release-1.partial\payload.bin"
+                    ),
+                )
+        self.assertEqual(["ssh"], [call[0] for call in calls])
+        self.assertFalse(any(call[0] == "scp" for call in calls))
 
 
 if __name__ == "__main__":

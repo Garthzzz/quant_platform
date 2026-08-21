@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from quant_hub.ops.failure_domain import (
     attest_failure_domain,
+    build_independence_probe,
     canonical_bytes,
     collect_host_facts,
 )
@@ -69,6 +70,12 @@ def main() -> int:
     attest.add_argument("--independence-probe", type=Path, required=True)
     attest.add_argument("--observed-at", required=True)
     attest.add_argument("--output", type=Path, required=True)
+    probe = subparsers.add_parser("independence-probe")
+    probe.add_argument("--recovery-root", type=Path, required=True)
+    probe.add_argument("--bundle-root", type=Path, required=True)
+    probe.add_argument("--materialization-event", type=Path, required=True)
+    probe.add_argument("--probe-tool", type=Path, required=True)
+    probe.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     if args.command == "facts":
@@ -77,7 +84,7 @@ def main() -> int:
         value = collect_host_facts(
             args.root, role=args.role, tool_version=args.tool_version
         )
-    else:
+    elif args.command == "attest":
         result = attest_failure_domain(
             production_facts=_read(args.production_facts),
             recovery_facts=_read(args.recovery_facts),
@@ -85,6 +92,13 @@ def main() -> int:
             observed_at=args.observed_at,
         )
         value = {**result.payload, "attestation_sha256": result.sha256}
+    else:
+        value = build_independence_probe(
+            recovery_root=args.recovery_root,
+            bundle_root=args.bundle_root,
+            materialization_event_path=args.materialization_event,
+            probe_tool_path=args.probe_tool,
+        )
     _write_new(args.output, value)
     print(json.dumps({"status": "PASS", "output": str(args.output.resolve())}))
     return 0

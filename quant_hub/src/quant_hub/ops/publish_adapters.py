@@ -111,6 +111,7 @@ class GitHubCIConfig:
 @dataclass(frozen=True)
 class VMConfig:
     ssh_alias: str
+    target_address: str
     root: PureWindowsPath
 
 
@@ -132,7 +133,7 @@ class ProductionPublishConfig:
             },
             "github config",
         )
-        vm = _closed(root["vm"], {"ssh_alias", "root"}, "vm config")
+        vm = _closed(root["vm"], {"ssh_alias", "target_address", "root"}, "vm config")
         workflow_id = github["workflow_id"]
         poll = github["poll_interval_seconds"]
         timeout = github["timeout_seconds"]
@@ -161,6 +162,8 @@ class ProductionPublishConfig:
             raise PublishAdapterError("VM root is outside the approved boundary") from error
         if approved_root != PRODUCTION_VM_ROOT:
             raise PublishAdapterError(r"VM root must be exactly D:\quant\quant_platform")
+        if vm["target_address"] != "10.5.1.240":
+            raise PublishAdapterError("production/recovery target must be 10.5.1.240")
         return cls(
             github=GitHubCIConfig(
                 owner=_name(github["owner"], "github owner"),
@@ -172,6 +175,7 @@ class ProductionPublishConfig:
             ),
             vm=VMConfig(
                 ssh_alias=_name(vm["ssh_alias"], "ssh_alias"),
+                target_address="10.5.1.240",
                 root=approved_root,
             ),
         )
@@ -476,6 +480,189 @@ def _ps_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def ssh_target_guard_script(target_address: str) -> str:
+    """Bind every remote action to the configured server-side SSH address."""
+
+    if target_address != "10.5.1.240":
+        raise PublishAdapterError("production SSH target must be 10.5.1.240")
+    return (
+        "$ssh=($env:SSH_CONNECTION -split ' ');"
+        f"if($ssh.Count-lt 3-or $ssh[2]-ne{_ps_literal(target_address)})"
+        "{throw 'ssh_target_address_differs'};"
+    )
+
+
+def exact_production_root_parent_guard_script() -> str:
+    """Return a write-free guard for exact D root and every existing parent."""
+
+    production_root = str(PRODUCTION_VM_ROOT)
+    return (
+        f"$approvedRoot={_ps_literal(production_root)};"
+        "$rootFull=[IO.Path]::GetFullPath($approvedRoot).TrimEnd('\\');"
+        "$expectedFull=$approvedRoot.TrimEnd('\\');"
+        "if(-not $rootFull.Equals($expectedFull,[StringComparison]::OrdinalIgnoreCase))"
+        "{throw 'root_full_path_differs'};"
+        "$rootCursor=$rootFull;"
+        "while($true){$rootComponent=Get-Item -LiteralPath $rootCursor -Force -ErrorAction Stop;"
+        "if(($rootComponent.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+        "{throw 'root_parent_reparse'};"
+        "if(-not $rootComponent.PSIsContainer){throw 'root_chain_not_directory'};"
+        "$rootParent=Split-Path -Parent $rootCursor;"
+        "if(-not $rootParent-or $rootParent-eq $rootCursor){break};"
+        "$rootCursor=$rootParent};"
+    )
+
+
+_OPERATIONAL_MODULE_BINDINGS = {
+    "deployment_cli_module": (
+        r"D:\quant\quant_platform\tooling\python\Lib\site-packages"
+        r"\quant_hub\ops\vm_deploy_cli.py"
+    ),
+    "publish_recovery_cli_module": (
+        r"D:\quant\quant_platform\tooling\python\Lib\site-packages"
+        r"\quant_hub\ops\publish_recovery_cli.py"
+    ),
+}
+
+
+def _powershell_package_inventory_verification_script() -> str:
+    """Rebuild Python's canonical package inventory using PowerShell bytes."""
+
+    return (
+        "$packageDirs=@(Get-ChildItem -LiteralPath $packageFull -Directory -Recurse -Force);"
+        "if(@($packageDirs|Where-Object{($_.Attributes-band"
+        "[IO.FileAttributes]::ReparsePoint)-ne 0}).Count-ne 0){throw 'package_reparse'};"
+        "$records=New-Object 'System.Collections.Generic.List[string]';"
+        "$packageFiles=@(Get-ChildItem -LiteralPath $packageFull -File -Recurse -Force);"
+        "foreach($file in $packageFiles){$relative=$file.FullName.Substring($packageFull.Length)."
+        "TrimStart('\\').Replace('\\','/');if((@($relative -split '/') -contains '__pycache__')"
+        "-or $relative.EndsWith('.pyc',[StringComparison]::OrdinalIgnoreCase)"
+        "-or $relative.EndsWith('.pyo',[StringComparison]::OrdinalIgnoreCase)){continue};"
+        "if(($file.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+        "{throw 'package_file_reparse'};$hash=(Get-FileHash -Algorithm SHA256 "
+        "-LiteralPath $file.FullName).Hash.ToLowerInvariant();"
+        # PowerShell single-quoted strings do not interpret backticks.  Use
+        # explicit characters so these bytes equal Python's tab/newline form.
+        "$records.Add($relative+[char]9+$file.Length+[char]9+$hash+[char]10)};"
+        "$records.Sort([StringComparer]::Ordinal);$inventoryText=[string]::Concat($records);"
+        "$inventoryBytes=(New-Object Text.UTF8Encoding($false)).GetBytes($inventoryText);"
+        "$inventoryHasher=[Security.Cryptography.SHA256]::Create();try{"
+        "$packageHash=([BitConverter]::ToString($inventoryHasher.ComputeHash($inventoryBytes)))."
+        "Replace('-','').ToLowerInvariant()}finally{$inventoryHasher.Dispose()};"
+        "if($packageHash-ne $candidate.quant_hub_package_inventory_sha256)"
+        "{throw 'package_inventory_hash_mismatch'};"
+    )
+
+
+def verified_d_tooling_python_script(module_binding: str) -> str:
+    """PowerShell prelude binding exact D Python and one fixed CLI module.
+
+    This prelude uses only Windows/PowerShell primitives.  It verifies the
+    closed install-candidate document and the complete non-reparse parent chain
+    before executing any project Python code.
+    """
+
+    try:
+        module_path = _OPERATIONAL_MODULE_BINDINGS[module_binding]
+    except KeyError as error:
+        raise PublishAdapterError("unreviewed operational module binding") from error
+    python_path = r"D:\quant\quant_platform\tooling\python\python.exe"
+    candidate_path = r"D:\quant\quant_platform\control\service_install_candidate.json"
+    expected_fields = (
+        "schema_version", "service_name", "python_class", "start_type",
+        "service_executable", "service_executable_sha256", "service_python",
+        "service_python_sha256", "service_host_module",
+        "service_host_module_sha256", "service_entry_module",
+        "service_entry_module_sha256", "deployment_cli_module",
+        "deployment_cli_module_sha256", "publish_recovery_cli_module",
+        "publish_recovery_cli_module_sha256", "access_gate_module",
+        "access_gate_module_sha256", "deployment_runtime",
+        "deployment_runtime_sha256", "quant_hub_package_root",
+        "quant_hub_package_inventory_sha256",
+    )
+    rendered_fields = ",".join(_ps_literal(field) for field in expected_fields)
+    module_hash_field = f"{module_binding}_sha256"
+    package_verification = _powershell_package_inventory_verification_script()
+    return (
+        exact_production_root_parent_guard_script()
+        + "function Assert-OperationalFile{param([string]$Path,[string]$Sha256);"
+        "$full=[IO.Path]::GetFullPath($Path);"
+        "if(-not $full.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+        "{throw 'operational_path_escaped_exact_root'};"
+        "$cursor=$full;$first=$true;$file=$null;while($true){"
+        "$item=Get-Item -LiteralPath $cursor -Force -ErrorAction Stop;"
+        "if(($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+        "{throw 'operational_reparse_chain'};"
+        "if($first){if($item.PSIsContainer){throw 'operational_not_regular_file'};"
+        "$file=$item;$first=$false}elseif(-not $item.PSIsContainer)"
+        "{throw 'operational_parent_not_directory'};"
+        "$parent=Split-Path -Parent $cursor;if(-not $parent-or $parent-eq $cursor){break};"
+        "$cursor=$parent};"
+        "if($Sha256-and((Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash."
+        "ToLowerInvariant()-ne $Sha256)){throw 'operational_hash_mismatch'};return $full};"
+        f"$candidatePath={_ps_literal(candidate_path)};"
+        "$candidateFull=Assert-OperationalFile $candidatePath '';"
+        "$candidate=Get-Content -LiteralPath $candidateFull -Raw -Encoding UTF8|ConvertFrom-Json;"
+        f"$expectedFields=@({rendered_fields})|Sort-Object;"
+        "$actualFields=@($candidate.PSObject.Properties.Name)|Sort-Object;"
+        "if(($expectedFields-join '|')-ne($actualFields-join '|'))"
+        "{throw 'operational_binding_schema_differs'};"
+        "if($candidate.schema_version-ne'qrh-windows-service-install-candidate/v1'"
+        "-or $candidate.service_name-ne'QuantResearchHub'"
+        "-or $candidate.python_class-ne"
+        "'quant_hub.ops.windows_service.QuantResearchHubWindowsService'"
+        "-or $candidate.start_type-ne'automatic'){throw 'operational_binding_identity_differs'};"
+        "$packageExpected=Join-Path $rootFull 'tooling\\python\\Lib\\site-packages\\quant_hub';"
+        "$packageFull=[IO.Path]::GetFullPath($packageExpected);"
+        "if(-not $packageFull.Equals($candidate.quant_hub_package_root,"
+        "[StringComparison]::OrdinalIgnoreCase)){throw 'package_binding_path_differs'};"
+        "$packageCursor=$packageFull;while($true){$packageItem=Get-Item -LiteralPath "
+        "$packageCursor -Force -ErrorAction Stop;if(-not $packageItem.PSIsContainer)"
+        "{throw 'package_parent_not_directory'};if(($packageItem.Attributes-band"
+        "[IO.FileAttributes]::ReparsePoint)-ne 0){throw 'package_reparse_chain'};"
+        "$packageParent=Split-Path -Parent $packageCursor;if(-not $packageParent-or"
+        "$packageParent-eq $packageCursor){break};$packageCursor=$packageParent};"
+        + package_verification
+        +
+        f"$pythonExpected={_ps_literal(python_path)};"
+        f"$moduleExpected={_ps_literal(module_path)};"
+        "$pythonFull=Assert-OperationalFile $pythonExpected $candidate.service_python_sha256;"
+        f"$moduleFull=Assert-OperationalFile $moduleExpected $candidate.{module_hash_field};"
+        "if(-not $pythonFull.Equals($candidate.service_python,[StringComparison]::OrdinalIgnoreCase)"
+        f"-or-not $moduleFull.Equals($candidate.{module_binding},[StringComparison]::OrdinalIgnoreCase))"
+        "{throw 'operational_binding_path_differs'};"
+        "$python=$pythonFull;"
+        "$env:PYTHONPATH=Join-Path $rootFull 'tooling\\python\\Lib\\site-packages';"
+    )
+
+
+def bootstrap_verified_d_tooling_python_script(
+    *, service_python_sha256: str, quant_hub_package_inventory_sha256: str
+) -> str:
+    """First-generation trust prelude before a service candidate exists."""
+
+    python_hash = _digest(service_python_sha256, "bootstrap service Python hash")
+    package_hash = _digest(
+        quant_hub_package_inventory_sha256, "bootstrap quant_hub inventory hash"
+    )
+    return (
+        exact_production_root_parent_guard_script()
+        + "$packageFull=Join-Path $rootFull 'tooling\\python\\Lib\\site-packages\\quant_hub';"
+        "$candidate=[pscustomobject]@{quant_hub_package_inventory_sha256="
+        + _ps_literal(package_hash)
+        + "};"
+        + _powershell_package_inventory_verification_script()
+        + "$pythonExpected=Join-Path $rootFull 'tooling\\python\\python.exe';"
+        "$pythonItem=Get-Item -LiteralPath $pythonExpected -Force -ErrorAction Stop;"
+        "if($pythonItem.PSIsContainer-or(($pythonItem.Attributes-band"
+        "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'bootstrap_python_not_regular'};"
+        "if((Get-FileHash -Algorithm SHA256 -LiteralPath $pythonExpected).Hash."
+        "ToLowerInvariant()-ne"
+        + _ps_literal(python_hash)
+        + "){throw 'bootstrap_python_hash_mismatch'};$python=$pythonExpected;"
+    )
+
+
 class OpenSSHVMBackend:
     """使用 Windows OpenSSH/PowerShell 的实际 backend；命令均为 argv，不经 shell。"""
 
@@ -484,9 +671,11 @@ class OpenSSHVMBackend:
         self.command_runner = command_runner
 
     def _ssh(self, script: str) -> str:
+        script = ssh_target_guard_script(self.config.target_address) + script
         result = self.command_runner(
             [
-                "ssh", self.config.ssh_alias, "powershell.exe", "-NoProfile",
+                "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                "--", self.config.ssh_alias, "powershell.exe", "-NoProfile",
                 "-NonInteractive", "-EncodedCommand", _powershell_encoded(script),
             ]
         )
@@ -497,16 +686,15 @@ class OpenSSHVMBackend:
     @staticmethod
     def _ensure_directory_script(path: PureWindowsPath) -> str:
         approved = validate_production_vm_write_path(path, allow_root=False)
-        production_root = str(PRODUCTION_VM_ROOT)
         return (
             "$ErrorActionPreference='Stop';"
-            f"$approvedRoot={_ps_literal(production_root)};"
-            f"$target={_ps_literal(str(approved))};"
-            "if(-not(Test-Path -LiteralPath $approvedRoot -PathType Container)){throw 'root_missing'};"
-            "$rootItem=Get-Item -LiteralPath $approvedRoot -Force;"
-            "if(($rootItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0){throw 'root_reparse'};"
-            "$root=$rootItem.FullName.TrimEnd('\\');$current=$root;"
-            "$relative=$target.Substring($approvedRoot.Length).TrimStart('\\');"
+            + exact_production_root_parent_guard_script()
+            + f"$target={_ps_literal(str(approved))};"
+            "$targetFull=[IO.Path]::GetFullPath($target);"
+            "if(-not $targetFull.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'target_escaped_exact_root'};"
+            "$root=$rootFull;$current=$root;"
+            "$relative=$targetFull.Substring($rootFull.Length).TrimStart('\\');"
             "foreach($part in $relative.Split('\\',[StringSplitOptions]::RemoveEmptyEntries)){"
             "$current=Join-Path $current $part;"
             "if(Test-Path -LiteralPath $current){$item=Get-Item -LiteralPath $current -Force;"
@@ -573,13 +761,24 @@ class OpenSSHVMBackend:
             f"{self.config.ssh_alias}:"
             f"{str(temporary).replace(os.sep, '/').replace(chr(92), '/')}"
         )
-        result = self.command_runner(["scp", "-q", str(local_path), destination])
+        result = self.command_runner(
+            [
+                "scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+                "-o", f"HostName={self.config.target_address}",
+                "--", str(local_path), destination,
+            ]
+        )
         if result.returncode != 0:
             raise PublishAdapterError("VM SCP upload failed")
         # 只有远端临时文件的 hash/size/reparse 全部通过后才替换 partial 内目标。
         script = (
             "$ErrorActionPreference='Stop';"
-            f"$tmp={_ps_literal(str(temporary))};$dst={_ps_literal(str(approved))};"
+            + exact_production_root_parent_guard_script()
+            + f"$tmp={_ps_literal(str(temporary))};$dst={_ps_literal(str(approved))};"
+            "$tmpFull=[IO.Path]::GetFullPath($tmp);$dstFull=[IO.Path]::GetFullPath($dst);"
+            "if(-not $tmpFull.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase)"
+            "-or-not $dstFull.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'upload_path_escaped_exact_root'};"
             "$item=Get-Item -LiteralPath $tmp -Force;"
             "if($item.PSIsContainer-or(($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'upload_type'};"
             f"if($item.Length-ne {expected_bytes}){{throw 'upload_size'}};"
@@ -606,21 +805,55 @@ class DeploymentInvoker(Protocol):
         release_manifest_sha256: str,
         publish_candidate_sha256: str,
         deployment_mode: str,
+        deployment_attempt_id: str | None,
+        recovery_protection_receipt_id: str | None,
     ) -> Mapping[str, object]: ...
+
+
+@dataclass(frozen=True)
+class ActivationAuthorization:
+    deployment_attempt_id: str
+    recovery_protection_receipt_id: str
+
+
+ActivationAuthorizationResolver = Callable[
+    [str, str], ActivationAuthorization
+]
 
 
 class VMDeploymentAdapter:
     """调用固定 VM deployment-controller CLI，并复核返回身份。"""
 
-    def __init__(self, config: VMConfig, *, invoker: DeploymentInvoker):
+    def __init__(
+        self,
+        config: VMConfig,
+        *,
+        invoker: DeploymentInvoker,
+        activation_authorization_resolver: ActivationAuthorizationResolver | None = None,
+    ):
         self.config = config
         self.invoker = invoker
+        self.activation_authorization_resolver = activation_authorization_resolver
 
     def __call__(self, candidate: Mapping[str, object]) -> VMDeployResult:
         release_id, release_hash, candidate_hash = IncrementalVMTransport._candidate(candidate)
         deployment_mode = candidate.get("deployment_mode")
         if deployment_mode not in {"activate", "candidate_only"}:
             raise PublishAdapterError("publish candidate deployment_mode is invalid")
+        authorization: ActivationAuthorization | None = None
+        if deployment_mode == "activate":
+            if self.activation_authorization_resolver is None:
+                raise PublishAdapterError("activation recovery protection is unavailable")
+            authorization = self.activation_authorization_resolver(
+                release_id, candidate_hash
+            )
+            if not isinstance(authorization, ActivationAuthorization):
+                raise PublishAdapterError("activation authorization schema is invalid")
+            _name(authorization.deployment_attempt_id, "deployment_attempt_id")
+            _name(
+                authorization.recovery_protection_receipt_id,
+                "recovery_protection_receipt_id",
+            )
         root = validate_production_vm_write_path(self.config.root, allow_root=True)
         result = self.invoker.invoke(
             vm_root=root,
@@ -628,12 +861,18 @@ class VMDeploymentAdapter:
             release_manifest_sha256=release_hash,
             publish_candidate_sha256=candidate_hash,
             deployment_mode=str(deployment_mode),
+            deployment_attempt_id=(
+                authorization.deployment_attempt_id if authorization else None
+            ),
+            recovery_protection_receipt_id=(
+                authorization.recovery_protection_receipt_id if authorization else None
+            ),
         )
         value = _closed(
             result,
             {
                 "schema_version", "release_id", "release_manifest_sha256",
-                "publish_candidate_sha256", "status", "receipt_id", "receipt_type",
+                "publish_candidate_sha256", "status", "evidence_id", "evidence_type",
             },
             "VM deploy result",
         )
@@ -646,17 +885,17 @@ class VMDeploymentAdapter:
         ):
             raise PublishAdapterError("VM deployment controller returned another identity")
         expected = (
-            ("activated", "activation")
+            ("activated", "activation_receipt")
             if deployment_mode == "activate"
-            else ("candidate_validated", "candidate_validation")
+            else ("candidate_validated", "candidate_validation_event")
         )
-        if (value["status"], value["receipt_type"]) != expected:
+        if (value["status"], value["evidence_type"]) != expected:
             raise PublishAdapterError("VM deployment controller did not satisfy requested mode")
         return VMDeployResult(
             candidate_manifest_sha256=candidate_hash,
             status=str(value["status"]),
-            receipt_id=_name(value["receipt_id"], "VM deploy receipt_id"),
-            receipt_type=str(value["receipt_type"]),
+            evidence_id=_name(value["evidence_id"], "VM deploy evidence_id"),
+            evidence_type=str(value["evidence_type"]),
         )
 
 
@@ -675,6 +914,8 @@ class OpenSSHDeploymentInvoker:
         release_manifest_sha256: str,
         publish_candidate_sha256: str,
         deployment_mode: str,
+        deployment_attempt_id: str | None,
+        recovery_protection_receipt_id: str | None,
     ) -> Mapping[str, object]:
         root = validate_production_vm_write_path(vm_root, allow_root=True)
         if deployment_mode not in {"activate", "candidate_only"}:
@@ -688,19 +929,36 @@ class OpenSSHDeploymentInvoker:
             "--release-manifest-sha256", _digest(release_manifest_sha256, "release hash"),
             "--publish-candidate-sha256", _digest(publish_candidate_sha256, "candidate hash"),
             "--deployment-mode", deployment_mode,
-            "--json",
         ]
+        if deployment_mode == "activate":
+            cli_arguments.extend(
+                [
+                    "--deployment-attempt-id",
+                    _name(deployment_attempt_id, "deployment_attempt_id"),
+                    "--recovery-protection-receipt-id",
+                    _name(
+                        recovery_protection_receipt_id,
+                        "recovery_protection_receipt_id",
+                    ),
+                ]
+            )
+        elif deployment_attempt_id is not None or recovery_protection_receipt_id is not None:
+            raise PublishAdapterError("candidate_only cannot carry activation authorization")
+        cli_arguments.append("--json")
         rendered_arguments = ",".join(_ps_literal(item) for item in cli_arguments)
         script = (
-            OpenSSHVMBackend._ensure_directory_script(temporary)
+            ssh_target_guard_script(self.config.target_address)
+            + OpenSSHVMBackend._ensure_directory_script(temporary)
+            + verified_d_tooling_python_script("deployment_cli_module")
             + f"$tmp={_ps_literal(str(temporary))};"
             "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
-            f"$cli=@({rendered_arguments});$output=& python @cli;"
+            f"$cli=@({rendered_arguments});$output=& $python @cli;"
             "if($LASTEXITCODE-ne 0){throw 'deploy_cli_failed'};"
             "$output|Write-Output"
         )
         arguments = [
-            "ssh", self.config.ssh_alias, "powershell.exe", "-NoProfile",
+            "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+            "--", self.config.ssh_alias, "powershell.exe", "-NoProfile",
             "-NonInteractive", "-EncodedCommand", _powershell_encoded(script),
         ]
         result = self.command_runner(arguments)
@@ -716,6 +974,7 @@ class OpenSSHDeploymentInvoker:
 
 
 __all__ = [
+    "ActivationAuthorization",
     "CONFIG_SCHEMA",
     "CommandResult",
     "GitHubExactSHACI",
@@ -729,5 +988,9 @@ __all__ = [
     "ReleaseMaterial",
     "SecretValue",
     "VMDeploymentAdapter",
+    "bootstrap_verified_d_tooling_python_script",
+    "exact_production_root_parent_guard_script",
+    "ssh_target_guard_script",
+    "verified_d_tooling_python_script",
     "subprocess_runner",
 ]

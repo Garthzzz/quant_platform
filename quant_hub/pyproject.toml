@@ -15,6 +15,7 @@ dependencies = [
   "markdown-it-py>=4.0,<5",
   "pymupdf>=1.27,<2",
   "pydantic>=2.12,<3",
+  "pywin32>=311; sys_platform == 'win32'",
   "typer>=0.20,<1",
 ]
 
@@ -28,6 +29,16 @@ paper-lab-components = "quant_hub.paper_lab.compat:component_main"
 paper-lab-import = "quant_hub.paper_lab.compat:legacy_import_main"
 paper-lab-viewer = "quant_hub.paper_lab.compat:viewer_main"
 qrh-publish = "quant_hub.ops.publish:main"
+qrh-cold-bundle = "quant_hub.ops.cold_bundle_cli:main"
+qrh-cold-restore = "quant_hub.ops.cold_restore_cli:main"
+qrh-operational-source = "quant_hub.ops.operational_source_cli:main"
+qrh-production-host-facts = "quant_hub.ops.production_host_facts_cli:main"
+qrh-state-only-backup = "quant_hub.ops.state_only_backup:main"
+qrh-writer-handoff = "quant_hub.ops.writer_handoff:main"
+qrh-writer-handoff-client = "quant_hub.ops.writer_handoff_client:main"
+qrh-knowledge-mcp = "quant_hub.knowledge_mcp.cli:main"
+qrh-knowledge-compile = "quant_hub.knowledge.semantic_cli:main"
+qrh-semantic-authority = "quant_hub.ops.semantic_authority:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -40,6 +51,7 @@ where = ["src"]
 "quant_hub.generic_research" = [
   "templates/generic_research/*.html",
   "static/*.css",
+  "static/*.js",
 ]
 "quant_hub.evidence" = [
   "templates/evidence/*.html",

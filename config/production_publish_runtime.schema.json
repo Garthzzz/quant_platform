@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schema/production-publish-runtime-v1.json",
+  "title": "Quant Research Hub protected local publish runtime configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "project_root", "state_root", "candidate_root",
+    "git_remote", "runtime_base", "runtime_base_manifest_sha256",
+    "reference_archive_root", "code_source_relative_path", "code_overlay_relative_path",
+    "launcher_relative_path", "required_runtime_paths", "resource_overlays",
+    "github", "vm", "recovery"
+  ],
+  "properties": {
+    "schema_version": {"const": "qrh-production-publish-runtime/v1"},
+    "project_root": {"type": "string"},
+    "state_root": {"type": "string"},
+    "candidate_root": {"type": "string"},
+    "git_remote": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+    "runtime_base": {"type": "string"},
+    "runtime_base_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "reference_archive_root": {"type": "string"},
+    "code_source_relative_path": {"type": "string"},
+    "code_overlay_relative_path": {"type": "string"},
+    "launcher_relative_path": {"type": "string"},
+    "required_runtime_paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["launcher", "templates", "static", "archive_database", "platform_database", "research_papers_database", "paper_lab_database", "papers", "objects", "paper_lab", "state_seed"],
+      "properties": {
+        "launcher": {"type": "string"},
+        "templates": {"type": "string"},
+        "static": {"type": "string"},
+        "archive_database": {"type": "string"},
+        "platform_database": {"type": "string"},
+        "research_papers_database": {"type": "string"},
+        "paper_lab_database": {"type": "string"},
+        "papers": {"type": "string"},
+        "objects": {"type": "string"},
+        "paper_lab": {"type": "string"},
+        "state_seed": {"type": "string"}
+      }
+    },
+    "resource_overlays": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["logical_name", "source_path", "target_relative_path"],
+        "properties": {
+          "logical_name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$"},
+          "source_path": {"type": "string"},
+          "target_relative_path": {"type": "string"}
+        }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "repository", "workflow_id", "credential_target", "poll_interval_seconds", "timeout_seconds"],
+      "properties": {
+        "owner": {"type": "string"},
+        "repository": {"type": "string"},
+        "workflow_id": {"type": "integer", "minimum": 1},
+        "credential_target": {"type": ["string", "null"]},
+        "poll_interval_seconds": {"type": "number", "minimum": 1, "maximum": 60},
+        "timeout_seconds": {"type": "number", "minimum": 10, "maximum": 3600}
+      }
+    },
+    "vm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ssh_alias", "target_address", "root"],
+      "properties": {
+        "ssh_alias": {"type": "string"},
+        "target_address": {"const": "10.5.1.240"},
+        "root": {"const": "D:\\quant\\quant_platform"}
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "failure_domain_attestation", "attestation_max_age_seconds", "state_authority_id", "restore_tool", "runbook", "operational_root"],
+      "properties": {
+        "root": {"type": "string"},
+        "failure_domain_attestation": {"type": "string"},
+        "attestation_max_age_seconds": {"type": "integer", "minimum": 60, "maximum": 2678400},
+        "state_authority_id": {"type": "string"},
+        "restore_tool": {"type": "string"},
+        "runbook": {"type": "string"},
+        "operational_root": {"type": "string"}
+      }
+    }
+  }
+}

@@ -1,0 +1,672 @@
+"""Current-sensitive read-only tools shared by stdio and deterministic tests."""
+
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+import hashlib
+import json
+import re
+from typing import Any, Mapping
+
+from quant_hub.knowledge.contracts import canonical_json
+from quant_hub.knowledge.retrieval import ArtifactKnowledgeIndex, TaskContext
+
+from .mirror import (
+    AuthorityIdentity,
+    AuthorityProbe,
+    AuthorityUnavailable,
+    MirrorError,
+    MirrorSnapshot,
+    MirrorStore,
+)
+
+
+SERVICE_SCHEMA = "qrh-knowledge-mcp-response/v1"
+CONTINUATION_SCHEMA = "qrh-mcp-continuation/v1"
+def _identity(value: AuthorityIdentity | None) -> dict[str, str] | None:
+    return value.to_dict() if value is not None else None
+
+
+def _context_values(
+    context: Mapping[str, object] | None, facet: str
+) -> set[str]:
+    if not context or facet not in context:
+        return set()
+    value = context[facet]
+    values = (value,) if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set)):
+        raise ValueError(f"task_context.{facet} must be a string or list")
+    return {
+        re.sub(r"\s+", " ", str(item).casefold()).strip()
+        for item in values
+        if str(item).strip()
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class Resolution:
+    availability: str
+    mirror: MirrorSnapshot | None
+    local_identity: AuthorityIdentity | None
+    observed_identity: AuthorityIdentity | None
+    verified_at: str | None
+    last_verified_at: str | None
+    reason: str | None
+    changed_from: AuthorityIdentity | None = None
+
+
+class KnowledgeMCPService:
+    """Three non-overlapping read tools with one freshness decision boundary."""
+
+    def __init__(
+        self,
+        *,
+        store: MirrorStore,
+        authority: AuthorityProbe,
+        artifact_release_root,
+    ) -> None:
+        self.store = store
+        self.authority = authority
+        self.artifact_release_root = artifact_release_root
+        self._session_identity: AuthorityIdentity | None = None
+        self._pending_transition: tuple[AuthorityIdentity, AuthorityIdentity] | None = None
+        self._last_verified_at: str | None = None
+        self._search_index_identity: AuthorityIdentity | None = None
+        self._search_index: ArtifactKnowledgeIndex | None = None
+
+    def _index_for(self, mirror: MirrorSnapshot) -> ArtifactKnowledgeIndex:
+        if self._search_index_identity != mirror.identity:
+            if self._search_index is not None:
+                self._search_index.close()
+            self._search_index = ArtifactKnowledgeIndex(mirror.artifact)
+            self._search_index_identity = mirror.identity
+        return self._search_index
+
+    def close(self) -> None:
+        if self._search_index is not None:
+            self._search_index.close()
+            self._search_index = None
+            self._search_index_identity = None
+
+    def __del__(self) -> None:
+        self.close()
+
+    def startup_probe(self) -> dict[str, Any]:
+        """Probe/sync once at server initialization without claiming availability."""
+
+        return self._base(self._resolve(allow_stale=False))
+
+    def _resolve(self, *, allow_stale: bool) -> Resolution:
+        try:
+            local = self.store.current()
+        except (MirrorError, KeyError, TypeError, ValueError, OSError):
+            local = None
+        local_identity = local.identity if local else None
+        try:
+            observation = self.authority.probe()
+        except AuthorityUnavailable:
+            return Resolution(
+                availability="stale" if allow_stale and local else "unavailable",
+                mirror=local if allow_stale else None,
+                local_identity=local_identity,
+                observed_identity=None,
+                verified_at=None,
+                last_verified_at=self._last_verified_at or (local.synced_at if local else None),
+                reason="authority_unreachable_or_unverifiable",
+            )
+        observed = observation.identity
+        if local_identity != observed:
+            try:
+                local = self.store.sync_from(observed, self.artifact_release_root)
+                local_identity = local.identity
+            except (MirrorError, KeyError, TypeError, ValueError, OSError):
+                return Resolution(
+                    availability="stale" if allow_stale and local else "unavailable",
+                    mirror=local if allow_stale else None,
+                    local_identity=local_identity,
+                    observed_identity=observed,
+                    verified_at=observation.verified_at,
+                    last_verified_at=observation.verified_at,
+                    reason="mirror_missing_lagging_or_sync_failed",
+                )
+        self._last_verified_at = observation.verified_at
+        changed_from = None
+        if self._session_identity is None:
+            self._session_identity = observed
+        elif self._session_identity != observed:
+            changed_from = self._session_identity
+            self._pending_transition = (self._session_identity, observed)
+            self._session_identity = observed
+        return Resolution(
+            availability="fresh",
+            mirror=local,
+            local_identity=local_identity,
+            observed_identity=observed,
+            verified_at=observation.verified_at,
+            last_verified_at=observation.verified_at,
+            reason=None,
+            changed_from=changed_from,
+        )
+
+    def _base(self, resolution: Resolution) -> dict[str, Any]:
+        identity = resolution.mirror.identity if resolution.mirror else None
+        return {
+            "schema_version": SERVICE_SCHEMA,
+            "availability": resolution.availability,
+            "identity": _identity(identity),
+            "local_identity": _identity(resolution.local_identity),
+            "observed_identity": _identity(resolution.observed_identity),
+            "authority_verified_at": resolution.verified_at,
+            "last_authority_verified_at": resolution.last_verified_at,
+            "mirror_synced_at": resolution.mirror.synced_at if resolution.mirror else None,
+            "reason": resolution.reason,
+            "source_is_untrusted_data": True,
+        }
+
+    def _blocked(self, resolution: Resolution) -> dict[str, Any] | None:
+        if resolution.mirror is None:
+            return {**self._base(resolution), "results": [], "truncated": False}
+        if resolution.availability != "fresh":
+            return None
+        if self._pending_transition is None:
+            return None
+        old, new = self._pending_transition
+        return {
+            **self._base(resolution),
+            "status": "snapshot_refresh_required",
+            "results": [],
+            "truncated": False,
+            "requires": ["list_knowledge_updates", "search_quant_knowledge", "get_quant_knowledge"],
+            "changed_from": old.to_dict(),
+            "changed_to": new.to_dict(),
+        }
+
+    @staticmethod
+    def _decode_cursor(cursor: str | None) -> Mapping[str, Any] | None:
+        if cursor is None:
+            return None
+        try:
+            padded = cursor + ("=" * (-len(cursor) % 4))
+            value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("continuation is malformed") from error
+        if not isinstance(value, dict) or value.get("schema_version") != CONTINUATION_SCHEMA:
+            raise ValueError("continuation schema is invalid")
+        return value
+
+    @staticmethod
+    def _cursor(*, identity: AuthorityIdentity, tool: str, offset: int, request_hash: str) -> str:
+        value = {
+            "schema_version": CONTINUATION_SCHEMA,
+            "identity": identity.to_dict(),
+            "tool": tool,
+            "offset": offset,
+            "request_hash": request_hash,
+        }
+        return base64.urlsafe_b64encode(canonical_json(value).encode()).decode().rstrip("=")
+
+    def _cursor_offset(
+        self,
+        cursor: str | None,
+        *,
+        identity: AuthorityIdentity,
+        tool: str,
+        request_hash: str,
+    ) -> int:
+        value = self._decode_cursor(cursor)
+        if value is None:
+            return 0
+        if (
+            value.get("identity") != identity.to_dict()
+            or value.get("tool") != tool
+            or value.get("request_hash") != request_hash
+        ):
+            raise ValueError("continuation_invalidated_by_snapshot_or_request")
+        offset = value.get("offset")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("continuation offset is invalid")
+        return offset
+
+    def search_quant_knowledge(
+        self,
+        *,
+        query: str,
+        task_context: Mapping[str, object] | None = None,
+        limit: int = 8,
+        budget_chars: int = 8_000,
+        detail: str = "compact",
+        cursor: str | None = None,
+        allow_stale: bool = False,
+        include_history: bool = False,
+        include_conflicts: bool = False,
+    ) -> dict[str, Any]:
+        if type(query) is not str or not query.strip():
+            raise ValueError("query is required")
+        if (
+            type(limit) is not int
+            or type(budget_chars) is not int
+            or not 1 <= limit <= 20
+            or not 500 <= budget_chars <= 50_000
+        ):
+            raise ValueError("limit or budget_chars is outside the supported range")
+        if detail not in {"compact", "evidence"}:
+            raise ValueError("detail must be compact or evidence")
+        if cursor is not None and not isinstance(cursor, str):
+            raise ValueError("cursor must be a string or null")
+        if task_context is not None and not isinstance(task_context, Mapping):
+            raise ValueError("task_context must be an object")
+        if any(
+            type(value) is not bool
+            for value in (allow_stale, include_history, include_conflicts)
+        ):
+            raise ValueError("boolean search flags must be booleans")
+        resolution = self._resolve(allow_stale=allow_stale)
+        blocked = self._blocked(resolution)
+        if blocked is not None:
+            return blocked
+        assert resolution.mirror is not None
+        artifact = resolution.mirror.artifact
+        identity = resolution.mirror.identity
+        context = TaskContext(
+            **{
+                facet: tuple(sorted(_context_values(task_context, facet)))
+                for facet in (
+                    "market",
+                    "frequency",
+                    "data",
+                    "objective",
+                    "assumption",
+                )
+            }
+        )
+        shared = self._index_for(resolution.mirror).search(
+            query,
+            context=context,
+            limit=max(1, len(artifact["retrieval"]["records"])),
+            include_history=include_history,
+            include_conflicts=include_conflicts,
+        )
+        knowledge_by_id = {
+            str(row["knowledge_item_id"]): row for row in artifact["knowledge"]
+        }
+        snippet_limit = 1_600 if detail == "evidence" else 420
+        ordered: list[dict[str, Any]] = []
+        for card in shared.cards:
+            knowledge = knowledge_by_id.get(card.evidence_id)
+            ordered.append(
+                {
+                    "object_id": card.evidence_id,
+                    "object_kind": (
+                        "evidence_chunk"
+                        if card.source_kind == "chunk"
+                        else card.knowledge_kind or "accepted_knowledge"
+                    ),
+                    "canonical_key": card.canonical_key,
+                    "document_id": card.document_id,
+                    "document_version_id": card.document_version_id,
+                    "research_id": card.research_id,
+                    "title": card.title,
+                    "heading_path": list(card.heading_path),
+                    "snippet": card.text[:snippet_limit],
+                    "source_locator": {
+                        "document_id": card.document_id,
+                        "document_version_id": card.document_version_id,
+                        "span_id": card.locator.span_id,
+                        "span_ids": list(card.covered_span_ids),
+                        "source_sha256": card.locator.source_sha256,
+                        "line_start": card.locator.line_start,
+                        "line_end": card.locator.line_end,
+                        "byte_start": card.locator.byte_start,
+                        "byte_end": card.locator.byte_end,
+                    },
+                    "citation_ids": list(card.citation_ids),
+                    "fact_status": card.fact_status,
+                    "knowledge_enrichment": card.knowledge_enrichment,
+                    "applicability": card.applicability or "not_assessed",
+                    "applicability_matches": list(card.applicability_matches),
+                    "limitations": list(card.limitations),
+                    "failures": list(card.failures),
+                    "conflicts": list(card.applicability_conflicts),
+                    "generation": knowledge.get("generation") if knowledge else None,
+                    "match_reasons": list(card.hit_reasons),
+                    "score": card.score,
+                    "rank": card.rank,
+                    "historical": card.active_status != "active",
+                    "active_status": card.active_status,
+                }
+            )
+        request_hash = hashlib.sha256(
+            canonical_json(
+                {
+                    "query": query,
+                    "task_context": task_context or {},
+                    "detail": detail,
+                    "include_history": include_history,
+                    "include_conflicts": include_conflicts,
+                }
+            ).encode()
+        ).hexdigest()
+        try:
+            offset = self._cursor_offset(
+                cursor,
+                identity=identity,
+                tool="search_quant_knowledge",
+                request_hash=request_hash,
+            )
+        except ValueError as error:
+            return {
+                **self._base(resolution),
+                "status": "continuation_invalid",
+                "reason": str(error),
+                "results": [],
+                "truncated": False,
+                "requires": ["list_knowledge_updates", "search_quant_knowledge"],
+            }
+        selected: list[dict[str, Any]] = []
+        used = 0
+        index = offset
+        while index < len(ordered) and len(selected) < limit:
+            row_size = len(canonical_json(ordered[index]))
+            if selected and used + row_size > budget_chars:
+                break
+            selected.append(ordered[index])
+            used += row_size
+            index += 1
+        truncated = index < len(ordered)
+        return {
+            **self._base(resolution),
+            "status": "ok" if selected else "no_answer",
+            "query": query,
+            "task_context": task_context or {},
+            "index_version": shared.index_version,
+            "total_candidates": shared.total_candidates,
+            "no_answer_reason": shared.no_answer_reason if not selected else None,
+            "results": selected,
+            "truncated": truncated,
+            "continuation": self._cursor(
+                identity=identity,
+                tool="search_quant_knowledge",
+                offset=index,
+                request_hash=request_hash,
+            )
+            if truncated
+            else None,
+            "deduplication": "shared_canonical_evidence_span_contract",
+        }
+
+    def get_quant_knowledge(
+        self,
+        *,
+        object_id: str,
+        include_history: bool = False,
+        include_relations: bool = False,
+        budget_chars: int = 12_000,
+        allow_stale: bool = False,
+    ) -> dict[str, Any]:
+        if (
+            type(object_id) is not str
+            or not object_id
+            or type(budget_chars) is not int
+            or not 500 <= budget_chars <= 50_000
+        ):
+            raise ValueError("object_id or budget_chars is invalid")
+        if any(
+            type(value) is not bool
+            for value in (include_history, include_relations, allow_stale)
+        ):
+            raise ValueError("boolean get flags must be booleans")
+        resolution = self._resolve(allow_stale=allow_stale)
+        blocked = self._blocked(resolution)
+        if blocked is not None:
+            return blocked
+        assert resolution.mirror is not None
+        artifact = resolution.mirror.artifact
+        matches: list[dict[str, Any]] = []
+        for collection, id_key, kind in (
+            (artifact["documents"], "document_id", "document"),
+            (artifact["versions"], "version_id", "document_version"),
+            (artifact["chunks"], "chunk_id", "evidence_chunk"),
+            (artifact["knowledge"], "knowledge_item_id", "accepted_knowledge"),
+        ):
+            for row in collection:
+                if row.get(id_key) == object_id:
+                    matches.append({"object_kind": kind, **row})
+        if not matches:
+            return {**self._base(resolution), "status": "not_found", "results": []}
+        if not include_history:
+            matches = [
+                row
+                for row in matches
+                if row["object_kind"] not in {"document_version", "evidence_chunk"}
+                or row.get("is_current", True)
+                or any(
+                    version.get("version_id") == row.get("document_version_id")
+                    and version.get("is_current")
+                    for version in artifact["versions"]
+                )
+            ]
+        if not matches:
+            return {
+                **self._base(resolution),
+                "status": "historical_requires_include_history",
+                "results": [],
+            }
+        payload = canonical_json(matches)
+        truncated = len(payload) > budget_chars
+        if truncated:
+            matches = [{**matches[0], "text": str(matches[0].get("text") or "")[:budget_chars]}]
+        relation_rows: list[dict[str, object]] = []
+        if include_relations:
+            relation_rows = [
+                {
+                    "knowledge_item_id": row.get("knowledge_item_id"),
+                    "relation": row.get("relation"),
+                    "source_locator": row.get("source_locator"),
+                }
+                for row in artifact["knowledge"]
+                if row.get("relation")
+                and (
+                    row.get("knowledge_item_id") == object_id
+                    or (
+                        isinstance(row.get("relation"), Mapping)
+                        and row["relation"].get("target_id") == object_id
+                    )
+                )
+            ]
+        return {
+            **self._base(resolution),
+            "status": "ok",
+            "results": matches,
+            "include_relations": include_relations,
+            "relations": relation_rows if include_relations else None,
+            "truncated": truncated,
+            "source_is_untrusted_data": True,
+        }
+
+    def list_knowledge_updates(
+        self,
+        *,
+        from_snapshot_id: str,
+        allow_stale: bool = False,
+        limit: int = 50,
+        budget_chars: int = 12_000,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        if type(from_snapshot_id) is not str or not from_snapshot_id:
+            raise ValueError("from_snapshot_id is required")
+        if (
+            type(limit) is not int
+            or type(budget_chars) is not int
+            or not 1 <= limit <= 200
+            or not 500 <= budget_chars <= 50_000
+        ):
+            raise ValueError("limit or budget_chars is outside the supported range")
+        if type(allow_stale) is not bool or (
+            cursor is not None and not isinstance(cursor, str)
+        ):
+            raise ValueError("update flags or cursor are invalid")
+        resolution = self._resolve(allow_stale=allow_stale)
+        if resolution.mirror is None:
+            return {**self._base(resolution), "status": "unavailable", "updates": []}
+        current = resolution.mirror
+        previous = self.store.find_snapshot(from_snapshot_id)
+        if previous is None:
+            if self._pending_transition is not None:
+                old_identity, new_identity = self._pending_transition
+                if (
+                    old_identity.snapshot_id == from_snapshot_id
+                    and new_identity == current.identity
+                ):
+                    # The caller acknowledged the transition; no retained
+                    # baseline exists to enumerate, so search/get may restart.
+                    self._pending_transition = None
+            return {
+                **self._base(resolution),
+                "status": "baseline_unavailable",
+                "updates": [],
+                "requires": ["search_quant_knowledge", "get_quant_knowledge"],
+            }
+        old_documents = {row["document_id"]: row for row in previous.artifact["documents"]}
+        new_documents = {row["document_id"]: row for row in current.artifact["documents"]}
+        updates: list[dict[str, Any]] = []
+        for document_id in sorted(set(old_documents) | set(new_documents)):
+            old = old_documents.get(document_id)
+            new = new_documents.get(document_id)
+            if old is None:
+                updates.append({"change": "added", "document_id": document_id, "to": new})
+            elif new is None:
+                updates.append({"change": "removed", "document_id": document_id, "from": old})
+            elif (
+                old.get("active_version_id") != new.get("active_version_id")
+                or old.get("status") != new.get("status")
+                or old.get("replacement_document_id") != new.get("replacement_document_id")
+            ):
+                updates.append(
+                    {
+                        "change": "replaced_or_status_changed",
+                        "document_id": document_id,
+                        "from_version_id": old.get("active_version_id"),
+                        "to_version_id": new.get("active_version_id"),
+                        "from_status": old.get("status"),
+                        "to_status": new.get("status"),
+                        "replacement_document_id": new.get("replacement_document_id"),
+                    }
+                )
+        old_versions = {
+            row["version_id"]: row for row in previous.artifact["versions"]
+        }
+        new_versions = {row["version_id"]: row for row in current.artifact["versions"]}
+        for document_id in sorted(set(old_documents).intersection(new_documents)):
+            old_version_id = old_documents[document_id].get("active_version_id")
+            new_version_id = new_documents[document_id].get("active_version_id")
+            if old_version_id != new_version_id:
+                continue
+            old_version = old_versions.get(old_version_id)
+            new_version = new_versions.get(new_version_id)
+            if (
+                old_version is not None
+                and new_version is not None
+                and old_version.get("knowledge_enrichment")
+                != new_version.get("knowledge_enrichment")
+            ):
+                updates.append(
+                    {
+                        "change": "knowledge_enrichment_changed",
+                        "document_id": document_id,
+                        "document_version_id": new_version_id,
+                        "from_status": old_version.get("knowledge_enrichment"),
+                        "to_status": new_version.get("knowledge_enrichment"),
+                    }
+                )
+        old_knowledge = {
+            row["knowledge_item_id"]: row
+            for row in previous.artifact["knowledge"]
+        }
+        new_knowledge = {
+            row["knowledge_item_id"]: row for row in current.artifact["knowledge"]
+        }
+        for knowledge_id in sorted(set(old_knowledge) | set(new_knowledge)):
+            old = old_knowledge.get(knowledge_id)
+            new = new_knowledge.get(knowledge_id)
+            if old is None:
+                updates.append(
+                    {
+                        "change": "knowledge_added",
+                        "knowledge_item_id": knowledge_id,
+                        "document_id": new.get("document_id") if new else None,
+                        "fact_status": new.get("fact_status") if new else None,
+                    }
+                )
+            elif new is None:
+                updates.append(
+                    {
+                        "change": "knowledge_removed_or_superseded",
+                        "knowledge_item_id": knowledge_id,
+                        "document_id": old.get("document_id"),
+                    }
+                )
+        updates.sort(
+            key=lambda row: (
+                str(row.get("document_id") or ""),
+                str(row.get("knowledge_item_id") or ""),
+                str(row.get("change") or ""),
+            )
+        )
+        request_hash = hashlib.sha256(
+            canonical_json({"from_snapshot_id": from_snapshot_id}).encode()
+        ).hexdigest()
+        try:
+            offset = self._cursor_offset(
+                cursor,
+                identity=current.identity,
+                tool="list_knowledge_updates",
+                request_hash=request_hash,
+            )
+        except ValueError as error:
+            return {
+                **self._base(resolution),
+                "status": "continuation_invalid",
+                "reason": str(error),
+                "updates": [],
+                "truncated": False,
+                "requires": ["list_knowledge_updates"],
+            }
+        selected: list[dict[str, Any]] = []
+        used = 0
+        index = offset
+        while index < len(updates) and len(selected) < limit:
+            row_size = len(canonical_json(updates[index]))
+            if selected and used + row_size > budget_chars:
+                break
+            selected.append(updates[index])
+            used += row_size
+            index += 1
+        truncated = index < len(updates)
+        if not truncated and self._pending_transition is not None:
+            old_identity, new_identity = self._pending_transition
+            if (
+                old_identity.snapshot_id == from_snapshot_id
+                and new_identity == current.identity
+            ):
+                self._pending_transition = None
+        return {
+            **self._base(resolution),
+            "status": "ok",
+            "from_snapshot_id": from_snapshot_id,
+            "to_snapshot_id": current.identity.snapshot_id,
+            "updates": selected,
+            "truncated": truncated,
+            "continuation": self._cursor(
+                identity=current.identity,
+                tool="list_knowledge_updates",
+                offset=index,
+                request_hash=request_hash,
+            )
+            if truncated
+            else None,
+            "requires": ["search_quant_knowledge", "get_quant_knowledge"],
+        }
+
+
+__all__ = ["KnowledgeMCPService", "Resolution", "SERVICE_SCHEMA"]

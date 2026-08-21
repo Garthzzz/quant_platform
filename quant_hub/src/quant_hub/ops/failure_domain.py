@@ -20,8 +20,9 @@ from typing import Mapping
 
 FACTS_SCHEMA = "qrh-failure-domain-host-facts/v1"
 ATTESTATION_SCHEMA = "qrh-recovery-failure-domain-attestation/v1"
-PROBE_SCHEMA = "qrh-recovery-independence-probe/v1"
+PROBE_SCHEMA = "qrh-recovery-independence-probe/v2"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class FailureDomainError(RuntimeError):
@@ -172,16 +173,139 @@ def verify_host_facts(value: Mapping[str, object], *, expected_role: str) -> dic
 
 def verify_independence_probe(value: Mapping[str, object]) -> dict[str, object]:
     probe = dict(value)
+    required = {
+        "schema_version",
+        "production_root_available",
+        "recovery_bundle_readable",
+        "closure_verified",
+        "empty_root_precondition",
+        "bundle_id",
+        "release_id",
+        "release_manifest_sha256",
+        "bundle_inventory_sha256",
+        "materialization_event_id",
+        "materialization_event_sha256",
+        "probe_tool_sha256",
+    }
+    if set(probe) != required:
+        raise FailureDomainError("independence probe shape is invalid")
     if probe.get("schema_version") != PROBE_SCHEMA:
         raise FailureDomainError("independence probe schema is invalid")
     if probe.get("production_root_available") is not False:
         raise FailureDomainError("probe did not isolate the production root")
-    if probe.get("recovery_bundle_readable") is not True or probe.get("closure_verified") is not True:
+    if (
+        probe.get("recovery_bundle_readable") is not True
+        or probe.get("closure_verified") is not True
+        or probe.get("empty_root_precondition") is not True
+    ):
         raise FailureDomainError("recovery bundle was not independently verified")
-    for field in ("bundle_inventory_sha256", "probe_tool_sha256"):
+    for field in (
+        "release_manifest_sha256",
+        "bundle_inventory_sha256",
+        "materialization_event_sha256",
+        "probe_tool_sha256",
+    ):
         if not isinstance(probe.get(field), str) or not _SHA256_RE.fullmatch(str(probe[field])):
             raise FailureDomainError(f"independence probe {field} is invalid")
+    for field in ("bundle_id", "release_id", "materialization_event_id"):
+        if not isinstance(probe.get(field), str) or not _SAFE_ID_RE.fullmatch(str(probe[field])):
+            raise FailureDomainError(f"independence probe {field} is invalid")
+    if probe["materialization_event_id"] != "cold-materialization-" + str(
+        probe["bundle_id"]
+    ):
+        raise FailureDomainError("independence probe materialization event differs")
     return probe
+
+
+def build_independence_probe(
+    *,
+    recovery_root: Path,
+    bundle_root: Path,
+    materialization_event_path: Path,
+    probe_tool_path: Path,
+) -> dict[str, object]:
+    """Bind an off-host bundle to a real empty-D materialization event.
+
+    This is the mechanical proof behind ``production_root_available=false``:
+    the sole production VM reported an exact empty D root before materializing
+    the bundle, while the same closed bundle remains readable and fully
+    verifiable on the recovery host.  The event is evidence only and never an
+    active/release authority.
+    """
+
+    from quant_hub.ops.recovery_bundle import verify_recovery_bundle
+
+    recovery = Path(recovery_root).resolve(strict=True)
+    bundle = Path(bundle_root).resolve(strict=True)
+    event_path = Path(materialization_event_path).resolve(strict=True)
+    tool_path = Path(probe_tool_path).resolve(strict=True)
+    if not recovery.is_dir() or _path_has_reparse(recovery):
+        raise FailureDomainError("recovery root is not a stable local directory")
+    if bundle.parent != recovery or not bundle.is_dir() or _path_has_reparse(bundle):
+        raise FailureDomainError("recovery bundle is outside the attested root")
+    for path, label in ((event_path, "materialization event"), (tool_path, "probe tool")):
+        if not path.is_file() or _path_has_reparse(path):
+            raise FailureDomainError(f"{label} is not a regular independent file")
+    report = verify_recovery_bundle(bundle)
+    if (
+        not report.valid
+        or report.bundle_id is None
+        or report.release_id is None
+        or report.release_manifest_sha256 is None
+    ):
+        raise FailureDomainError("off-host recovery bundle verification failed")
+    try:
+        event_raw = event_path.read_bytes()
+        event = json.loads(event_raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise FailureDomainError("materialization event is unreadable") from error
+    if not isinstance(event, dict) or set(event) != {
+        "schema_version", "event_id", "kind", "authority", "fields"
+    }:
+        raise FailureDomainError("materialization event shape is invalid")
+    fields = event.get("fields")
+    if not isinstance(fields, dict) or set(fields) != {
+        "bundle_id",
+        "release_id",
+        "manifest_sha256",
+        "empty_root_precondition",
+        "import_cleaned",
+        "runtime_tmp_cleaned",
+    }:
+        raise FailureDomainError("materialization event fields are invalid")
+    expected_event_id = "cold-materialization-" + report.bundle_id
+    if (
+        event.get("schema_version") != "qrh-recovery-materialization-event/v1"
+        or event.get("event_id") != expected_event_id
+        or event.get("kind") != "cold_recovery_materialized"
+        or event.get("authority") != "evidence_only"
+        or fields.get("bundle_id") != report.bundle_id
+        or fields.get("release_id") != report.release_id
+        or fields.get("manifest_sha256") != report.release_manifest_sha256
+        or any(
+            fields.get(name) is not True
+            for name in (
+                "empty_root_precondition", "import_cleaned", "runtime_tmp_cleaned"
+            )
+        )
+    ):
+        raise FailureDomainError("materialization event does not bind the bundle")
+    inventory = bundle / "closure_inventory.json"
+    probe = {
+        "schema_version": PROBE_SCHEMA,
+        "production_root_available": False,
+        "recovery_bundle_readable": True,
+        "closure_verified": True,
+        "empty_root_precondition": True,
+        "bundle_id": report.bundle_id,
+        "release_id": report.release_id,
+        "release_manifest_sha256": report.release_manifest_sha256,
+        "bundle_inventory_sha256": hashlib.sha256(inventory.read_bytes()).hexdigest(),
+        "materialization_event_id": expected_event_id,
+        "materialization_event_sha256": hashlib.sha256(event_raw).hexdigest(),
+        "probe_tool_sha256": hashlib.sha256(tool_path.read_bytes()).hexdigest(),
+    }
+    return verify_independence_probe(probe)
 
 
 def attest_failure_domain(
@@ -227,6 +351,7 @@ __all__ = [
     "FailureDomainAttestation",
     "FailureDomainError",
     "attest_failure_domain",
+    "build_independence_probe",
     "canonical_bytes",
     "collect_host_facts",
     "verify_host_facts",

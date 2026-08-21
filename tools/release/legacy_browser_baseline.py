@@ -6,6 +6,7 @@ import argparse
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -40,6 +41,20 @@ def _login(page: Page, base_url: str, password: str | None) -> None:
         page.locator("button[type=submit]").click()
     if "/login" in page.url:
         raise RuntimeError("broadcast login failed")
+
+
+def _protected_password(command_line_value: str | None) -> str | None:
+    """Resolve the browser credential without requiring it in process argv.
+
+    ``--access-password`` remains as a legacy test-only compatibility input;
+    production evidence commands inject ``VIEWER_ACCESS_PASSWORD`` through the
+    protected process environment and never persist its value.
+    """
+
+    if command_line_value is not None:
+        return command_line_value
+    value = os.environ.get("VIEWER_ACCESS_PASSWORD")
+    return value if value else None
 
 
 def _page_facts(page: Page, *, status: int) -> dict[str, Any]:
@@ -97,7 +112,8 @@ def main() -> int:
                 if message.type == "error"
                 else None,
             )
-            _login(page, base_url, args.access_password)
+            password = _protected_password(args.access_password)
+            _login(page, base_url, password)
             report["authenticated"] = True
 
             health = page.evaluate(
@@ -158,7 +174,7 @@ def main() -> int:
 
             mobile = browser.new_context(viewport={"width": 390, "height": 844})
             mobile_page = mobile.new_page()
-            _login(mobile_page, base_url, args.access_password)
+            _login(mobile_page, base_url, password)
             mobile_shot = output / "home-mobile.png"
             mobile_page.screenshot(path=str(mobile_shot), full_page=True)
             report["pages"]["home_mobile"] = _page_facts(

@@ -10,12 +10,27 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 import hashlib
+import json
+import re
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from quant_hub.knowledge.compiler import validate_snapshot
-from quant_hub.knowledge.contracts import BaseSnapshot, DocumentVersion, SourceSpan
+from quant_hub.collaboration.comment_anchors import (
+    CommentAnchorSnapshot,
+    CommentTargetInput,
+    SnapshotBlock,
+    SnapshotDocument,
+)
+from quant_hub.knowledge.contracts import (
+    BaseSnapshot,
+    DocumentIR,
+    DocumentVersion,
+    IRBlock,
+    SourceSpan,
+    content_hash,
+)
 from quant_hub.knowledge.ir import build_document_ir
 
 
@@ -35,7 +50,7 @@ class GenericKnowledgeCard:
     title: str
     statement: str
     evidence_span_ids: tuple[str, ...]
-    acceptance: Literal["mechanically_verified", "human_accepted"]
+    acceptance: Literal["source_explicit", "mechanically_verified", "human_accepted"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +77,15 @@ class GenericVersionLink:
 
 
 @dataclass(frozen=True, slots=True)
+class GenericCommentAnchorOption:
+    span_id: str
+    block_type: str
+    label: str
+    line_start: int
+    line_end: int
+
+
+@dataclass(frozen=True, slots=True)
 class GenericDocumentPage:
     snapshot_id: str
     document_id: str
@@ -79,6 +103,7 @@ class GenericDocumentPage:
     knowledge_cards: tuple[GenericKnowledgeCard, ...]
     knowledge_evidence: Mapping[str, tuple[GenericLocator, ...]]
     versions: tuple[GenericVersionLink, ...]
+    comment_anchor_options: tuple[GenericCommentAnchorOption, ...]
 
 
 def _safe_external_href(value: object) -> str | None:
@@ -118,6 +143,9 @@ class GenericResearchCatalog:
         source_objects: Mapping[str, bytes],
         *,
         accepted_knowledge: Mapping[str, Sequence[GenericKnowledgeCard]] | None = None,
+        effective_snapshot_id: str | None = None,
+        knowledge_status_membership: Mapping[str, str] | None = None,
+        release_manifest_sha256: str | None = None,
     ) -> None:
         validate_snapshot(snapshot)
         copied: dict[str, bytes] = {}
@@ -128,6 +156,21 @@ class GenericResearchCatalog:
                 raise GenericCatalogError("source object key does not match its bytes")
             copied[digest] = value
         self._snapshot = copy.deepcopy(snapshot)
+        self._effective_snapshot_id = effective_snapshot_id or snapshot.snapshot_id
+        self._release_manifest_sha256 = release_manifest_sha256 or content_hash(
+            "qrh-generic-catalog-manifest-surrogate/v1",
+            {
+                "base_snapshot_id": snapshot.snapshot_id,
+                "effective_snapshot_id": self._effective_snapshot_id,
+            },
+        )
+        if not re.fullmatch(r"[0-9a-f]{64}", self._release_manifest_sha256):
+            raise GenericCatalogError("release manifest SHA-256 is invalid")
+        self._knowledge_status = MappingProxyType(
+            dict(knowledge_status_membership or snapshot.knowledge_status_membership)
+        )
+        if set(self._knowledge_status) != set(snapshot.knowledge_status_membership):
+            raise GenericCatalogError("knowledge status membership differs from base snapshot")
         self._sources: Mapping[str, bytes] = MappingProxyType(copied)
         self._knowledge: Mapping[str, tuple[GenericKnowledgeCard, ...]] = MappingProxyType(
             {
@@ -139,14 +182,215 @@ class GenericResearchCatalog:
         if unknown:
             raise GenericCatalogError("knowledge references an unknown document version")
         for version_id, cards in self._knowledge.items():
-            if (
-                cards
-                and self._snapshot.knowledge_status_membership.get(version_id) != "ready"
+            if cards and self._knowledge_status.get(version_id) != "ready" and any(
+                card.acceptance != "source_explicit" for card in cards
             ):
                 raise GenericCatalogError(
                     "accepted knowledge requires a ready snapshot membership"
                 )
             self._validate_cards(version_id, cards)
+
+    @property
+    def base_snapshot(self) -> BaseSnapshot:
+        """Return an isolated copy of the release-verified deterministic base."""
+
+        return copy.deepcopy(self._snapshot)
+
+    @staticmethod
+    def _block_context(ir: DocumentIR, position: int) -> dict[str, object]:
+        block = ir.blocks[position]
+        ordinal = 1 + sum(
+            prior.kind == block.kind and prior.heading_path == block.heading_path
+            for prior in ir.blocks[:position]
+        )
+        return {
+            "heading_path": list(block.heading_path),
+            "ordinal": ordinal,
+        }
+
+    @staticmethod
+    def _comment_block_positions(ir: DocumentIR) -> tuple[int, ...]:
+        """Select deterministic leaf-like, non-overlapping anchor blocks.
+
+        IR may contain a container (for example a list) and its child blocks.
+        Comment projection deliberately chooses the smallest exact source
+        occurrence so one byte range cannot resolve through two structures.
+        """
+
+        selected: list[int] = []
+        for position in sorted(
+            range(len(ir.blocks)),
+            key=lambda index: (
+                ir.blocks[index].source_span.byte_end
+                - ir.blocks[index].source_span.byte_start,
+                ir.blocks[index].source_span.byte_start,
+                ir.blocks[index].source_span.byte_end,
+                index,
+            ),
+        ):
+            candidate = ir.blocks[position].source_span
+            if candidate.byte_end <= candidate.byte_start:
+                continue
+            if any(
+                candidate.byte_start < ir.blocks[other].source_span.byte_end
+                and ir.blocks[other].source_span.byte_start < candidate.byte_end
+                for other in selected
+            ):
+                continue
+            selected.append(position)
+        return tuple(
+            sorted(selected, key=lambda index: ir.blocks[index].source_span.byte_start)
+        )
+
+    def comment_research_exists(self, research_id: str) -> bool:
+        return any(
+            version.research_id == research_id
+            for version in self._snapshot.versions.values()
+        )
+
+    def _comment_document_version(
+        self, research_id: str, document_id: str, version_id: str
+    ) -> tuple[DocumentVersion, DocumentIR, bytes] | None:
+        version = self._snapshot.versions.get(version_id)
+        if (
+            version is None
+            or version.document_id != document_id
+            or version.research_id != research_id
+        ):
+            return None
+        return (
+            version,
+            self._snapshot.ir_documents[version_id],
+            self.source_bytes(document_id, version_id),
+        )
+
+    def validate_comment_target(
+        self,
+        research_id: str,
+        _target: CommentTargetInput,
+        material: dict[str, object],
+    ) -> str | None:
+        """Prove a submitted target against immutable IR/source bytes."""
+
+        if material["target_kind"] == "research":
+            return None if self.comment_research_exists(research_id) else "研究不存在。"
+        document_id = str(material["document_id"])
+        record = self._snapshot.documents.get(document_id)
+        if record is None or record.research_id != research_id:
+            return "document_id 不属于当前 stable research identity。"
+        if material["target_kind"] == "document":
+            return None
+        located = self._comment_document_version(
+            research_id,
+            document_id,
+            str(material["origin_document_version_id"]),
+        )
+        if located is None:
+            return "origin document version 不属于当前 stable document identity。"
+        version, ir, source = located
+        if version.source_sha256 != material["origin_source_sha256"]:
+            return "origin source hash 与 document version 不一致。"
+        start = int(material["origin_start_byte"])
+        end = int(material["origin_end_byte"])
+        exact = material["origin_exact_bytes"]
+        if type(exact) is not bytes or end > len(source) or source[start:end] != exact:
+            return "exact byte span 无法在 origin source 中确定性定位。"
+        matching: list[IRBlock] = []
+        for position in self._comment_block_positions(ir):
+            block = ir.blocks[position]
+            if (
+                block.kind == material["origin_block_type"]
+                and block.source_span.byte_start <= start
+                and block.source_span.byte_end >= end
+                and self._block_context(ir, position)
+                == json.loads(str(material["origin_structural_context_json"]))
+            ):
+                matching.append(block)
+        if len(matching) != 1:
+            return "origin anchor 不能由唯一 IR block 确定性证明。"
+        locator = json.loads(str(material["origin_locator_json"]))
+        span_id = locator.get("span_id")
+        valid_spans = (matching[0].source_span, *matching[0].spans)
+        if not any(
+            span.span_id == span_id
+            and span.byte_start == start
+            and span.byte_end == end
+            for span in valid_spans
+        ):
+            return "origin locator 与确定性 IR span 不一致。"
+        return None
+
+    def comment_target(
+        self,
+        document_id: str,
+        version_id: str,
+        *,
+        target_kind: Literal["document", "block", "span"],
+        span_id: str | None = None,
+    ) -> CommentTargetInput:
+        version, _ = self._resolve_version(document_id, version_id)
+        if target_kind == "document":
+            return CommentTargetInput.document(document_id)
+        ir = self._snapshot.ir_documents[version.document_version_id]
+        source = self.source_bytes(document_id, version.document_version_id)
+        candidates: list[tuple[int, IRBlock, SourceSpan]] = []
+        for position in self._comment_block_positions(ir):
+            block = ir.blocks[position]
+            spans = (block.source_span,) if target_kind == "block" else block.spans
+            for span in spans:
+                if span.span_id == span_id:
+                    candidates.append((position, block, span))
+        if len(candidates) != 1:
+            raise KeyError(span_id or "")
+        position, block, span = candidates[0]
+        return CommentTargetInput.anchored(
+            target_kind=target_kind,
+            document_id=document_id,
+            origin_document_version_id=version.document_version_id,
+            origin_source_sha256=version.source_sha256,
+            origin_block_type=block.kind,
+            origin_start_byte=span.byte_start,
+            origin_end_byte=span.byte_end,
+            origin_exact_bytes=source[span.byte_start : span.byte_end],
+            structural_context=self._block_context(ir, position),
+            locator={
+                "kind": "generic-ir-span",
+                "span_id": span.span_id,
+                "line_start": span.line_start,
+                "line_end": span.line_end,
+            },
+        )
+
+    def comment_snapshot(
+        self, document_id: str, version_id: str | None = None
+    ) -> CommentAnchorSnapshot:
+        version, is_current = self._resolve_version(document_id, version_id)
+        ir = self._snapshot.ir_documents[version.document_version_id]
+        source = self.source_bytes(document_id, version.document_version_id)
+        return CommentAnchorSnapshot(
+            snapshot_id=self._effective_snapshot_id,
+            manifest_sha256=self._release_manifest_sha256,
+            view="current" if is_current else "history",
+            documents=(
+                SnapshotDocument(
+                    research_id=version.research_id,
+                    document_id=document_id,
+                    document_version_id=version.document_version_id,
+                    source_sha256=version.source_sha256,
+                    source_bytes=source,
+                    blocks=tuple(
+                        SnapshotBlock(
+                            block_type=block.kind,
+                            start_byte=block.source_span.byte_start,
+                            end_byte=block.source_span.byte_end,
+                            structural_context=self._block_context(ir, position),
+                        )
+                        for position in self._comment_block_positions(ir)
+                        for block in (ir.blocks[position],)
+                    ),
+                ),
+            ),
+        )
 
     def _validate_cards(
         self, version_id: str, cards: Sequence[GenericKnowledgeCard]
@@ -212,7 +456,8 @@ class GenericResearchCatalog:
 
         all_spans = {
             span.span_id: span
-            for block in expected_ir.blocks
+            for position in self._comment_block_positions(expected_ir)
+            for block in (expected_ir.blocks[position],)
             for span in (block.source_span, *block.spans)
         }
         toc: list[GenericLocator] = []
@@ -288,8 +533,19 @@ class GenericResearchCatalog:
                 for item_id in reversed(record.version_ids)
             )
         )
+        comment_anchor_options = tuple(
+            GenericCommentAnchorOption(
+                span_id=block.source_span.span_id,
+                block_type=block.kind,
+                label=(block.text.strip() or block.kind)[:120],
+                line_start=block.source_span.line_start,
+                line_end=block.source_span.line_end,
+            )
+            for block in expected_ir.blocks
+            if block.kind != "heading" and block.source_span.byte_end > block.source_span.byte_start
+        )
         return GenericDocumentPage(
-            snapshot_id=self._snapshot.snapshot_id,
+            snapshot_id=self._effective_snapshot_id,
             document_id=document_id,
             research_id=version.research_id,
             version_id=version.document_version_id,
@@ -299,7 +555,7 @@ class GenericResearchCatalog:
             title=expected_ir.title,
             rendered_html=rendered_html,
             is_current=is_current,
-            knowledge_status=self._snapshot.knowledge_status_membership.get(
+            knowledge_status=self._knowledge_status.get(
                 version.document_version_id, version.knowledge_status
             ),
             toc=tuple(toc),
@@ -307,11 +563,13 @@ class GenericResearchCatalog:
             knowledge_cards=tuple(cards),
             knowledge_evidence=evidence,
             versions=versions,
+            comment_anchor_options=comment_anchor_options,
         )
 
 
 __all__ = [
     "GenericCatalogError",
+    "GenericCommentAnchorOption",
     "GenericDocumentPage",
     "GenericKnowledgeCard",
     "GenericResearchCatalog",

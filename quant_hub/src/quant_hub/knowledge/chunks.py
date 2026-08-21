@@ -9,7 +9,7 @@ from typing import Sequence
 from .contracts import Chunk, DocumentIR, IRBlock, content_hash
 
 
-CHUNKER_VERSION = "qrh-heading-aware-chunker/v1"
+CHUNKER_VERSION = "qrh-heading-aware-chunker/v2-single-block"
 
 _STRUCTURAL_ONLY = frozenset({"list", "list_item", "quote"})
 _ATOMIC_KINDS = frozenset({"math", "table", "code"})
@@ -160,31 +160,15 @@ def build_chunks(ir: DocumentIR, *, max_chunk_bytes: int = 2400) -> tuple[Chunk,
     if max_chunk_bytes < 128:
         raise ValueError("max_chunk_bytes is too small for stable research chunks")
     chunks: list[Chunk] = []
-    buffer: list[IRBlock] = []
-    buffer_bytes = 0
-
     def append_chunk(row: Chunk) -> None:
         chunks.append(row)
-
-    def flush() -> None:
-        nonlocal buffer, buffer_bytes
-        if buffer:
-            append_chunk(_make_chunk(ir, buffer, ordinal=len(chunks) + 1))
-        buffer = []
-        buffer_bytes = 0
 
     for block in ir.blocks:
         if block.kind in _STRUCTURAL_ONLY:
             continue
         encoded_bytes = len(block.text.encode("utf-8"))
         contains_citation = any(span.kind == "citation" for span in block.spans)
-        if block.kind == "heading":
-            flush()
-            buffer = [block]
-            buffer_bytes = encoded_bytes
-            continue
         if block.kind in _ATOMIC_KINDS or contains_citation or encoded_bytes > max_chunk_bytes:
-            flush()
             segments = _safe_segments(block, max_chunk_bytes)
             if len(segments) == 1:
                 append_chunk(_make_chunk(ir, (block,), ordinal=len(chunks) + 1))
@@ -237,12 +221,12 @@ def build_chunks(ir: DocumentIR, *, max_chunk_bytes: int = 2400) -> tuple[Chunk,
                     )
                 )
             continue
-        separator = 2 if buffer else 0
-        if buffer and (buffer_bytes + separator + encoded_bytes > max_chunk_bytes):
-            flush()
-        buffer.append(block)
-        buffer_bytes += separator + encoded_bytes
-    flush()
+        # A short source block is already the preferred semantic retrieval
+        # unit.  Combining adjacent paragraphs under the same heading made
+        # positive evidence, conditions, limitations and counterexamples share
+        # one locator and allowed context to masquerade as a match.  Heading
+        # context remains explicit in ``heading_path`` and adjacency metadata.
+        append_chunk(_make_chunk(ir, (block,), ordinal=len(chunks) + 1))
 
     # Adjacency is descriptive metadata, not part of chunk identity, avoiding a
     # hash dependency cycle while still allowing deterministic navigation.

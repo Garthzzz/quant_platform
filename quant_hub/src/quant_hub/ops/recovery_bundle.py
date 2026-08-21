@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import shutil
+import sqlite3
 import stat
 from typing import Iterable, Mapping
 from uuid import uuid4
@@ -27,25 +29,52 @@ from quant_hub.ops.release_identity import (
     validate_recovery_manifest,
     validate_release_manifest,
 )
+from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
 
 
 CLOSURE_SCHEMA = "qrh-recovery-closure-inventory/v1"
-SCANNER_VERSION = "qrh-recovery-no-secret/v1"
+SCANNER_VERSION = "qrh-recovery-no-secret/v2"
 RESTORE_PROTOCOL = "qrh-restore/v1"
+OPERATIONAL_BOOTSTRAP_SCHEMA = "qrh-operational-bootstrap/v1"
+PRODUCTION_VM_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_SECRET_PATTERNS = {
-    "private_key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    "github_token": re.compile(rb"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b"),
-    "deepseek_key": re.compile(rb"\bsk-[A-Za-z0-9_-]{24,}\b"),
-    "authorization": re.compile(rb"\bAuthorization\s*:\s*Bearer\s+\S+", re.I),
+_SECRET_PATTERN_TEXT = {
+    "private_key": r"(?m)^-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----\r?\n[A-Za-z0-9+/=\r\n]{32,}",
+    "github_token": r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{20,}\b",
+    "deepseek_openai_key": r"\bsk-(?:proj-)?[A-Za-z0-9_-]{24,}\b",
+    "authorization_bearer": r"(?i)\b(?:Authorization\s*[:=]\s*)?Bearer\s+[A-Za-z0-9._~+/=-]{20,}",
+    "aws_access_key": r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+    "aws_secret_key": r"(?i)\baws_secret_access_key\s*[:=]\s*[A-Za-z0-9/+=]{40}\b",
 }
-_TEXT_SUFFIXES = {
-    ".bat", ".cfg", ".conf", ".css", ".html", ".ini", ".js", ".json",
-    ".md", ".ps1", ".py", ".toml", ".txt", ".yaml", ".yml",
+_SECRET_PATTERNS = {
+    name: re.compile(pattern.encode("ascii"))
+    for name, pattern in _SECRET_PATTERN_TEXT.items()
+}
+_SECRET_TEXT_PATTERNS = {
+    name: re.compile(pattern) for name, pattern in _SECRET_PATTERN_TEXT.items()
 }
 _FORBIDDEN_SECRET_NAMES = {
     ".env", "credentials", "credentials.json", "viewer_secret.key",
+    "viewer_access_password.digest",
 }
+_REVIEWED_SOURCE_SUFFIXES = {
+    ".c", ".cjs", ".cpp", ".cs", ".css", ".go", ".h", ".hpp", ".html",
+    ".java", ".js", ".jsx", ".mjs", ".php", ".ps1", ".psm1", ".py",
+    ".pyi", ".rb", ".rs", ".sh", ".ts", ".tsx",
+}
+
+_OPERATIONAL_PATHS = {
+    "service_executable": "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+    "service_python": "tooling/python/python.exe",
+    "service_host_module": "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py",
+    "service_entry_module": "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+    "deployment_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py",
+    "publish_recovery_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py",
+    "access_gate_module": "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py",
+    "deployment_runtime": "control/deployment_runtime.json",
+}
+_SERVICE_CANDIDATE_PATH = "control/service_install_candidate.json"
+_BOOTSTRAP_PATH = "control/operational_bootstrap.json"
 
 
 class RecoveryBundleError(RuntimeError):
@@ -96,6 +125,16 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
+def _path_has_reparse(path: Path) -> bool:
+    current = path
+    while True:
+        if current.exists() and _is_reparse(current):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
+
+
 def _files(root: Path) -> list[Path]:
     result: list[Path] = []
     for current, directories, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -133,20 +172,25 @@ def _scan_no_secret(root: Path, paths: Iterable[Path]) -> dict[str, object]:
     for path in paths:
         relative = path.relative_to(root).as_posix()
         lowered_name = path.name.casefold()
-        if lowered_name in _FORBIDDEN_SECRET_NAMES or any(
-            marker in lowered_name for marker in ("credential", "cookie", "storage_state")
+        marker_name = any(
+            marker in lowered_name
+            for marker in ("credential", "cookie", "storage_state")
+        )
+        # Runtime dependencies legitimately contain reviewed source modules
+        # such as requests/cookies.py.  Their bytes are still scanned below;
+        # only non-source state/config files retain the filename hard gate.
+        if lowered_name in _FORBIDDEN_SECRET_NAMES or (
+            marker_name and path.suffix.casefold() not in _REVIEWED_SOURCE_SUFFIXES
         ):
             findings.append({"path": relative, "kind": "forbidden_secret_filename"})
             continue
-        if path.suffix.casefold() not in _TEXT_SUFFIXES:
-            continue
-        payload = path.read_bytes()
+        size, digest, kinds = _scan_regular_payload(path)
         scanned.append(
-            {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+            {"path": relative, "bytes": size, "sha256": digest}
         )
-        for kind, pattern in _SECRET_PATTERNS.items():
-            if pattern.search(payload):
-                findings.append({"path": relative, "kind": kind})
+        if _is_sqlite_payload(path):
+            kinds.update(_scan_sqlite_logical_text(path))
+        findings.extend({"path": relative, "kind": kind} for kind in sorted(kinds))
     report = {
         "schema_version": SCANNER_VERSION,
         "verdict": "pass" if not findings else "blocked",
@@ -162,9 +206,203 @@ def _scan_no_secret(root: Path, paths: Iterable[Path]) -> dict[str, object]:
     return report
 
 
+def _pattern_kinds_bytes(payload: bytes) -> set[str]:
+    return {
+        kind for kind, pattern in _SECRET_PATTERNS.items() if pattern.search(payload)
+    }
+
+
+def _pattern_kinds_text(payload: str) -> set[str]:
+    return {
+        kind
+        for kind, pattern in _SECRET_TEXT_PATTERNS.items()
+        if pattern.search(payload)
+    }
+
+
+def _pattern_kinds_all_encodings(payload: bytes) -> set[str]:
+    """Scan one bounded window as raw/UTF-8 and both UTF-16 alignments."""
+
+    kinds = _pattern_kinds_bytes(payload)
+    kinds.update(_pattern_kinds_text(payload.decode("utf-8", errors="ignore")))
+    for encoding in ("utf-16-le", "utf-16-be"):
+        for offset in (0, 1):
+            aligned = payload[offset:]
+            aligned = aligned[: len(aligned) - (len(aligned) % 2)]
+            if aligned:
+                kinds.update(
+                    _pattern_kinds_text(aligned.decode(encoding, errors="ignore"))
+                )
+    return kinds
+
+
+def _scan_binary_value(payload: bytes) -> set[str]:
+    """Bound temporary memory while scanning a possibly large SQLite BLOB."""
+
+    kinds: set[str] = set()
+    overlap = b""
+    view = memoryview(payload)
+    for start in range(0, len(view), 1024 * 1024):
+        block = bytes(view[start : start + 1024 * 1024])
+        window = overlap + block
+        kinds.update(_pattern_kinds_all_encodings(window))
+        overlap = window[-8192:]
+    return kinds
+
+
+def _scan_regular_payload(path: Path) -> tuple[int, str, set[str]]:
+    """Stream every regular payload, including binary and UTF-16 material."""
+
+    digest = hashlib.sha256()
+    kinds: set[str] = set()
+    total = 0
+    overlap = b""
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            total += len(block)
+            digest.update(block)
+            window = overlap + block
+            kinds.update(_pattern_kinds_all_encodings(window))
+            overlap = window[-8192:]
+    return total, digest.hexdigest(), kinds
+
+
+def _is_sqlite_payload(path: Path) -> bool:
+    with path.open("rb") as stream:
+        return stream.read(16) == b"SQLite format 3\x00"
+
+
+def _scan_sqlite_logical_text(path: Path) -> set[str]:
+    """Read every readable SQLite value without executing application code."""
+
+    kinds: set[str] = set()
+    uri = f"file:{path.resolve().as_posix()}?mode=ro&immutable=1"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as connection:
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA trusted_schema=OFF")
+            tables = connection.execute(
+                "SELECT name,sql FROM sqlite_schema "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            for table_name, create_sql in tables:
+                if not isinstance(table_name, str):
+                    raise RecoveryBundleError("SQLite table identity is unreadable")
+                if isinstance(create_sql, str) and create_sql.lstrip().upper().startswith(
+                    "CREATE VIRTUAL TABLE"
+                ):
+                    raise RecoveryBundleError(
+                        "SQLite virtual table cannot be proven secret-free"
+                    )
+                quoted = '"' + table_name.replace('"', '""') + '"'
+                cursor = connection.execute(f"SELECT * FROM {quoted}")
+                for row in cursor:
+                    for value in row:
+                        if isinstance(value, str):
+                            kinds.update(_pattern_kinds_text(value))
+                        elif isinstance(value, bytes):
+                            kinds.update(_scan_binary_value(value))
+    except (OSError, sqlite3.Error, UnicodeError) as error:
+        raise RecoveryBundleError("SQLite logical no-secret scan failed") from error
+    return kinds
+
+
 def _copy_tree(source: Path, destination: Path) -> None:
     _files(source)
     shutil.copytree(source, destination, symlinks=False)
+
+
+def _operational_bootstrap(root: Path) -> tuple[dict[str, object], str]:
+    root = root.resolve(strict=True)
+    candidate_path = root / _SERVICE_CANDIDATE_PATH
+    runtime_path = root / _OPERATIONAL_PATHS["deployment_runtime"]
+    if not candidate_path.is_file() or not runtime_path.is_file():
+        raise RecoveryBundleError("operational service candidate/runtime is missing")
+    try:
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RecoveryBundleError("operational service candidate is invalid") from error
+    candidate_fields = {
+        "schema_version", "service_name", "python_class", "service_executable",
+        "service_executable_sha256", "service_python", "service_python_sha256",
+        "service_host_module", "service_host_module_sha256", "service_entry_module",
+        "service_entry_module_sha256", "deployment_cli_module",
+        "deployment_cli_module_sha256", "publish_recovery_cli_module",
+        "publish_recovery_cli_module_sha256", "access_gate_module", "access_gate_module_sha256",
+        "deployment_runtime", "deployment_runtime_sha256", "start_type",
+        "quant_hub_package_root", "quant_hub_package_inventory_sha256",
+    }
+    if (
+        not isinstance(candidate, dict)
+        or set(candidate) != candidate_fields
+        or candidate["schema_version"] != "qrh-windows-service-install-candidate/v1"
+        or candidate["service_name"] != "QuantResearchHub"
+        or candidate["python_class"]
+        != "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
+        or candidate["start_type"] != "automatic"
+        or candidate_path.read_bytes() != canonical_manifest_bytes(candidate)
+    ):
+        raise RecoveryBundleError("operational service candidate contract differs")
+    required: list[dict[str, object]] = []
+    for field, relative in sorted(_OPERATIONAL_PATHS.items()):
+        path = root.joinpath(*relative.split("/"))
+        if not path.is_file():
+            raise RecoveryBundleError(f"operational required file is missing: {relative}")
+        expected_path = PRODUCTION_VM_ROOT.joinpath(*relative.split("/"))
+        expected_hash = _hash_path(path)
+        if (
+            PureWindowsPath(str(candidate[field])) != expected_path
+            or candidate[f"{field}_sha256"] != expected_hash
+        ):
+            raise RecoveryBundleError(f"operational candidate binding differs: {field}")
+        required.append({"path": relative, "sha256": expected_hash})
+    package_root = root / "tooling" / "python" / "Lib" / "site-packages" / "quant_hub"
+    if (
+        PureWindowsPath(str(candidate["quant_hub_package_root"]))
+        != PRODUCTION_VM_ROOT
+        / "tooling" / "python" / "Lib" / "site-packages" / "quant_hub"
+        or candidate["quant_hub_package_inventory_sha256"]
+        != quant_hub_package_inventory_sha256(package_root)
+    ):
+        raise RecoveryBundleError("operational quant_hub package binding differs")
+    operational_files = [
+        path
+        for path in _files(root)
+        if path.relative_to(root).as_posix() != _BOOTSTRAP_PATH
+    ]
+    bootstrap: dict[str, object] = {
+        "schema_version": OPERATIONAL_BOOTSTRAP_SCHEMA,
+        "authority_root": str(PRODUCTION_VM_ROOT),
+        "required": required,
+        "files": _records(root, operational_files),
+    }
+    bootstrap_hash = hashlib.sha256(canonical_manifest_bytes(bootstrap)).hexdigest()
+    return bootstrap, bootstrap_hash
+
+
+def _write_and_validate_operational_bootstrap(root: Path) -> str:
+    path = root / _BOOTSTRAP_PATH
+    if path.exists():
+        raise RecoveryBundleError("operational bootstrap must be generated by bundle builder")
+    bootstrap, bootstrap_hash = _operational_bootstrap(root)
+    path.write_bytes(canonical_manifest_bytes(bootstrap))
+    observed, observed_hash = _operational_bootstrap(root)
+    if observed != bootstrap or observed_hash != bootstrap_hash:
+        raise RecoveryBundleError("operational bootstrap changed during generation")
+    return bootstrap_hash
+
+
+def _verify_operational_bootstrap(root: Path, expected_hash: object) -> None:
+    path = root / _BOOTSTRAP_PATH
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RecoveryBundleError("operational bootstrap is unavailable") from error
+    if not isinstance(stored, dict) or path.read_bytes() != canonical_manifest_bytes(stored):
+        raise RecoveryBundleError("operational bootstrap is not canonical")
+    rebuilt, rebuilt_hash = _operational_bootstrap(root)
+    if stored != rebuilt or expected_hash != rebuilt_hash:
+        raise RecoveryBundleError("operational bootstrap inventory/hash differs")
 
 
 def build_recovery_bundle(
@@ -176,6 +414,7 @@ def build_recovery_bundle(
     created_at: str,
     restore_tool: Path,
     runbook: Path,
+    operational_root: Path,
     compatibility: Mapping[str, object],
     checkpoint_scratch_root: Path | None = None,
 ) -> RecoveryBundle:
@@ -188,12 +427,17 @@ def build_recovery_bundle(
     recovery_root = recovery_root.resolve(strict=True)
     restore_tool = restore_tool.resolve(strict=True)
     runbook = runbook.resolve(strict=True)
+    operational_root = operational_root.resolve(strict=True)
     if not restore_tool.is_file() or not runbook.is_file():
         raise RecoveryBundleError("restore tool and runbook must be files")
     destination = recovery_root / f"cold-recovery-{bundle_id}"
     if destination.exists():
         raise RecoveryBundleError("recovery bundle ID already exists")
-    partial = recovery_root / f".cold-recovery-{bundle_id}.partial-{uuid4().hex}"
+    # Keep the staging component deliberately short.  The V39 closure contains
+    # legitimate deeply nested research/resource names near Win32 MAX_PATH;
+    # repeating the full bundle ID in the partial directory can make an
+    # otherwise restorable payload impossible to copy on Windows.
+    partial = recovery_root / f".qrh-rb-{uuid4().hex}"
     partial.mkdir()
     try:
         release_manifest_path = release_root / "release_manifest.json"
@@ -221,6 +465,20 @@ def build_recovery_bundle(
         )
         checkpoint_destination.parent.mkdir()
         _copy_tree(checkpoint_root, checkpoint_destination)
+        operational_destination = partial / "operational"
+        (operational_destination / "control").mkdir(parents=True)
+        _copy_tree(
+            operational_root / "tooling",
+            operational_destination / "tooling",
+        )
+        for name in ("deployment_runtime.json", "service_install_candidate.json"):
+            source = operational_root / "control" / name
+            if not source.is_file():
+                raise RecoveryBundleError(f"operational control file is missing: {name}")
+            shutil.copy2(source, operational_destination / "control" / name)
+        operational_bootstrap_hash = _write_and_validate_operational_bootstrap(
+            operational_destination
+        )
         tool_destination = partial / "tools" / "restore"
         tool_destination.mkdir(parents=True)
         shutil.copy2(restore_tool, tool_destination / restore_tool.name)
@@ -271,6 +529,7 @@ def build_recovery_bundle(
                 "protocol_version": RESTORE_PROTOCOL,
                 "tool_inventory_sha256": tool_inventory_hash,
                 "runbook_sha256": _hash_path(partial / "RUNBOOK.md"),
+                "operational_bootstrap_sha256": operational_bootstrap_hash,
             },
             "no_secret_attestation": {
                 "verdict": "pass",
@@ -423,6 +682,10 @@ def verify_recovery_bundle(
             raise RecoveryBundleError("no-secret attestation evidence differs")
         if recovery_manifest["no_secret_attestation"]["report_sha256"] != claimed_report_hash:
             raise RecoveryBundleError("recovery no-secret attestation differs")
+        _verify_operational_bootstrap(
+            root / "operational",
+            recovery_manifest["restore"]["operational_bootstrap_sha256"],
+        )
     except (RecoveryBundleError, OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         errors.append("recovery_bundle_validation_failed")
     return RecoveryVerification(
@@ -447,7 +710,7 @@ def restore_recovery_bundle(*, bundle_root: Path, empty_target_root: Path) -> Re
 
     bundle_root = Path(bundle_root).resolve(strict=True)
     target = Path(empty_target_root).resolve(strict=True)
-    if _is_reparse(target) or any(target.iterdir()):
+    if _path_has_reparse(target) or any(target.iterdir()):
         raise RecoveryBundleError("restore target must be a real empty directory")
     scratch_root = target / ".recovery-verify-scratch"
     if scratch_root.exists():
@@ -495,8 +758,15 @@ def restore_recovery_bundle(*, bundle_root: Path, empty_target_root: Path) -> Re
             )
             shutil.copy2(source, state_destination / f"{logical_name}.sqlite3")
         _copy_tree(bundle_root / "tools", target / "tools")
+        _copy_tree(bundle_root / "operational" / "tooling", target / "tooling")
         control = target / "control"
         control.mkdir()
+        for name in (
+            "deployment_runtime.json",
+            "service_install_candidate.json",
+            "operational_bootstrap.json",
+        ):
+            shutil.copy2(bundle_root / "operational" / "control" / name, control / name)
         active: dict[str, object] = {
             "schema_version": ACTIVE_SCHEMA,
             "release_id": release_id,

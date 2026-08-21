@@ -1,0 +1,35 @@
+{
+  "schema_version": "qrh-production-vm-write-set/v1",
+  "root": "D:\\quant\\quant_platform",
+  "areas": [
+    "audit",
+    "backups",
+    "checkout",
+    "control",
+    "incoming",
+    "logs",
+    "releases",
+    "state",
+    "tmp",
+    "tooling",
+    "tools"
+  ],
+  "legacy_read_only_sources": [
+    "C:\\quant_platform_data\\comments.sqlite3",
+    "C:\\quant_platform_data\\research_workspace.sqlite3"
+  ],
+  "contract": {
+    "root_must_preexist": true,
+    "reparse_points_forbidden": true,
+    "python_bytecode_disabled": true,
+    "temp_and_tmp_inside_root": true,
+    "writes_outside_areas_forbidden": true,
+    "os_managed_non_file_state": {
+      "type": "windows_scm_service_registration",
+      "service_name": "QuantResearchHub",
+      "image_path": "exact_hash_verified_D_root_candidate_only",
+      "python_class": "quant_hub.ops.windows_service.QuantResearchHubWindowsService",
+      "project_content_secret_temp_log_cache_on_C_forbidden": true
+    }
+  }
+}

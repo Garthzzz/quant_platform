@@ -105,6 +105,62 @@
         {% endif %}
       </section>
 
+      <section class="qrh-generic__comments" aria-labelledby="generic-comments-title" data-generic-comments{% if comments.enabled %} data-comment-snapshot-id="{{ comments.projection_snapshot_id }}" data-comment-manifest-sha256="{{ comments.projection_manifest_sha256 }}"{% endif %}>
+        <div class="qrh-generic__section-heading">
+          <div><p class="qrh-generic__eyebrow">Release 外持久状态</p><h2 id="generic-comments-title">研究评论</h2></div>
+          {% if comments.enabled %}<span>{{ comments.resolved|length + comments.unresolved|length }} 条</span>{% else %}<span>未配置</span>{% endif %}
+        </div>
+        {% if comments.enabled %}
+          <p class="qrh-generic__comment-note">评论绑定稳定 research/document identity。块或 span 仅在原文字节与结构上下文可确定性证明时重定位；无法证明的评论保留在“未解析／历史定位”中。</p>
+          <form class="qrh-generic__comment-form" data-generic-comment-form data-endpoint="{{ url_for('generic_research.create_comment', document_id=page.document_id) }}" data-version-id="{{ page.version_id }}">
+            <fieldset>
+              <legend>评论者</legend>
+              <label><input type="radio" name="actor_kind" value="zhang_zhengze" checked> 张正泽</label>
+              <label><input type="radio" name="actor_kind" value="song_dingkun"> 宋定坤</label>
+              <label><input type="radio" name="actor_kind" value="other"> 其他</label>
+            </fieldset>
+            <label>其他评论者姓名 <input type="text" name="display_name" maxlength="80" autocomplete="name" disabled></label>
+            <label>定位
+              <select name="comment_target">
+                <option value="document">整篇文档（稳定 document identity）</option>
+                {% for anchor in page.comment_anchor_options %}
+                  <option value="block:{{ anchor.span_id }}">行 {{ anchor.line_start }}–{{ anchor.line_end }} · {{ anchor.block_type }} · {{ anchor.label }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label>评论 <textarea name="content" rows="4" maxlength="8000" required></textarea></label>
+            <div><button type="submit">保存评论</button> <span role="status" aria-live="polite" data-generic-comment-status></span></div>
+          </form>
+
+          <h3>当前／已确定定位</h3>
+          {% if comments.resolved %}
+          <ol class="qrh-generic__comment-list" data-comment-group="resolved">
+          {% for comment in comments.resolved %}
+            <li data-comment-id="{{ comment.comment_id }}" data-resolution-status="{{ comment.resolution.status }}">
+              <p>{{ comment.content }}</p>
+              <small>{{ comment.actor.display_name }} · {{ comment.created_at }} · revision {{ comment.revision }} · {{ comment.resolution.status }}</small>
+            </li>
+          {% endfor %}
+          </ol>
+          {% else %}<p>当前版本尚无已确定定位的评论。</p>{% endif %}
+
+          <h3>未解析／历史定位</h3>
+          {% if comments.unresolved %}
+          <ol class="qrh-generic__comment-list qrh-generic__comment-list--unresolved" data-comment-group="unresolved">
+          {% for comment in comments.unresolved %}
+            <li data-comment-id="{{ comment.comment_id }}" data-resolution-status="{{ comment.resolution.status }}">
+              <p>{{ comment.content }}</p>
+              <small>{{ comment.actor.display_name }} · {{ comment.created_at }} · revision {{ comment.revision }} · {{ comment.resolution.status }} / {{ comment.resolution.reason }}</small>
+              {% if comment.history.origin_locator %}<details><summary>查看原始历史定位</summary><code>{{ comment.history.origin_locator }}</code></details>{% endif %}
+            </li>
+          {% endfor %}
+          </ol>
+          {% else %}<p>没有未解析评论。</p>{% endif %}
+        {% else %}
+          <p class="qrh-generic__pending">此进程未配置 release 外评论库；页面保持只读，不会把评论写入 release。</p>
+        {% endif %}
+      </section>
+
       <section class="qrh-generic__versions" aria-labelledby="generic-version-title">
         <div class="qrh-generic__section-heading"><h2 id="generic-version-title">版本历史</h2></div>
         <ol>
@@ -142,4 +198,8 @@
     </div>
   </dialog>
 </main>
+{% endblock %}
+{% block scripts %}
+  {{ super() }}
+  <script src="{{ url_for('generic_research.static', filename='generic-comments.js') }}" defer></script>
 {% endblock %}

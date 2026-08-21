@@ -11,15 +11,60 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import sqlite3
 import stat
+import sys
 from typing import Any
 
 
 class RestoreError(RuntimeError):
     pass
+
+
+PRODUCTION_VM_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
+OPERATIONAL_BOOTSTRAP_SCHEMA = "qrh-operational-bootstrap/v1"
+OPERATIONAL_PATHS = {
+    "service_executable": "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+    "service_python": "tooling/python/python.exe",
+    "service_host_module": "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py",
+    "service_entry_module": "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+    "deployment_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py",
+    "publish_recovery_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py",
+    "access_gate_module": "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py",
+    "deployment_runtime": "control/deployment_runtime.json",
+}
+
+
+def validate_production_restore_target(path: Path) -> None:
+    """The shipped production CLI may only materialize the exact empty D root."""
+
+    raw = str(path)
+    if raw.startswith(("\\\\", "//", "\\\\?\\", "\\??\\")):
+        raise RestoreError("production restore target cannot use UNC/extended syntax")
+    target = PureWindowsPath(raw)
+    if target != PRODUCTION_VM_ROOT:
+        raise RestoreError(
+            r"production restore target must be exactly D:\quant\quant_platform"
+        )
+
+
+def is_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return bool(attributes & 0x400)
+
+
+def path_has_reparse(path: Path) -> bool:
+    current = path
+    while True:
+        if current.exists() and is_reparse(current):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
 
 
 def canonical(value: object) -> bytes:
@@ -83,6 +128,65 @@ def load_canonical(path: Path) -> dict[str, Any]:
     return value
 
 
+def package_inventory_hash(root: Path) -> str:
+    records = []
+    for relative, path in files(root).items():
+        parts = PurePosixPath(relative).parts
+        if "__pycache__" in parts or relative.casefold().endswith((".pyc", ".pyo")):
+            continue
+        records.append(f"{relative}\t{path.stat().st_size}\t{digest(path)}\n")
+    value = hashlib.sha256()
+    for record in sorted(records):
+        value.update(record.encode("utf-8"))
+    return value.hexdigest()
+
+
+def verify_operational(root: Path, recovery: dict[str, Any]) -> None:
+    operational = root / "operational"
+    bootstrap_path = operational / "control" / "operational_bootstrap.json"
+    bootstrap = load_canonical(bootstrap_path)
+    if (
+        bootstrap.get("schema_version") != OPERATIONAL_BOOTSTRAP_SCHEMA
+        or bootstrap.get("authority_root") != str(PRODUCTION_VM_ROOT)
+        or recovery.get("restore", {}).get("operational_bootstrap_sha256")
+        != digest(bootstrap_path)
+    ):
+        raise RestoreError("operational bootstrap identity differs")
+    actual = files(operational)
+    actual.pop("control/operational_bootstrap.json", None)
+    records = [
+        {"path": relative, "bytes": path.stat().st_size, "sha256": digest(path)}
+        for relative, path in actual.items()
+    ]
+    if bootstrap.get("files") != records:
+        raise RestoreError("operational bootstrap inventory differs")
+    required = bootstrap.get("required")
+    expected_required = []
+    candidate = load_canonical(
+        operational / "control" / "service_install_candidate.json"
+    )
+    for field, relative in sorted(OPERATIONAL_PATHS.items()):
+        path = operational.joinpath(*relative.split("/"))
+        expected_hash = digest(path)
+        expected_required.append({"path": relative, "sha256": expected_hash})
+        if (
+            PureWindowsPath(str(candidate.get(field)))
+            != PRODUCTION_VM_ROOT.joinpath(*relative.split("/"))
+            or candidate.get(f"{field}_sha256") != expected_hash
+        ):
+            raise RestoreError("operational service binding differs")
+    if required != expected_required:
+        raise RestoreError("operational required-file closure differs")
+    package = operational / "tooling" / "python" / "Lib" / "site-packages" / "quant_hub"
+    if (
+        PureWindowsPath(str(candidate.get("quant_hub_package_root")))
+        != PRODUCTION_VM_ROOT / "tooling" / "python" / "Lib" / "site-packages" / "quant_hub"
+        or candidate.get("quant_hub_package_inventory_sha256")
+        != package_inventory_hash(package)
+    ):
+        raise RestoreError("operational project-package closure differs")
+
+
 def verify_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     root = root.resolve(strict=True)
     actual = files(root)
@@ -106,6 +210,7 @@ def verify_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             raise RestoreError(f"bundle hash differs: {relative}")
 
     recovery = load_canonical(root / "recovery_manifest.json")
+    verify_operational(root, recovery)
     release = load_canonical(root / "release" / "release_manifest.json")
     release_hash = hashlib.sha256(canonical(release)).hexdigest()
     if recovery.get("release") != {
@@ -168,12 +273,42 @@ def verify_bundle(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     return recovery, checkpoint
 
 
-def restore(bundle_root: Path, target_root: Path) -> dict[str, object]:
+def _validate_staged_target(bundle: Path, target: Path) -> None:
+    try:
+        relative = bundle.relative_to(target)
+    except ValueError as error:
+        raise RestoreError("staged bundle is outside the exact target root") from error
+    if (
+        len(relative.parts) != 3
+        or relative.parts[:2] != ("tmp", "recovery-import")
+        or relative.name != bundle.name
+    ):
+        raise RestoreError("staged bundle path is not the fixed recovery import path")
+    root_entries = {path.name for path in target.iterdir()}
+    if root_entries != {"tmp"}:
+        raise RestoreError("staged restore target contains non-staging content")
+    tmp = target / "tmp"
+    allowed_tmp = {"recovery-import", "recovery-runtime"}
+    if not {path.name for path in tmp.iterdir()}.issubset(allowed_tmp):
+        raise RestoreError("staged restore tmp contains an unapproved path")
+    imports = tmp / "recovery-import"
+    if not imports.is_dir() or {path.name for path in imports.iterdir()} != {bundle.name}:
+        raise RestoreError("recovery import contains another bundle or path")
+
+
+def restore(
+    bundle_root: Path,
+    target_root: Path,
+    *,
+    staged_under_target: bool = False,
+) -> dict[str, object]:
     bundle = bundle_root.resolve(strict=True)
     target = target_root.resolve(strict=True)
-    if target.is_symlink() or getattr(target.lstat(), "st_file_attributes", 0) & 0x400:
+    if path_has_reparse(target):
         raise RestoreError("target cannot be a reparse/symlink")
-    if any(target.iterdir()):
+    if staged_under_target:
+        _validate_staged_target(bundle, target)
+    elif any(target.iterdir()):
         raise RestoreError("target must be empty")
     recovery, checkpoint = verify_bundle(bundle)
     release = recovery["release"]
@@ -188,8 +323,15 @@ def restore(bundle_root: Path, target_root: Path) -> dict[str, object]:
         source = safe_relative(checkpoint_root, record["relative_path"])
         shutil.copy2(source, state_destination / f"{record['logical_name']}.sqlite3")
     shutil.copytree(bundle / "tools", target / "tools")
+    shutil.copytree(bundle / "operational" / "tooling", target / "tooling")
     control = target / "control"
     control.mkdir()
+    for name in (
+        "deployment_runtime.json",
+        "service_install_candidate.json",
+        "operational_bootstrap.json",
+    ):
+        shutil.copy2(bundle / "operational" / "control" / name, control / name)
     active = {
         "schema_version": "qrh-active-release/v1",
         "release_id": release_id,
@@ -204,6 +346,8 @@ def restore(bundle_root: Path, target_root: Path) -> dict[str, object]:
         "release_id": release_id,
         "manifest_sha256": release["manifest_sha256"],
         "checkpoint_id": checkpoint["checkpoint_id"],
+        "empty_root_precondition": True,
+        "staged_import_pending_cleanup": staged_under_target,
     }
 
 
@@ -211,8 +355,21 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--empty-target-root", type=Path, required=True)
+    parser.add_argument("--staged-under-target", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(restore(args.bundle_root, args.empty_target_root), sort_keys=True))
+    validate_production_restore_target(args.empty_target_root)
+    if not sys.dont_write_bytecode:
+        raise RestoreError("production restore requires python -B")
+    print(
+        json.dumps(
+            restore(
+                args.bundle_root,
+                args.empty_target_root,
+                staged_under_target=args.staged_under_target,
+            ),
+            sort_keys=True,
+        )
+    )
     return 0
 
 

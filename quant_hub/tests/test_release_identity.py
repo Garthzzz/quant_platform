@@ -18,10 +18,11 @@ from quant_hub.ops.release_identity import (
 H = {
     name: (str(index) * 64)
     for index, name in enumerate(
-        ("tree", "source", "ir", "knowledge", "search", "resources", "state", "tools", "runbook"),
+        ("tree", "source", "ir", "knowledge", "search", "resources", "state", "tools", "runbook", "operational"),
         start=1,
     )
 }
+H["operational"] = "a" * 64
 
 
 def release(release_id: str, *, commit: str) -> dict[str, object]:
@@ -106,6 +107,7 @@ def recovery_manifest(
             "protocol_version": "qrh-restore/v1",
             "tool_inventory_sha256": H["tools"],
             "runbook_sha256": H["runbook"],
+            "operational_bootstrap_sha256": H["operational"],
         },
         "no_secret_attestation": {"verdict": "pass", "scanner_version": "tests/v1"},
     }

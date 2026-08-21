@@ -67,6 +67,10 @@ class DeploymentLocked(DeploymentError):
     pass
 
 
+class PendingActivationRecoveryRequired(DeploymentError):
+    pass
+
+
 @dataclass(frozen=True)
 class DeploymentResult:
     status: str
@@ -156,6 +160,10 @@ class DeploymentLayout:
     @property
     def deployment_lock(self) -> Path:
         return self.locks / "deployment.lock"
+
+    @property
+    def pending_activation(self) -> Path:
+        return self.control / "pending_activation.json"
 
 
 def _now() -> str:
@@ -414,9 +422,15 @@ class DeploymentController:
             if temporary.exists():
                 temporary.unlink()
 
-    def read_active(self) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    def read_active(
+        self, *, allow_pending_activation: bool = False
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
         """只解析唯一 pointer；损坏时不从 receipt 猜 current。"""
 
+        if self.layout.pending_activation.exists() and not allow_pending_activation:
+            raise PendingActivationRecoveryRequired(
+                "pending activation requires explicit controller recovery"
+            )
         try:
             active = validate_active_release(read_json(self.layout.active))
             release, digest, release_path = self._load_release(str(active["release_id"]))
@@ -429,6 +443,252 @@ class DeploymentController:
         ):
             raise ActiveAuthorityCorrupt("active release path escapes controlled releases")
         return active, release
+
+    @staticmethod
+    def _validate_pending_activation(value: object) -> Mapping[str, object]:
+        fields = {
+            "schema_version", "authority", "deployment_attempt_id",
+            "candidate_active", "prior_active", "recovery_protection_receipt_id",
+            "activation_receipt_id", "failure_receipt_id", "created_at",
+            "service_start_nonce", "phase",
+        }
+        if not isinstance(value, dict) or set(value) != fields:
+            raise PendingActivationRecoveryRequired("pending activation schema differs")
+        if (
+            value.get("schema_version") != "qrh-pending-activation/v1"
+            or value.get("authority") != "recovery_coordination_only"
+        ):
+            raise PendingActivationRecoveryRequired("pending activation identity differs")
+        _stable_id(value.get("deployment_attempt_id"), label="deployment_attempt_id")
+        _stable_id(
+            value.get("recovery_protection_receipt_id"),
+            label="recovery_protection_receipt_id",
+        )
+        _stable_id(value.get("activation_receipt_id"), label="activation_receipt_id")
+        _stable_id(value.get("failure_receipt_id"), label="failure_receipt_id")
+        _stable_id(value.get("service_start_nonce"), label="service_start_nonce")
+        validate_active_release(value.get("candidate_active"))
+        validate_active_release(value.get("prior_active"))
+        if not isinstance(value.get("created_at"), str):
+            raise PendingActivationRecoveryRequired("pending activation time is invalid")
+        if value.get("phase") not in {
+            "prepared_before_pointer", "candidate_start_authorized",
+            "prior_recovery_authorized",
+        }:
+            raise PendingActivationRecoveryRequired("pending activation phase is invalid")
+        return _json_clone(value)
+
+    def _load_pending_activation(self) -> Mapping[str, object] | None:
+        if not self.layout.pending_activation.exists():
+            return None
+        try:
+            return self._validate_pending_activation(
+                read_json(self.layout.pending_activation)
+            )
+        except (RuntimeSealError, IdentityContractError, OSError) as error:
+            raise PendingActivationRecoveryRequired(
+                "pending activation journal is unreadable"
+            ) from error
+
+    def _write_pending_activation(self, value: Mapping[str, object]) -> None:
+        journal = self._validate_pending_activation(value)
+        try:
+            write_atomic_new_json(self.layout.pending_activation, journal)
+        except FileExistsError as error:
+            raise PendingActivationRecoveryRequired(
+                "another pending activation already exists"
+            ) from error
+
+    def _remove_pending_activation(self, expected: Mapping[str, object]) -> None:
+        observed = self._load_pending_activation()
+        if observed != expected:
+            raise PendingActivationRecoveryRequired(
+                "pending activation changed before terminal cleanup"
+            )
+        self.layout.pending_activation.unlink()
+
+    def _replace_pending_activation(
+        self, expected: Mapping[str, object], *, phase: str
+    ) -> Mapping[str, object]:
+        observed = self._load_pending_activation()
+        if observed != expected:
+            raise PendingActivationRecoveryRequired(
+                "pending activation changed before phase transition"
+            )
+        updated = self._validate_pending_activation({**expected, "phase": phase})
+        temporary = self.layout.control / f".pending.{uuid.uuid4().hex}.tmp"
+        try:
+            with temporary.open("xb") as handle:
+                handle.write(canonical_manifest_bytes(updated))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.layout.pending_activation)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return updated
+
+    def assert_no_pending_activation(self) -> None:
+        if self._load_pending_activation() is not None:
+            raise PendingActivationRecoveryRequired(
+                "service/controller cannot consume uncommitted active pointer"
+            )
+
+    def pending_service_start_authorization(
+        self, active: Mapping[str, object]
+    ) -> tuple[str, str, str] | None:
+        """Return explicit SCM start args for an exact in-flight identity."""
+
+        journal = self._load_pending_activation()
+        if journal is None:
+            return None
+        observed = validate_active_release(active)
+        if observed == journal["candidate_active"]:
+            role = "candidate"
+            required_phase = "candidate_start_authorized"
+        elif observed == journal["prior_active"]:
+            role = "prior_recovery"
+            required_phase = "prior_recovery_authorized"
+        else:
+            raise PendingActivationRecoveryRequired(
+                "pending service start identity is neither candidate nor prior"
+            )
+        if journal["phase"] != required_phase:
+            raise PendingActivationRecoveryRequired(
+                "pending service start role is not authorized in this phase"
+            )
+        return (
+            role,
+            str(journal["deployment_attempt_id"]),
+            str(journal["service_start_nonce"]),
+        )
+
+    def authorize_service_start(
+        self,
+        *,
+        active: Mapping[str, object],
+        authorization: tuple[str, str, str] | None,
+    ) -> None:
+        journal = self._load_pending_activation()
+        if journal is None:
+            if authorization is not None:
+                raise PendingActivationRecoveryRequired(
+                    "service start authorization has no pending activation"
+                )
+            return
+        if authorization is None:
+            raise PendingActivationRecoveryRequired(
+                "ordinary service start cannot consume pending activation"
+            )
+        expected = self.pending_service_start_authorization(active)
+        if authorization != expected:
+            raise PendingActivationRecoveryRequired(
+                "service start authorization does not bind pending attempt"
+            )
+
+    def recover_pending_activation(
+        self,
+        *,
+        start_release: StartRelease,
+        stop_release: StopRelease,
+    ) -> DeploymentResult | None:
+        """Replay one durable journal without treating it as active authority."""
+
+        with self.locked():
+            journal = self._load_pending_activation()
+            if journal is None:
+                return None
+            attempt_id = str(journal["deployment_attempt_id"])
+            candidate_active = validate_active_release(journal["candidate_active"])
+            prior_active = validate_active_release(journal["prior_active"])
+            activation_id = str(journal["activation_receipt_id"])
+            failure_id = str(journal["failure_receipt_id"])
+            activation_path = self._receipt_path(activation_id)
+            failure_path = self._receipt_path(failure_id)
+            if activation_path.exists() and failure_path.exists():
+                raise PendingActivationRecoveryRequired(
+                    "activation and failure receipts are mutually exclusive"
+                )
+            if activation_path.exists():
+                activation = self._load_receipt(activation_id)
+                if (
+                    activation.get("receipt_type") != "activation"
+                    or activation.get("deployment_attempt_id") != attempt_id
+                    or activation.get("release_manifest_sha256")
+                    != candidate_active["manifest_sha256"]
+                ):
+                    raise PendingActivationRecoveryRequired(
+                        "activation receipt does not close pending journal"
+                    )
+                observed, _ = self.read_active(allow_pending_activation=True)
+                if observed != candidate_active:
+                    raise PendingActivationRecoveryRequired(
+                        "committed activation receipt and active authority differ"
+                    )
+                self._remove_pending_activation(journal)
+                return DeploymentResult(
+                    "activated", str(candidate_active["release_id"]),
+                    str(candidate_active["manifest_sha256"]),
+                    str(prior_active["release_id"]),
+                    str(prior_active["manifest_sha256"]), activation_id,
+                    False, False,
+                )
+
+            candidate_path = self.release_path(str(candidate_active["release_id"]))
+            try:
+                stop_release(candidate_path)
+            except Exception:
+                pass
+            self._write_active(prior_active)
+            prior_path = self.release_path(str(prior_active["release_id"]))
+            _prior_release, prior_hash, _ = self._load_release(
+                str(prior_active["release_id"])
+            )
+            journal = self._replace_pending_activation(
+                journal, phase="prior_recovery_authorized"
+            )
+            rollback_succeeded = (
+                prior_hash == prior_active["manifest_sha256"]
+                and start_release(prior_path, prior_active) is True
+                and self.read_active(allow_pending_activation=True)[0] == prior_active
+            )
+            if not rollback_succeeded:
+                raise PendingActivationRecoveryRequired(
+                    "pending activation could not restore explicit prior"
+                )
+            if failure_path.exists():
+                failure = self._load_receipt(failure_id)
+                if (
+                    failure.get("receipt_type") != "failure"
+                    or failure.get("deployment_attempt_id") != attempt_id
+                    or failure.get("candidate_manifest_sha256")
+                    != candidate_active["manifest_sha256"]
+                    or failure.get("prior_manifest_sha256")
+                    != prior_active["manifest_sha256"]
+                ):
+                    raise PendingActivationRecoveryRequired(
+                        "failure receipt does not close pending journal"
+                    )
+            else:
+                failure = {
+                    "schema_version": "qrh-failure-receipt/v1",
+                    "receipt_type": "failure", "receipt_id": failure_id,
+                    "deployment_attempt_id": attempt_id, "recorded_at": _now(),
+                    "authority": "evidence_only",
+                    "candidate_manifest_sha256": candidate_active["manifest_sha256"],
+                    "prior_manifest_sha256": prior_active["manifest_sha256"],
+                    "verdict": "failed", "failed_phase": "activation_interrupted",
+                    "error_code": "activation_interrupted_recovered",
+                    "rollback": {"attempted": True, "succeeded": True},
+                }
+                authorize_receipt_append(failure)
+                self._append_receipt(failure)
+            self._remove_pending_activation(journal)
+            return DeploymentResult(
+                "failed", str(candidate_active["release_id"]),
+                str(candidate_active["manifest_sha256"]),
+                str(prior_active["release_id"]), str(prior_active["manifest_sha256"]),
+                failure_id, True, True,
+            )
 
     def replay_prior(
         self,
@@ -478,7 +738,7 @@ class DeploymentController:
             raise DeploymentError("receipt filename and identity disagree")
         return receipt
 
-    def _append_event(self, kind: str, fields: Mapping[str, object]) -> None:
+    def _append_event(self, kind: str, fields: Mapping[str, object]) -> str:
         event_id = f"{kind}-{uuid.uuid4().hex}"
         payload = {
             "schema_version": "qrh-deployment-audit-event/v1",
@@ -489,6 +749,46 @@ class DeploymentController:
             "authority": "evidence_only",
         }
         write_atomic_new_json(self.layout.audit_events / f"{event_id}.json", payload)
+        return event_id
+
+    def record_candidate_validation(
+        self,
+        *,
+        release_id: str,
+        expected_manifest_sha256: str,
+        publish_candidate_sha256: str,
+        probe_evidence: Mapping[str, object],
+    ) -> str:
+        """验证 finalized candidate 并追加 evidence-only event；绝不生成 receipt。"""
+
+        with self.locked():
+            _release, digest, _path = self._load_release(release_id)
+            if digest != expected_manifest_sha256:
+                raise CandidateValidationError("finalized candidate manifest hash differs")
+            if re.fullmatch(r"[0-9a-f]{64}", publish_candidate_sha256) is None:
+                raise CandidateValidationError("publish candidate hash is invalid")
+            return self._append_event(
+                "candidate_validation_completed",
+                {
+                    "release_id": release_id,
+                    "release_manifest_sha256": digest,
+                    "publish_candidate_sha256": publish_candidate_sha256,
+                    "status": "candidate_validated_not_active",
+                    "receipt_created": False,
+                    "probe_evidence": dict(probe_evidence),
+                },
+            )
+
+    def verify_finalized_release(
+        self, *, release_id: str, expected_manifest_sha256: str
+    ) -> tuple[Path, str]:
+        """只读复核 finalized release；不生成 event/receipt，不改变 active。"""
+
+        with self.locked():
+            _release, digest, path = self._load_release(release_id)
+            if digest != expected_manifest_sha256:
+                raise CandidateValidationError("finalized candidate manifest hash differs")
+            return path, digest
 
     def record_recovery_protection(
         self,
@@ -606,6 +906,8 @@ class DeploymentController:
             phase = "recovery_protection"
             switch_attempted = False
             protection: Mapping[str, object] | None = None
+            journal: Mapping[str, object] | None = None
+            activation_committed = False
             try:
                 protection = self._load_receipt(recovery_protection_receipt_id)
                 if (
@@ -619,14 +921,35 @@ class DeploymentController:
                 candidate_active = self._active_value(
                     candidate_release_id, candidate_path, candidate_hash
                 )
+                pending = self._validate_pending_activation(
+                    {
+                        "schema_version": "qrh-pending-activation/v1",
+                        "authority": "recovery_coordination_only",
+                        "deployment_attempt_id": deployment_attempt_id,
+                        "candidate_active": candidate_active,
+                        "prior_active": prior_active,
+                        "recovery_protection_receipt_id": recovery_protection_receipt_id,
+                        "activation_receipt_id": f"activation-{uuid.uuid4().hex}",
+                        "failure_receipt_id": f"failure-{uuid.uuid4().hex}",
+                        "service_start_nonce": secrets.token_hex(24),
+                        "phase": "prepared_before_pointer",
+                        "created_at": _now(),
+                    }
+                )
+                phase = "activation_journal"
+                self._write_pending_activation(pending)
+                journal = pending
                 phase = "pointer_switch"
                 switch_attempted = True
                 self._write_active(candidate_active)
-                observed, _ = self.read_active()
+                observed, _ = self.read_active(allow_pending_activation=True)
                 if observed != candidate_active:
                     raise DeploymentError("candidate active pointer verification failed")
 
                 phase = "candidate_start"
+                journal = self._replace_pending_activation(
+                    journal, phase="candidate_start_authorized"
+                )
                 if start_release(candidate_path, candidate_active) is not True:
                     raise DeploymentError("candidate start callback failed")
                 phase = "post_activation"
@@ -637,7 +960,7 @@ class DeploymentController:
                 activation = {
                     "schema_version": "qrh-activation-receipt/v1",
                     "receipt_type": "activation",
-                    "receipt_id": f"activation-{uuid.uuid4().hex}",
+                    "receipt_id": journal["activation_receipt_id"],
                     "deployment_attempt_id": deployment_attempt_id,
                     "recorded_at": _now(),
                     "authority": "evidence_only",
@@ -655,7 +978,7 @@ class DeploymentController:
                     },
                     "post_activation_verification": dict(gates),
                 }
-                observed, _ = self.read_active()
+                observed, _ = self.read_active(allow_pending_activation=True)
                 authorize_receipt_append(
                     activation,
                     observed_active_release=observed,
@@ -675,6 +998,8 @@ class DeploymentController:
                 # 成功 activation receipt 是最后一个可能失败的持久化动作；一旦
                 # append 成功，后续不得再进入 rollback/failure 路径。
                 self._append_receipt(activation)
+                activation_committed = True
+                self._remove_pending_activation(journal)
                 return DeploymentResult(
                     status="activated",
                     candidate_release_id=candidate_release_id,
@@ -686,6 +1011,10 @@ class DeploymentController:
                     rollback_succeeded=False,
                 )
             except Exception:
+                if activation_committed:
+                    raise PendingActivationRecoveryRequired(
+                        "activation committed; pending journal cleanup must replay"
+                    )
                 return self._activation_failed(
                     candidate_release_id=candidate_release_id,
                     candidate_hash=candidate_hash,
@@ -697,6 +1026,7 @@ class DeploymentController:
                     switch_attempted=switch_attempted,
                     start_release=start_release,
                     stop_release=stop_release,
+                    journal=journal,
                 )
 
     def _activation_failed(
@@ -712,6 +1042,7 @@ class DeploymentController:
         switch_attempted: bool,
         start_release: StartRelease,
         stop_release: StopRelease,
+        journal: Mapping[str, object] | None,
     ) -> DeploymentResult:
         rollback_attempted = switch_attempted
         rollback_succeeded = False
@@ -724,8 +1055,14 @@ class DeploymentController:
             try:
                 self._write_active(prior_active)
                 prior_path = self.release_path(str(prior_active["release_id"]))
+                if journal is not None:
+                    journal = self._replace_pending_activation(
+                        journal, phase="prior_recovery_authorized"
+                    )
                 restarted = start_release(prior_path, prior_active) is True
-                observed, observed_release = self.read_active()
+                observed, observed_release = self.read_active(
+                    allow_pending_activation=journal is not None
+                )
                 rollback_succeeded = (
                     stopped
                     and restarted
@@ -738,7 +1075,11 @@ class DeploymentController:
         failure = {
             "schema_version": "qrh-failure-receipt/v1",
             "receipt_type": "failure",
-            "receipt_id": f"failure-{uuid.uuid4().hex}",
+            "receipt_id": (
+                journal["failure_receipt_id"]
+                if journal is not None
+                else f"failure-{uuid.uuid4().hex}"
+            ),
             "deployment_attempt_id": deployment_attempt_id,
             "recorded_at": _now(),
             "authority": "evidence_only",
@@ -754,6 +1095,11 @@ class DeploymentController:
         }
         authorize_receipt_append(failure)
         self._append_receipt(failure)
+        # A failure receipt is evidence, not authority.  If explicit prior
+        # restart did not complete, keep the coordination journal so a later
+        # controller can replay the same prior and reuse this one receipt.
+        if journal is not None and rollback_succeeded:
+            self._remove_pending_activation(journal)
         result = DeploymentResult(
             status="failed",
             candidate_release_id=candidate_release_id,

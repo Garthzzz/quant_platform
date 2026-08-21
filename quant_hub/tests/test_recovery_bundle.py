@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
 import unittest
 import subprocess
@@ -19,8 +21,11 @@ from quant_hub.ops.recovery_bundle import (
     finalize_recovery_receipt,
     restore_recovery_bundle,
     verify_recovery_bundle,
+    _scan_no_secret,
+    _scan_sqlite_logical_text,
 )
 from quant_hub.ops.release_identity import canonical_manifest_bytes, manifest_sha256
+from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
 
 
 def release_manifest() -> dict[str, object]:
@@ -92,6 +97,53 @@ class RecoveryBundleTests(unittest.TestCase):
         self.restore_tool.write_text("# restore entrypoint\n", encoding="utf-8")
         self.runbook = self.root / "RUNBOOK.md"
         self.runbook.write_text("# 恢复\n\n机器验证后执行。\n", encoding="utf-8")
+        self.operational = self.root / "operational-source"
+        operational_files = {
+            "tooling/python/Lib/site-packages/win32/pythonservice.exe": b"python-service",
+            "tooling/python/python.exe": b"python-runtime",
+            "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py": b"service-host",
+            "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py": b"service-entry",
+            "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py": b"deploy-cli",
+            "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py": b"recovery-cli",
+            "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py": b"access-gate",
+            "control/deployment_runtime.json": canonical_manifest_bytes(
+                {"schema_version": "qrh-vm-deploy-runtime/v1", "fixture": True}
+            ),
+        }
+        for relative, payload in operational_files.items():
+            path = self.operational.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+        production = Path(r"D:\quant\quant_platform")
+        bindings = {
+            "service_executable": "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+            "service_python": "tooling/python/python.exe",
+            "service_host_module": "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py",
+            "service_entry_module": "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+            "deployment_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py",
+            "publish_recovery_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py",
+            "access_gate_module": "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py",
+            "deployment_runtime": "control/deployment_runtime.json",
+        }
+        candidate = {
+            "schema_version": "qrh-windows-service-install-candidate/v1",
+            "service_name": "QuantResearchHub",
+            "python_class": "quant_hub.ops.windows_service.QuantResearchHubWindowsService",
+            "start_type": "automatic",
+        }
+        for field, relative in bindings.items():
+            source = self.operational.joinpath(*relative.split("/"))
+            candidate[field] = str(production.joinpath(*relative.split("/")))
+            candidate[f"{field}_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+        package = self.operational / "tooling/python/Lib/site-packages/quant_hub"
+        candidate["quant_hub_package_root"] = str(
+            production / "tooling/python/Lib/site-packages/quant_hub"
+        )
+        candidate["quant_hub_package_inventory_sha256"] = (
+            quant_hub_package_inventory_sha256(package)
+        )
+        candidate_path = self.operational / "control" / "service_install_candidate.json"
+        candidate_path.write_bytes(canonical_manifest_bytes(candidate))
 
     def _build(self):
         return build_recovery_bundle(
@@ -102,6 +154,7 @@ class RecoveryBundleTests(unittest.TestCase):
             created_at="2026-08-21T08:00:00+08:00",
             restore_tool=self.restore_tool,
             runbook=self.runbook,
+            operational_root=self.operational,
             compatibility={"verdict": "compatible", "state_schema": 2},
         )
 
@@ -172,6 +225,7 @@ class RecoveryBundleTests(unittest.TestCase):
             created_at="2026-08-21T08:00:00+08:00",
             restore_tool=restore_tool,
             runbook=self.runbook,
+            operational_root=self.operational,
             compatibility={"verdict": "compatible", "state_schema": 2},
         )
         target = self.root / "stdlib-empty"
@@ -179,15 +233,20 @@ class RecoveryBundleTests(unittest.TestCase):
         copied_tool = bundle.root / "tools" / "restore" / restore_tool.name
         environment = dict(os.environ)
         environment.pop("PYTHONPATH", None)
+        loader = (
+            "import importlib.util,json,pathlib;"
+            f"p=pathlib.Path({str(copied_tool)!r});"
+            "s=importlib.util.spec_from_file_location('standalone_restore',p);"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            f"print(json.dumps(m.restore(pathlib.Path({str(bundle.root)!r}),pathlib.Path({str(target)!r})),sort_keys=True))"
+        )
         result = subprocess.run(
             [
                 sys.executable,
                 "-I",
-                str(copied_tool),
-                "--bundle-root",
-                str(bundle.root),
-                "--empty-target-root",
-                str(target),
+                "-B",
+                "-c",
+                loader,
             ],
             cwd=self.root,
             env=environment,
@@ -230,6 +289,111 @@ class RecoveryBundleTests(unittest.TestCase):
         self.assertNotIn(secret, str(context.exception))
         self.assertFalse(any(self.recovery_root.iterdir()))
 
+    def test_reviewed_cookie_source_name_is_scanned_but_state_file_is_blocked(self) -> None:
+        source = self.root / "runtime" / "requests" / "cookies.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("def cookie_policy():\n    return 'public-code'\n", encoding="utf-8")
+        report = _scan_no_secret(self.root, [source])
+        self.assertEqual("pass", report["verdict"])
+        self.assertEqual("runtime/requests/cookies.py", report["scanned"][0]["path"])
+
+        state = self.root / "runtime" / "browser" / "cookies.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(RecoveryBundleError, "forbidden_secret_filename"):
+            _scan_no_secret(self.root, [state])
+
+    def test_binary_utf16_and_sqlite_logical_secrets_are_blocked_without_values(self) -> None:
+        payloads = {
+            "opaque.bin": ("ghp_" + "A" * 32).encode("ascii"),
+            "wide.dat": ("sk-proj-" + "B" * 32).encode("utf-16-le"),
+        }
+        for name, payload in payloads.items():
+            with self.subTest(name=name):
+                target = self.release / "resources" / name
+                target.write_bytes(payload)
+                with self.assertRaises(RecoveryBundleError) as caught:
+                    self._build()
+                self.assertNotIn(payload[:12].decode("ascii", errors="ignore"), str(caught.exception))
+                self.assertFalse(any(self.recovery_root.iterdir()))
+                target.unlink()
+
+        database = self.root / "state" / "sqlite-secret.sqlite3"
+        secret = "Authorization: Bearer " + "C" * 36
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE notes(body TEXT)")
+            connection.execute("INSERT INTO notes(body) VALUES (?)", (secret,))
+            connection.commit()
+        finally:
+            connection.close()
+        secret_checkpoint = create_sqlite_checkpoint(
+            sources={"comments": database},
+            checkpoint_root=self.root / "secret-checkpoints",
+            checkpoint_id="checkpoint-secret-logical",
+            state_authority_id="state-test",
+            captured_under_release_id="release-test-v1",
+            captured_under_manifest_sha256=manifest_sha256(self.manifest),
+            captured_at=datetime(2026, 8, 21, 1, tzinfo=UTC),
+        )
+        with self.assertRaises(RecoveryBundleError) as caught:
+            build_recovery_bundle(
+                release_root=self.release,
+                checkpoint_root=secret_checkpoint.root,
+                recovery_root=self.recovery_root,
+                bundle_id="bundle-sqlite-secret",
+                created_at="2026-08-21T08:00:00+08:00",
+                restore_tool=self.restore_tool,
+                runbook=self.runbook,
+                operational_root=self.operational,
+                compatibility={"verdict": "compatible", "state_schema": 2},
+            )
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertFalse(any(self.recovery_root.iterdir()))
+
+    def test_odd_offset_utf16_secret_crossing_stream_chunk_is_blocked(self) -> None:
+        secret = "Authorization: Bearer " + "D" * 40
+        # 1 MiB is even; subtracting 31 makes the UTF-16 code-unit alignment
+        # odd and places the token across the scanner's block boundary.
+        start = 1024 * 1024 - 31
+        payload = b"x" * start + secret.encode("utf-16-le") + b"tail"
+        target = self.root / "odd-offset-cross-boundary.bin"
+        target.write_bytes(payload)
+        with self.assertRaises(RecoveryBundleError) as caught:
+            _scan_no_secret(self.root, [target])
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIn("authorization_bearer", str(caught.exception))
+
+    def test_sqlite_blob_scans_utf8_and_both_utf16_alignments(self) -> None:
+        database = self.root / "state" / "blob-encodings.sqlite3"
+        github = "ghp_" + "E" * 32
+        deepseek = "sk-proj-" + "F" * 32
+        bearer = "Authorization: Bearer " + "G" * 40
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE payloads(body BLOB)")
+            connection.executemany(
+                "INSERT INTO payloads(body) VALUES (?)",
+                (
+                    (github.encode("utf-8"),),
+                    (b"\x00" + deepseek.encode("utf-16-le"),),
+                    (b"\x00" + bearer.encode("utf-16-be"),),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        kinds = _scan_sqlite_logical_text(database)
+        self.assertTrue(
+            {"github_token", "deepseek_openai_key", "authorization_bearer"}
+            .issubset(kinds)
+        )
+        with self.assertRaises(RecoveryBundleError) as caught:
+            _scan_no_secret(self.root, [database])
+        rendered = str(caught.exception)
+        for secret in (github, deepseek, bearer):
+            self.assertNotIn(secret, rendered)
+
     def test_nonempty_restore_target_is_rejected(self) -> None:
         bundle = self._build()
         target = self.root / "not-empty"
@@ -237,6 +401,81 @@ class RecoveryBundleTests(unittest.TestCase):
         (target / "keep.txt").write_text("keep", encoding="utf-8")
         with self.assertRaisesRegex(RecoveryBundleError, "real empty"):
             restore_recovery_bundle(bundle_root=bundle.root, empty_target_root=target)
+
+    def test_off_host_bundle_restores_only_empty_d_fixture_and_leaves_legacy_c_untouched(self) -> None:
+        """Developer recovery storage and the sole .240 target are distinct roles."""
+
+        bundle = self._build()
+        bundle_before = {
+            path.relative_to(bundle.root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in bundle.root.rglob("*")
+            if path.is_file()
+        }
+        production_vm = self.root / "vm-10.5.1.240"
+        target = production_vm / "D" / "quant" / "quant_platform"
+        target.mkdir(parents=True)
+        legacy_c = production_vm / "C" / "quant_platform"
+        legacy_c.mkdir(parents=True)
+        legacy_marker = legacy_c / "V39-online.marker"
+        legacy_marker.write_bytes(b"legacy-v39-remains-online")
+        legacy_before = hashlib.sha256(legacy_marker.read_bytes()).hexdigest()
+
+        restored = restore_recovery_bundle(
+            bundle_root=bundle.root,
+            empty_target_root=target,
+        )
+
+        self.assertEqual("release-test-v1", restored.release_id)
+        self.assertEqual(
+            legacy_before, hashlib.sha256(legacy_marker.read_bytes()).hexdigest()
+        )
+        self.assertEqual(
+            bundle_before,
+            {
+                path.relative_to(bundle.root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in bundle.root.rglob("*")
+                if path.is_file()
+            },
+        )
+        self.assertEqual(
+            {"control", "releases", "state", "tooling", "tools"},
+            {path.name for path in target.iterdir()},
+        )
+
+    def test_missing_or_tampered_operational_bootstrap_cannot_recover(self) -> None:
+        runtime = self.operational / "tooling" / "python" / "python.exe"
+        original = runtime.read_bytes()
+        runtime.unlink()
+        with self.assertRaisesRegex(RecoveryBundleError, "required file"):
+            self._build()
+        runtime.write_bytes(original)
+
+        bundle = self._build()
+        bundled_runtime = (
+            bundle.root / "operational" / "tooling" / "python" / "python.exe"
+        )
+        bundled_runtime.write_bytes(b"tampered-operational-runtime")
+        self.assertFalse(verify_recovery_bundle(bundle.root).valid)
+        target = self.root / "tampered-empty"
+        target.mkdir()
+        with self.assertRaisesRegex(RecoveryBundleError, "not restorable"):
+            restore_recovery_bundle(bundle_root=bundle.root, empty_target_root=target)
+        self.assertFalse(any(target.iterdir()))
+
+    def test_restore_rejects_reparse_in_target_parent_chain(self) -> None:
+        bundle = self._build()
+        target = self.root / "vm-10.5.1.240" / "D" / "quant" / "quant_platform"
+        target.mkdir(parents=True)
+        with patch(
+            "quant_hub.ops.recovery_bundle._path_has_reparse",
+            return_value=True,
+        ):
+            with self.assertRaisesRegex(RecoveryBundleError, "real empty"):
+                restore_recovery_bundle(
+                    bundle_root=bundle.root,
+                    empty_target_root=target,
+                )
+        self.assertFalse(any(target.iterdir()))
 
     def test_restore_verification_scratch_stays_under_empty_target(self) -> None:
         bundle = self._build()
@@ -260,6 +499,49 @@ class RecoveryBundleTests(unittest.TestCase):
             all(path is not None and path.is_relative_to(target) for path in observed)
         )
         self.assertFalse((target / ".recovery-verify-scratch").exists())
+
+    def test_standalone_restore_accepts_only_its_fixed_d_import_staging(self) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        restore_tool = project_root / "tools" / "release" / "restore_cold_bundle.py"
+        bundle = build_recovery_bundle(
+            release_root=self.release,
+            checkpoint_root=self.checkpoint.root,
+            recovery_root=self.recovery_root,
+            bundle_id="bundle-staged-v1",
+            created_at="2026-08-21T08:00:00+08:00",
+            restore_tool=restore_tool,
+            runbook=self.runbook,
+            operational_root=self.operational,
+            compatibility={"verdict": "compatible", "state_schema": 2},
+        )
+        target = self.root / "vm-240-staged" / "D" / "quant" / "quant_platform"
+        import_parent = target / "tmp" / "recovery-import"
+        import_parent.mkdir(parents=True)
+        staged = import_parent / bundle.root.name
+        shutil.copytree(bundle.root, staged)
+        runtime_tmp = target / "tmp" / "recovery-runtime"
+        runtime_tmp.mkdir()
+        spec = importlib.util.spec_from_file_location(
+            "standalone_staged_restore", restore_tool
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.restore(staged, target, staged_under_target=True)
+        self.assertTrue(result["empty_root_precondition"])
+        self.assertTrue(result["staged_import_pending_cleanup"])
+        self.assertTrue((target / "releases" / "release-test-v1").is_dir())
+        self.assertTrue((target / "tooling" / "python" / "python.exe").is_file())
+
+        rejected = self.root / "vm-240-rejected" / "D" / "quant" / "quant_platform"
+        rejected_import = rejected / "tmp" / "recovery-import"
+        rejected_import.mkdir(parents=True)
+        rejected_staged = rejected_import / bundle.root.name
+        shutil.copytree(bundle.root, rejected_staged)
+        (rejected / "unexpected-sibling").mkdir()
+        with self.assertRaisesRegex(module.RestoreError, "non-staging"):
+            module.restore(rejected_staged, rejected, staged_under_target=True)
+        self.assertFalse((rejected / "releases").exists())
 
 
 if __name__ == "__main__":

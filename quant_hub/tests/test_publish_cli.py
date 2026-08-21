@@ -96,7 +96,7 @@ class FakeActions:
             str(candidate["candidate_manifest_sha256"]),
             "activated",
             "activation-1",
-            "activation",
+            "activation_receipt",
         )
 
 
@@ -109,7 +109,7 @@ class PublishPipelineTests(unittest.TestCase):
         self.assertEqual("activated", result.status)
         self.assertEqual(1, fake.push_count)
         self.assertEqual(
-            ["inspect", "public", "tests", "freeze", "inspect", "push", "ci", "transport", "deploy"],
+            ["inspect", "tests", "public", "freeze", "inspect", "push", "ci", "transport", "deploy"],
             [name for name, _ in fake.calls],
         )
         self.assertTrue(all(sha == SHA_A for _, sha in fake.calls))
@@ -124,7 +124,7 @@ class PublishPipelineTests(unittest.TestCase):
                 str(candidate["candidate_manifest_sha256"]),
                 "candidate_validated",
                 "candidate-validation-1",
-                "candidate_validation",
+                "candidate_validation_event",
             )
 
         actions = fake.bundle()
@@ -143,7 +143,7 @@ class PublishPipelineTests(unittest.TestCase):
                 str(candidate["candidate_manifest_sha256"]),
                 "candidate_validated",
                 "candidate-validation-1",
-                "candidate_validation",
+                "candidate_validation_event",
             )
 
         actions = fake.bundle()
@@ -297,7 +297,7 @@ class PublishDryRunTests(unittest.TestCase):
             self.assertEqual(str(repository), plan["project_root"])
             self.assertEqual(7, len(plan["steps"]))
 
-    def test_standalone_cli_refuses_non_dry_run(self) -> None:
+    def test_standalone_cli_requires_protected_config_for_non_dry_run(self) -> None:
         with self.assertRaises(SystemExit) as caught:
             main(["--project-root", str(Path.cwd())])
         self.assertEqual(2, caught.exception.code)

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from quant_hub.archive.contracts import (
     ActorInput,
@@ -38,6 +38,25 @@ from quant_hub.presentation import ArchivePresentation
 
 class IdempotencyConflict(RuntimeError):
     pass
+
+
+class CommentIdentityAuthority(Protocol):
+    """Read-only source authority used by one comment command surface.
+
+    Archive remains the default authority.  The generic research namespace
+    supplies its immutable catalog here so it can reuse the same external
+    SQLite facts/events without pretending that generic documents belong to
+    the legacy Archive database.
+    """
+
+    def comment_research_exists(self, research_id: str) -> bool: ...
+
+    def validate_comment_target(
+        self,
+        research_id: str,
+        target: CommentTargetInput,
+        material: dict[str, Any],
+    ) -> str | None: ...
 
 
 ARCHIVE_COMPLETION_REVIEW_REQUIREMENTS_HASH = stable_sha256(
@@ -97,12 +116,14 @@ class ArchiveCollaboration:
         settings: Settings,
         *,
         comment_database_path: Path | None = None,
+        comment_identity_authority: CommentIdentityAuthority | None = None,
     ):
         self.settings = settings
         self.comment_database_path = (
             comment_database_path.resolve() if comment_database_path is not None else None
         )
         self.presentation = ArchivePresentation.default()
+        self.comment_identity_authority = comment_identity_authority
 
     @contextmanager
     def _comment_connection(self) -> Iterator[sqlite3.Connection]:
@@ -145,6 +166,11 @@ class ArchiveCollaboration:
         material: dict[str, Any],
     ) -> str | None:
         """Validate stable identities and exact origin bytes against Archive."""
+
+        if self.comment_identity_authority is not None:
+            return self.comment_identity_authority.validate_comment_target(
+                research_id, target, material
+            )
 
         if material["target_kind"] == "research":
             return None
@@ -490,10 +516,15 @@ class ArchiveCollaboration:
                     actor_id=actor_id,
                     outcome=CommandOutcome(False, 422, error_code="invalid_comment", error_message="评论内容不能为空且不得超过 8000 字符。"),
                 )
-            with archive_connection(self.settings) as archive:
-                research_exists = archive.execute(
-                    "SELECT 1 FROM research WHERE research_id=?", (research_id,)
-                ).fetchone() is not None
+            if self.comment_identity_authority is not None:
+                research_exists = self.comment_identity_authority.comment_research_exists(
+                    research_id
+                )
+            else:
+                with archive_connection(self.settings) as archive:
+                    research_exists = archive.execute(
+                        "SELECT 1 FROM research WHERE research_id=?", (research_id,)
+                    ).fetchone() is not None
             if not research_exists:
                 return self._record(
                     connection,

@@ -12,10 +12,14 @@ from werkzeug.exceptions import HTTPException
 from quant_hub.archive.catalog import ArchiveCatalog
 from quant_hub.collaboration.comment_store import initialize_comment_store
 from quant_hub.collaboration.service import ArchiveCollaboration
-from quant_hub.config import Settings
+from quant_hub.config import ConfigurationError, Settings
 from quant_hub.evidence.service import EvidenceQueryService
 from quant_hub.evidence.web import create_evidence_blueprint
-from quant_hub.generic_research import GenericResearchCatalog, generic_research_web
+from quant_hub.generic_research import (
+    GenericResearchCatalog,
+    generic_research_web,
+    load_generic_catalog_from_release,
+)
 from quant_hub.paper_lab import register_paper_lab
 from quant_hub.research_workspace import ResearchWorkspace
 from quant_hub.web.routes import api_error, api_v1, web
@@ -51,6 +55,7 @@ def create_app(
         COMMENT_DATABASE_PATH=None,
         RESEARCH_WORKSPACE_DATABASE_PATH=None,
         GENERIC_RESEARCH_CATALOG=None,
+        GENERIC_RESEARCH_RELEASE_ROOT=None,
     )
     if config:
         app.config.update(config)
@@ -70,6 +75,22 @@ def create_app(
         if configured_comment_database is not None
         else None
     )
+    configured_generic_release_root = app.config.get("GENERIC_RESEARCH_RELEASE_ROOT")
+    if (
+        comment_database_path is not None
+        and configured_generic_release_root is not None
+    ):
+        release_root = Path(configured_generic_release_root).resolve()
+        try:
+            comment_database_path.resolve().relative_to(release_root)
+        except ValueError:
+            pass
+        else:
+            # Reject before initialize_comment_store can create a file or WAL
+            # sidecar beneath an immutable release.
+            raise ConfigurationError(
+                "COMMENT_DATABASE_PATH 不得位于 immutable release 内。"
+            )
     configured_workspace_database = app.config.get("RESEARCH_WORKSPACE_DATABASE_PATH")
     workspace_database_path = (
         Path(configured_workspace_database)
@@ -98,10 +119,27 @@ def create_app(
         app.config["TRUSTED_ORIGINS"]
     )
     generic_catalog = app.config.get("GENERIC_RESEARCH_CATALOG")
+    generic_release_root = configured_generic_release_root
+    if generic_catalog is not None and generic_release_root is not None:
+        raise TypeError(
+            "GENERIC_RESEARCH_CATALOG and GENERIC_RESEARCH_RELEASE_ROOT are mutually exclusive"
+        )
+    if generic_release_root is not None:
+        generic_catalog = load_generic_catalog_from_release(Path(generic_release_root))
     if generic_catalog is not None:
         if not isinstance(generic_catalog, GenericResearchCatalog):
             raise TypeError("GENERIC_RESEARCH_CATALOG must be a GenericResearchCatalog")
+        if comment_database_path is None and not app.testing:
+            raise ConfigurationError(
+                "生产 generic research 必须显式配置 release 外 COMMENT_DATABASE_PATH。"
+            )
         app.extensions["generic_research_catalog"] = generic_catalog
+        if comment_database_path is not None:
+            app.extensions["generic_research_collaboration"] = ArchiveCollaboration(
+                resolved,
+                comment_database_path=comment_database_path,
+                comment_identity_authority=generic_catalog,
+            )
 
     app.register_blueprint(web)
     app.register_blueprint(api_v1)

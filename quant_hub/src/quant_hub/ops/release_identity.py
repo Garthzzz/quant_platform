@@ -481,7 +481,12 @@ def validate_recovery_manifest(value: object) -> Mapping[str, object]:
     restore = _mapping(recovery["restore"], label="recovery_manifest.restore")
     _required(
         restore,
-        ("protocol_version", "tool_inventory_sha256", "runbook_sha256"),
+        (
+            "protocol_version",
+            "tool_inventory_sha256",
+            "runbook_sha256",
+            "operational_bootstrap_sha256",
+        ),
         label="recovery_manifest.restore",
     )
     _text(restore["protocol_version"], label="recovery restore protocol_version")

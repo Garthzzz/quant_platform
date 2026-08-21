@@ -15,13 +15,15 @@ from quant_hub.ops.deployment import (
     DeploymentError,
     DeploymentFailed,
     DeploymentLocked,
+    PendingActivationRecoveryRequired,
 )
 from quant_hub.ops.release_identity import manifest_sha256
 from quant_hub.runtime_seal import read_json
 
 
 ROOT = Path(__file__).resolve().parents[2]
-H = {name: str(index) * 64 for index, name in enumerate(("tree", "source", "ir", "knowledge", "search", "state", "tools", "runbook"), start=1)}
+H = {name: str(index) * 64 for index, name in enumerate(("tree", "source", "ir", "knowledge", "search", "state", "tools", "runbook", "operational"), start=1)}
+H["operational"] = "a" * 64
 
 
 def iso_before(seconds: int = 5) -> str:
@@ -155,6 +157,7 @@ def recovery_manifest(
             "protocol_version": "qrh-restore/v1",
             "tool_inventory_sha256": H["tools"],
             "runbook_sha256": H["runbook"],
+            "operational_bootstrap_sha256": H["operational"],
         },
         "no_secret_attestation": {
             "verdict": "pass",
@@ -249,6 +252,229 @@ class DeploymentFixture:
 
 
 class DeploymentControllerTests(unittest.TestCase):
+    def test_pending_activation_crash_cuts_recover_prior_with_one_failure(self) -> None:
+        for cut in ("before_pointer", "candidate_start", "post_probe", "receipt_append"):
+            with self.subTest(cut=cut):
+                fixture = DeploymentFixture()
+                self.addCleanup(fixture.close)
+                prior = fixture.finalize("release-r0", commit_character="a")
+                candidate = fixture.finalize("release-r1", commit_character="b")
+                fixture.seed_prior(prior)
+                protection = fixture.protect(
+                    prior, candidate, attempt_id=f"crash-{cut}"
+                )
+                original_write = fixture.controller._write_active
+                original_append = fixture.controller._append_receipt
+
+                def write(active):
+                    if cut == "before_pointer" and active["release_id"] == "release-r1":
+                        raise SystemExit("crash-before-pointer")
+                    original_write(active)
+
+                def start(path, _active):
+                    if cut == "candidate_start" and path.name == "release-r1":
+                        raise SystemExit("crash-candidate-start")
+                    return True
+
+                def probe(_path, _active):
+                    if cut == "post_probe":
+                        raise SystemExit("crash-post-probe")
+                    return {
+                        "health": True,
+                        "critical_functions": True,
+                        "writer_fence": True,
+                    }
+
+                def append(receipt):
+                    if cut == "receipt_append" and receipt["receipt_type"] == "activation":
+                        raise SystemExit("crash-receipt-append")
+                    original_append(receipt)
+
+                with mock.patch.object(fixture.controller, "_write_active", side_effect=write), mock.patch.object(
+                    fixture.controller, "_append_receipt", side_effect=append
+                ), self.assertRaises(SystemExit):
+                    fixture.controller.activate(
+                        candidate_release_id="release-r1",
+                        deployment_attempt_id=f"crash-{cut}",
+                        recovery_protection_receipt_id=str(protection["receipt_id"]),
+                        start_release=start,
+                        stop_release=lambda _path: None,
+                        post_activation_probe=probe,
+                    )
+                self.assertTrue(fixture.controller.layout.pending_activation.is_file())
+                with self.assertRaises(PendingActivationRecoveryRequired):
+                    fixture.controller.read_active()
+                restarted = DeploymentController(fixture.root)
+                result = restarted.recover_pending_activation(
+                    start_release=lambda _path, _active: True,
+                    stop_release=lambda _path: None,
+                )
+                self.assertEqual("failed", result.status)
+                self.assertFalse(restarted.layout.pending_activation.exists())
+                active, _ = restarted.read_active()
+                self.assertEqual("release-r0", active["release_id"])
+                terminal = [
+                    read_json(path)["receipt_type"]
+                    for path in restarted.layout.audit_receipts.glob("*.json")
+                    if read_json(path)["receipt_type"] in {"activation", "failure"}
+                ]
+                self.assertEqual(["failure"], terminal)
+
+    def test_committed_activation_crash_only_cleans_journal_on_replay(self) -> None:
+        fixture = DeploymentFixture()
+        self.addCleanup(fixture.close)
+        prior = fixture.finalize("release-r0", commit_character="a")
+        candidate = fixture.finalize("release-r1", commit_character="b")
+        fixture.seed_prior(prior)
+        protection = fixture.protect(prior, candidate, attempt_id="crash-cleanup")
+        with mock.patch.object(
+            fixture.controller,
+            "_remove_pending_activation",
+            side_effect=SystemExit("crash-after-activation-receipt"),
+        ), self.assertRaises(SystemExit):
+            fixture.controller.activate(
+                candidate_release_id="release-r1",
+                deployment_attempt_id="crash-cleanup",
+                recovery_protection_receipt_id=str(protection["receipt_id"]),
+                start_release=lambda _path, _active: True,
+                stop_release=lambda _path: None,
+                post_activation_probe=lambda _path, _active: {
+                    "health": True, "critical_functions": True, "writer_fence": True,
+                },
+            )
+        restarted = DeploymentController(fixture.root)
+        result = restarted.recover_pending_activation(
+            start_release=lambda _path, _active: self.fail("must not restart committed activation"),
+            stop_release=lambda _path: self.fail("must not stop committed activation"),
+        )
+        self.assertEqual("activated", result.status)
+        active, _ = restarted.read_active()
+        self.assertEqual("release-r1", active["release_id"])
+        terminal = [
+            read_json(path)["receipt_type"]
+            for path in restarted.layout.audit_receipts.glob("*.json")
+            if read_json(path)["receipt_type"] in {"activation", "failure"}
+        ]
+        self.assertEqual(["activation"], terminal)
+
+    def test_failure_receipt_cleanup_crash_reuses_same_receipt(self) -> None:
+        fixture = DeploymentFixture()
+        self.addCleanup(fixture.close)
+        prior = fixture.finalize("release-r0", commit_character="a")
+        candidate = fixture.finalize("release-r1", commit_character="b")
+        fixture.seed_prior(prior)
+        protection = fixture.protect(prior, candidate, attempt_id="failure-cleanup")
+        original_remove = fixture.controller._remove_pending_activation
+        crashed = False
+
+        def remove(journal):
+            nonlocal crashed
+            failure_exists = fixture.controller._receipt_path(
+                str(journal["failure_receipt_id"])
+            ).exists()
+            if failure_exists and not crashed:
+                crashed = True
+                raise SystemExit("crash-after-failure-receipt")
+            original_remove(journal)
+
+        with mock.patch.object(
+            fixture.controller, "_remove_pending_activation", side_effect=remove
+        ), self.assertRaises(SystemExit):
+            fixture.controller.activate(
+                candidate_release_id="release-r1",
+                deployment_attempt_id="failure-cleanup",
+                recovery_protection_receipt_id=str(protection["receipt_id"]),
+                start_release=lambda _path, _active: True,
+                stop_release=lambda _path: None,
+                post_activation_probe=lambda _path, _active: {
+                    "health": False, "critical_functions": True, "writer_fence": True,
+                },
+            )
+        restarted = DeploymentController(fixture.root)
+        before = {
+            path.name for path in restarted.layout.audit_receipts.glob("failure-*.json")
+        }
+        result = restarted.recover_pending_activation(
+            start_release=lambda _path, _active: True,
+            stop_release=lambda _path: None,
+        )
+        after = {
+            path.name for path in restarted.layout.audit_receipts.glob("failure-*.json")
+        }
+        self.assertEqual(before, after)
+        self.assertEqual({f"{result.receipt_id}.json"}, after)
+
+    def test_pending_service_start_is_exact_role_attempt_phase_and_nonce(self) -> None:
+        fixture = DeploymentFixture()
+        self.addCleanup(fixture.close)
+        prior = fixture.finalize("release-r0", commit_character="a")
+        candidate = fixture.finalize("release-r1", commit_character="b")
+        fixture.seed_prior(prior)
+        protection = fixture.protect(prior, candidate, attempt_id="service-auth")
+        observed_roles = []
+
+        def start(_path, active):
+            with self.assertRaises(PendingActivationRecoveryRequired):
+                fixture.controller.authorize_service_start(
+                    active=active, authorization=None
+                )
+            authorization = fixture.controller.pending_service_start_authorization(active)
+            fixture.controller.authorize_service_start(
+                active=active, authorization=authorization
+            )
+            observed_roles.append(authorization[0] if authorization else None)
+            return True
+
+        with self.assertRaises(DeploymentFailed):
+            fixture.controller.activate(
+                candidate_release_id="release-r1",
+                deployment_attempt_id="service-auth",
+                recovery_protection_receipt_id=str(protection["receipt_id"]),
+                start_release=start,
+                stop_release=lambda _path: None,
+                post_activation_probe=lambda _path, _active: {
+                    "health": False, "critical_functions": True, "writer_fence": True,
+                },
+            )
+        self.assertEqual(["candidate", "prior_recovery"], observed_roles)
+
+    def test_failed_prior_restart_keeps_recovery_journal_for_replay(self) -> None:
+        fixture = DeploymentFixture()
+        self.addCleanup(fixture.close)
+        prior = fixture.finalize("release-r0", commit_character="a")
+        candidate = fixture.finalize("release-r1", commit_character="b")
+        fixture.seed_prior(prior)
+        protection = fixture.protect(prior, candidate, attempt_id="retry-prior")
+
+        def start(path, _active):
+            return path.name == "release-r1"
+
+        with self.assertRaises(DeploymentFailed) as caught:
+            fixture.controller.activate(
+                candidate_release_id="release-r1",
+                deployment_attempt_id="retry-prior",
+                recovery_protection_receipt_id=str(protection["receipt_id"]),
+                start_release=start,
+                stop_release=lambda _path: None,
+                post_activation_probe=lambda _path, _active: {
+                    "health": False, "critical_functions": True, "writer_fence": True,
+                },
+            )
+        self.assertFalse(caught.exception.result.rollback_succeeded)
+        self.assertTrue(fixture.controller.layout.pending_activation.is_file())
+        with self.assertRaises(PendingActivationRecoveryRequired):
+            fixture.controller.read_active()
+
+        restarted = DeploymentController(fixture.root)
+        result = restarted.recover_pending_activation(
+            start_release=lambda _path, _active: True,
+            stop_release=lambda _path: None,
+        )
+        self.assertEqual("failed", result.status)
+        self.assertFalse(restarted.layout.pending_activation.exists())
+        active, _ = restarted.read_active()
+        self.assertEqual("release-r0", active["release_id"])
+
     def test_partial_finalizes_only_after_inventory_and_state_pass(self) -> None:
         fixture = DeploymentFixture()
         self.addCleanup(fixture.close)

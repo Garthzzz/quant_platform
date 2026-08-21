@@ -157,8 +157,8 @@ class TransferResult:
 class VMDeployResult:
     candidate_manifest_sha256: str
     status: str
-    receipt_id: str
-    receipt_type: str
+    evidence_id: str
+    evidence_type: str
 
 
 @dataclass(frozen=True)
@@ -167,7 +167,7 @@ class PublishResult:
     commit_sha: str
     candidate_manifest_sha256: str
     ci_run_id: str
-    deploy_receipt_id: str
+    deploy_evidence_id: str
     deployment_mode: str
     status: str
 
@@ -253,15 +253,15 @@ class PublishPipeline:
         if snapshot.tracked_clean is not True:
             raise PublishError("tracked tree is dirty")
 
-        public_gate = self._gate(
-            self._call("public_guard", self.actions.public_guard, snapshot),
-            expected_sha=expected_sha,
-            label="public_guard",
-        )
         local_gate = self._gate(
             self._call("local_test_gate", self.actions.local_test_gate, snapshot),
             expected_sha=expected_sha,
             label="local_test_gate",
+        )
+        public_gate = self._gate(
+            self._call("public_guard", self.actions.public_guard, snapshot),
+            expected_sha=expected_sha,
+            label="public_guard",
         )
         frozen = self._call("freeze_sources", self.actions.freeze_sources, snapshot)
         _stable_id(frozen.freeze_id, "freeze_id")
@@ -320,22 +320,22 @@ class PublishPipeline:
         deployed = self._call("deploy_candidate", self.actions.deploy_candidate, candidate)
         self._candidate(candidate)
         expected_deploy = (
-            ("activated", "activation")
+            ("activated", "activation_receipt")
             if deployment_mode == "activate"
-            else ("candidate_validated", "candidate_validation")
+            else ("candidate_validated", "candidate_validation_event")
         )
         if deployed.candidate_manifest_sha256 != candidate_hash or (
             deployed.status,
-            deployed.receipt_type,
+            deployed.evidence_type,
         ) != expected_deploy:
             raise PublishError("VM deploy did not return the exact candidate identity")
-        _stable_id(deployed.receipt_id, "deploy.receipt_id")
+        _stable_id(deployed.evidence_id, "deploy.evidence_id")
         return PublishResult(
             request_id=request.request_id,
             commit_sha=expected_sha,
             candidate_manifest_sha256=candidate_hash,
             ci_run_id=ci.run_id,
-            deploy_receipt_id=deployed.receipt_id,
+            deploy_evidence_id=deployed.evidence_id,
             deployment_mode=deployment_mode,
             status=deployed.status,
         )
@@ -651,7 +651,7 @@ def dry_run_plan(
         "tracked_clean": snapshot.tracked_clean,
         "deployment_mode": _deployment_mode(deployment_mode),
         "steps": [
-            "public_guard", "local_test_gate", "freeze_non_git_sources",
+            "local_test_gate", "public_guard", "freeze_non_git_sources",
             "push_once", "wait_exact_sha_ci", "incremental_candidate_transport",
             "vm_deploy_cli",
         ],
@@ -663,6 +663,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--commit-sha")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        help="Git 外受保护 production runtime config；非 dry-run 必填",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--candidate-only",
@@ -670,16 +675,39 @@ def main(argv: list[str] | None = None) -> int:
         help="显式无生产切换候选演练；默认 publish 必须完成 activation",
     )
     args = parser.parse_args(argv)
-    if not args.dry_run:
-        parser.error(
-            "production adapters must be supplied by the controlled runtime; "
-            "the standalone core only permits --dry-run"
+    if args.dry_run:
+        result = dry_run_plan(
+            args.project_root,
+            args.commit_sha,
+            deployment_mode="candidate_only" if args.candidate_only else "activate",
         )
-    result = dry_run_plan(
-        args.project_root,
-        args.commit_sha,
-        deployment_mode="candidate_only" if args.candidate_only else "activate",
-    )
+    else:
+        if args.config is None:
+            parser.error("non-dry-run publish requires --config outside the Git project")
+        from .publish_runtime import ProductionPublishRuntime, RuntimePublishConfig
+
+        config = RuntimePublishConfig.load(
+            args.config, expected_project_root=args.project_root
+        )
+        commit_sha = args.commit_sha
+        if commit_sha is None:
+            completed = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=args.project_root.resolve(strict=True),
+                shell=False,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if completed.returncode:
+                raise PublishError("cannot resolve local exact commit")
+            commit_sha = completed.stdout.strip()
+        result = ProductionPublishRuntime(config).publish(
+            commit_sha=commit_sha,
+            candidate_only=args.candidate_only,
+        )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 

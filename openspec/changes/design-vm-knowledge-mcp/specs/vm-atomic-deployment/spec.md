@@ -1,5 +1,20 @@
 ## ADDED Requirements
 
+### Requirement: 生产 VM 写入必须闭合在唯一 D 根
+系统 SHALL 把生产 VM 的全部项目写入闭合在 `D:\quant\quant_platform`：代码 checkout、tooling、incoming/candidate、release、control、state、checkpoint/backup、audit/receipt、lock、log、TEMP/TMP 与 Python bytecode 均 SHALL 位于该根的受审查子目录；系统 SHALL NOT 向 `D:\`、`D:\quant`、其他 sibling/parent 或 C 盘新增、覆盖或修改项目内容。旧 C 盘 V39 与 `C:\quant_platform_data` 在 writer handoff 前只可作为显式只读来源。
+
+#### Scenario: 写目标位于 D 上级、同级或 C 盘
+- **WHEN** 任一发布、bootstrap、恢复、部署、服务或临时文件路径解析到精确 D 根之外
+- **THEN** canonical path gate SHALL 在写入前 fail closed，active/writer SHALL 保持不变
+
+#### Scenario: 路径文本在 D 根内但通过 reparse 逃逸
+- **WHEN** 任一路径组件是 junction/reparse/subst/UNC 映射，或解析后的 physical path 不再等于批准路径
+- **THEN** 系统 SHALL 拒绝该路径，不得创建 candidate、receipt 或成功审计
+
+#### Scenario: 生产操作完成
+- **WHEN** 受控操作成功或失败返回
+- **THEN** 系统 SHALL 生成不含 secret 的声明 write-set 与 D-root 实际 delta 审计；任何未声明写入或无法证明的路径 SHALL 使该操作不得获成功 verdict
+
 ### Requirement: 兼容基线必须先于知识增强完成 VM 纵切
 系统 SHALL 在依赖通用 parser、MCP、vector 或 PostgreSQL 之前，以现网 V39 的完整代码、页面、数据和 Git 外资源建立 D 盘不可变候选及可启动的 D 盘回退版本。
 
@@ -10,6 +25,10 @@
 #### Scenario: 兼容候选出现前端差异
 - **WHEN** V39 基线与 D 候选存在未授权视觉、DOM 或交互差异
 - **THEN** 系统 SHALL 拒绝候选，且不得以通用 renderer 或新知识功能解释该差异
+
+#### Scenario: 旧 C V39 仍占用生产端口时验证 D candidate
+- **WHEN** 首次 handoff 或空 D 恢复验收期间旧 C writer 仍在 `8765` 提供现网服务
+- **THEN** 系统 SHALL 在 `.240` 使用 D-root tooling、loopback 隔离端口和 D-root tmp 中的 SQLite checkpoint 副本启动 exact candidate，验证 release/manifest/snapshot、页面/API/资源和 legacy 行为；该 runner SHALL NOT 修改 production active pointer、生产 state、C 盘或对外 writer authority，结束后 SHALL 可审计清理自身 D-root tmp
 
 ### Requirement: 精确提交与受控发布入口
 系统 SHALL 只通过受控单命令 `publish` 将完整 commit SHA 与本地冻结的非 Git source/resource inventory 绑定为不可变 candidate，经同一 SHA 的本地检查和 GitHub CI 后才允许上传；系统 SHALL NOT 在 active 运行目录执行 `git pull`，本版 SHALL NOT 实现裸 push watcher、部署 hook、self-hosted runner 或 bare receive。
@@ -49,7 +68,7 @@
 - **THEN** writer fence/服务配置 SHALL 阻止其写入并产生可见告警，不得形成双写
 
 ### Requirement: 自动 cold recovery bundle
-每个 production candidate 在激活前 SHALL 先冻结 immutable release manifest `R`，再形成不含 secret 的 machine-verifiable cold recovery bundle：immutable checkpoint `C` 记录 captured-under active release，`recovery_manifest RM` 单向引用 candidate `R`、明确 `C` 与完整 closure；`R` SHALL NOT 反向引用 `RM/C`。最终 `RECOVERY_ROOT` SHALL 位于生产 VM 整机之外的真实独立故障域，同一 VM 的其他本地/虚拟盘符、挂载点、reparse/subst 或映射回该 VM 的共享路径 SHALL NOT 合格。bundle SHALL 覆盖精确代码/前端、release/content/resource/index closure、SQLite checkpoint、恢复工具、校验信息和 runbook。
+每个 production candidate 在激活前 SHALL 先冻结 immutable release manifest `R`，再形成不含 secret 的 machine-verifiable cold recovery bundle：immutable checkpoint `C` 记录 captured-under active release，`recovery_manifest RM` 单向引用 candidate `R`、明确 `C` 与完整 closure；`R` SHALL NOT 反向引用 `RM/C`。最终 `RECOVERY_ROOT` SHALL 位于生产 VM 整机之外的真实独立故障域，同一 VM 的其他本地/虚拟盘符、挂载点、reparse/subst 或映射回该 VM 的共享路径 SHALL NOT 合格。bundle SHALL 覆盖精确代码/前端、release/content/resource/index closure、SQLite checkpoint、恢复工具、校验信息、runbook，以及从空 D 启动所需且不含 secret 的 operational bootstrap closure（`tooling/python`、固定控制面与 service install candidate）。受保护 access digest/API/SSH/GitHub 凭据只在恢复后重新注入。
 
 #### Scenario: 仅把恢复根配置到同一 VM 的其他盘符
 - **WHEN** `RECOVERY_ROOT` 与生产 D 盘显示为不同 drive letter，但 canonical host/storage authority 仍属于同一生产 VM
@@ -57,11 +76,19 @@
 
 #### Scenario: 故障域独立性实测
 - **WHEN** 发布系统准备接受最终 `RECOVERY_ROOT`
-- **THEN** 它 SHALL 记录 production/recovery host identity、storage authority、volume/backend、UNC/reparse 解析和工具版本，并在生产 VM/D 测试性不可用时证明 bundle 仍可独立读取与校验，形成 failure-domain attestation
+- **THEN** 它 SHALL 先记录 production/recovery host identity、storage authority、volume/backend、UNC/reparse 解析和工具版本，拒绝同机/同 storage 根；并在唯一生产 VM 的真实空 D 物化成功后，将 off-host bundle 的闭包验证、empty-root 事件与同一 root/host/storage 身份机械绑定成最终 failure-domain attestation
+
+#### Scenario: 首个 qualification bundle 与最终 attestation 存在依赖顺序
+- **WHEN** V39 首次恢复尚没有 empty-D materialization event
+- **THEN** 系统 SHALL 允许在已验证不同 host/storage、无 reparse 的开发机候选根生成 no-secret qualification bundle，但 SHALL NOT 将它称为 recovery-protected 或生成 protection receipt；只有该 bundle 完成真实空 D 物化且最终 attestation 通过后才可进入生产门禁
 
 #### Scenario: 活动 D 盘及对象库全部丢失
 - **WHEN** 操作者在非生产真实空 `D:\quant\quant_platform` 目标选择一个 retained recovery manifest 和 state checkpoint
-- **THEN** 系统 SHALL 仅凭 bundle 与受保护运行配置恢复完整站点、资源、Search/MCP、SQLite 状态并通过 hash/schema/浏览器/API 验证
+- **THEN** 系统 SHALL 仅凭 bundle 与受保护运行配置恢复完整站点、资源、Search/MCP、SQLite 状态、D-root operational tooling/control/service candidate，并在受保护凭据重新注入后通过 hash/schema/服务启动/浏览器/API 验证
+
+#### Scenario: Bundle 只有内容闭包而缺少服务启动闭包
+- **WHEN** release、state 与恢复工具完整，但 `tooling/python`、固定控制面或 service install candidate 任一缺失或 hash 不符
+- **THEN** 恢复 SHALL fail closed 且不得生成成功 recovery receipt，不得把“内容已物化”报告为完整空 D 恢复
 
 #### Scenario: Bundle 包含 secret 或缺少对象
 - **WHEN** no-secret scan、manifest closure、文件 hash 或 SQLite checkpoint 任一验证失败
@@ -79,6 +106,10 @@
 - **WHEN** pointer 切换、启动或任一 post-activation 验证失败
 - **THEN** 系统 SHALL 回退明确 prior 并只生成 `failure_receipt`，记录 candidate/prior、失败阶段、错误和回退结果；SHALL NOT 生成或保留成功 activation receipt
 
+#### Scenario: 激活进程在 pointer 前后中断
+- **WHEN** 部署在 durable pending journal、pointer、candidate start、post-activation probe、receipt append 或 journal cleanup 任一 crash cut 中断
+- **THEN** `active_release.json` SHALL 仍是唯一 active authority，pending journal SHALL 只是 recovery coordination；服务启动 SHALL 要求精确 SCM transient role/attempt/phase/nonce，普通 reboot/手工 start SHALL 拒绝 pending 状态；replay SHALL 在已存在合法 activation receipt 时只核对 candidate pointer 并清 journal，否则恢复明确 prior 并生成或复用唯一 failure receipt，不得同时留下 activation/failure 两种终态
+
 ### Requirement: State-only backup 不得改变 release 且 RPO 按实际年龄退化
 唯一 state-only job SHALL 至少每 24 小时运行，每次成功 SHALL 创建新的 immutable checkpoint、单向引用当前 release 的 recovery manifest 和 receipt；它 SHALL NOT 改写 release manifest/active pointer 或要求代码重新发布。Recovery protection SHALL 由最后一个 retained、closure 可读且完全验证 checkpoint 的 `captured_at` 实际年龄计算。
 
@@ -91,7 +122,7 @@
 - **THEN** recovery protection SHALL 明确为 `degraded` 并告警/重试，不得声称 RPO 满足；若不存在有效 checkpoint、closure/attestation 无效或恢复验证失败则 SHALL 为 `failed`
 
 ### Requirement: V39 空 D 恢复是首次生产切换前置门禁
-首次 C→D handoff 前，系统 SHALL 在 host identity 与生产 VM 不同的独立非生产恢复主机或隔离 VM 的真实空 `D:\quant\quant_platform`，仅凭已 attested `RECOVERY_ROOT` 中的 V39 bundle、受保护运行配置与 runbook 恢复完整站点并通过 hash/schema/browser/API 验收；未通过时 SHALL NOT 开放 D 生产流量或转移 writer authority。
+首次 C→D handoff 前，系统 SHALL 使用位于生产 VM 外不同 host/storage、已 attested 的 `RECOVERY_ROOT` 保存 V39 bundle，并在唯一目标 VM `10.5.1.240` 上执行恢复：旧 C 盘 V39 继续在线且 D 尚未承接 writer 时，验证并清空精确 `D:\quant\quant_platform`，仅凭该 off-host bundle、受保护运行配置与 runbook 恢复完整站点并通过 hash/schema/browser/API 验收。不依赖 `.223/.235` 或第二台恢复 VM；未通过时 SHALL NOT 开放 D 生产流量或转移 writer authority。
 
 #### Scenario: D baseline 副本验证通过但未做空盘恢复
 - **WHEN** V39 candidate 在 D staging 可启动，而 failure-domain attestation 或真实空 D restore receipt 缺失

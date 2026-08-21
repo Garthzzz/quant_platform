@@ -26,6 +26,26 @@
 - **WHEN** job 产生合法候选并完成机械验证或人工接受
 - **THEN** 系统 SHALL 构建新的 enriched snapshot、重新验证 Web/Search/MCP identity 并经正常 release 激活，原 active snapshot 在切换前保持不变
 
+#### Scenario: 相同代码与 reference 下正式语义知识发生变化
+- **WHEN** accepted/machine-verified knowledge、弃用状态或被选中的成功 generation 发生变化，而 Git commit 与 deterministic source version 均未变化
+- **THEN** 系统 SHALL 生成新的 effective snapshot ID、release ID、knowledge/search hashes 和 immutable release manifest，不得复用旧 release identity
+- **AND** release SHALL 只包含正式知识投影及所选成功 generation 的可追溯 provenance，不得包含 compiler workspace 数据库、待审核候选、API key 或其他凭据
+
+### Requirement: promoted semantic authority 是 immutable 发布输入
+
+系统 SHALL 只从全体 job terminal、SQLite 一致性与 immutable promotion receipt 均已验证的 semantic authority 构建 release、holdout 和检索 artifact。所有消费者 SHALL 使用不创建文件、不切换 WAL、不执行 DDL/backfill 的严格 read-only/immutable 连接；promotion 后 authority 主文件 hash、逻辑 hash、schema 与 row counts 任一漂移 SHALL fail closed。知识写入 SHALL 发生在独立 compiler workspace，完成后形成新的 promotion identity，不得原地改写已经参与 release 或 sealed evaluation 的 authority。
+
+#### Scenario: 名为读取的 store 试图初始化 authority
+
+- **WHEN** release freezer、holdout 或 artifact builder 以默认可写 `SemanticJobStore` 打开 promoted authority，或产生 WAL/SHM、schema 初始化、backfill 或主文件 hash 变化
+- **THEN** gate SHALL 拒绝该消费者和当前 promotion identity
+- **AND** 不得通过忽略物理 hash、重用已失败 holdout 或重新标记旧 receipt 继续发布
+
+#### Scenario: 新 targeted generation 失败或仍在等待
+- **WHEN** 当前 source version 已有成功 generation，而后续 targeted job 超时、失败、返回非法证据或尚未完成
+- **THEN** 系统 SHALL 保留上一成功 generation、正式知识投影与 active release identity，不得因最新 job 非成功而撤回可用知识
+- **AND** 只有新的成功 generation 或正式知识接受/弃用变化，才 SHALL 形成新的 enriched snapshot 与 release
+
 #### Scenario: API 失败或证据验证失败
 - **WHEN** generation 超时、返回非法 schema、span 不属于当前来源或证据冲突
 - **THEN** 当前 active SHALL 保持不变，失败 generation SHALL 仅进入审计状态；任何 prior source version 知识不得静默替代当前候选
@@ -50,6 +70,8 @@ Web、Search 和 MCP SHALL 在每个请求开始时解析同一 active release/s
 
 ### Requirement: 审计材料不得成为平行身份
 `recovery_protection_receipt`、`activation_receipt`、`failure_receipt`、灾难恢复 receipt、checkpoint receipt、备份记录和验证证据 SHALL 为 append-only 证明材料，但 SHALL NOT 定义另一个 current/version authority；release 兼容性只由 active pointer 与被指向 manifest 解析。`recovery_protection_receipt` SHALL 只绑定激活前已验证的 `R/RM/C` 与恢复保护 verdict；`activation_receipt` SHALL 仅在成功切换并完成 post-activation 验证后绑定被激活 release hash、已验证 recovery manifest hash 与结果；切换失败 SHALL 只生成 failure receipt。灾难恢复 receipt SHALL 绑定明确 release/recovery/checkpoint 与恢复结果。
+
+`pending_activation.json` MAY 作为 pointer 切换前的 durable crash-coordination journal，但 SHALL 明确标记 `recovery_coordination_only`，SHALL NOT 被当作 active pointer、release identity 或 receipt。它只能在精确的 attempt/phase/role/nonce 下授权一次 SCM start；终态 receipt 与 active pointer 验证完成后必须清理，损坏或身份漂移时 fail closed。
 
 #### Scenario: 审计记录与 active pointer 表示不同 prior
 - **WHEN** 恢复工具读取到多条历史 activation 记录
