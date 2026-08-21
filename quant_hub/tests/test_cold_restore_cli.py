@@ -911,8 +911,8 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             30000,
         )
         outer = base64.b64decode(runner.calls[0][-1]).decode("utf-16-le")
-        self.assertIn("compressed_script_length_differs", outer)
-        self.assertIn("compressed_script_hash_differs", outer)
+        self.assertIn("gz_l", outer)
+        self.assertIn("gz_h", outer)
         self.assertNotIn("Remove-Item -LiteralPath $child.FullName", inspect_script)
         for gate in (
             "qualification_service_exists",
@@ -921,7 +921,7 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             "qualification_inventory_reparse",
             "qualification_inventory_alternate_stream",
             "qualification_expected_file_differs",
-            "materialization_event_remote_bytes",
+            "materialization_event_bytes",
             "production_host_facts_relative_path",
             "production_host_facts_file_sha256",
             "qualification_candidate_audit_count",
@@ -988,11 +988,19 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
         ).hexdigest()
         for path in evidence.glob("*.json"):
             with self.subTest(evidence=path.name):
+                value = json.loads(path.read_bytes())
                 self.assertEqual(
                     attestation_file_sha256,
-                    json.loads(path.read_bytes())[
-                        "failure_domain_attestation_file_sha256"
-                    ],
+                    value["failure_domain_attestation_file_sha256"],
+                )
+                self.assertEqual(105288, value["legacy_python_bytes"])
+                self.assertEqual(
+                    "187c79755d766743dd778487a796b354597c18a676888168fb75f09eba9539b0",
+                    value["legacy_python_path_sha256"],
+                )
+                self.assertEqual(
+                    "f3c05e11e9fc3fc0941fda221b1dfb0aac39d6ef298078054a5d949d620f3d6c",
+                    value["legacy_python_sha256"],
                 )
 
     def test_response_loss_reuses_exact_intent_and_recovers_empty_postcondition(self) -> None:
@@ -1100,6 +1108,43 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             )
         self.assertEqual(before, len(runner.calls))
 
+    def test_tampered_legacy_python_identity_blocks_apply_without_remote(self) -> None:
+        mutations = {
+            "legacy_python_path_sha256": "0" * 64,
+            "legacy_python_bytes": 105289,
+            "legacy_python_sha256": "1" * 64,
+        }
+        for index, (field, replacement) in enumerate(mutations.items()):
+            with self.subTest(field=field):
+                runner = QualificationResetRunner()
+                operator = self.operator(runner)
+                nonce = f"materialized-reset-python-id-{index:04d}"
+                operator.inspect_prepare_empty(
+                    self.bundle,
+                    intent_nonce=nonce,
+                    expected_legacy_deployment_id=LEGACY_ID,
+                    qualification_reset_materialized=True,
+                )
+                evidence_root = (
+                    self.config.recovery.recovery_root / "evidence"
+                    / "prepare-empty-qualification-reset"
+                )
+                nonce_hash = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+                inspection = evidence_root / f"{nonce_hash}.inspection.json"
+                value = json.loads(inspection.read_bytes())
+                value[field] = replacement
+                inspection.write_bytes(operator._canonical_bytes(value))
+                before = len(runner.calls)
+                with self.assertRaisesRegex(ColdRestoreCLIError, "does not authorize"):
+                    operator.apply_prepare_empty(
+                        self.bundle,
+                        intent_nonce=nonce,
+                        expected_pre_delete_inventory_sha256=INVENTORY_HASH,
+                        expected_legacy_deployment_id=LEGACY_ID,
+                        qualification_reset_materialized=True,
+                    )
+                self.assertEqual(before, len(runner.calls))
+
     def test_apply_rereads_attestation_file_and_rejects_equivalent_reformat(self) -> None:
         runner = QualificationResetRunner()
         operator = self.operator(runner)
@@ -1205,7 +1250,14 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
                 ),
                 bundle_verifier=self.verifier,
             )
-            self.assertEqual({}, transport._ssh(script, compressed=True))
+            self.assertEqual(
+                {},
+                transport._ssh(
+                    script,
+                    compressed=True,
+                    compact_qualification_wrapper=True,
+                ),
+            )
             full_command = (
                 "powershell.exe -NoProfile -NonInteractive -EncodedCommand "
                 + calls[-1][-1]
@@ -1391,7 +1443,10 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
         self.assertEqual(0, completed.returncode, completed.stderr)
         value = json.loads(completed.stdout)
         self.assertTrue(value["good"])
-        self.assertFalse(value["windows"])
+        # This helper closes argv shape only; the full guard below binds the
+        # opaque path hash and binary identity, so an arbitrary matching argv
+        # cannot pass production qualification.
+        self.assertTrue(value["windows"])
         self.assertFalse(value["substring"])
         self.assertTrue(value["forward"])
         self.assertTrue(value["extended"])
@@ -1437,9 +1492,17 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
     def test_real_powershell_full_legacy_guard_rejects_c_windows_python(self) -> None:
         root = Path(__file__).resolve().parents[2]
 
-        def invoke(executable: str) -> subprocess.CompletedProcess[str]:
+        def invoke(
+            executable: str,
+            *,
+            expected_executable: str,
+            observed_python_sha256: str = "b" * 64,
+        ) -> subprocess.CompletedProcess[str]:
             server = r"C:\quant_platform\tools\viewer\server.py"
             command_line = f'"{executable}" -I "{server}"'
+            expected_path_sha256 = hashlib.sha256(
+                expected_executable.lower().encode("utf-8")
+            ).hexdigest()
             deployment = json.dumps(
                 {
                     "schema_version": "qrh-company-broadcast-health/v1",
@@ -1457,6 +1520,8 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
                 + _qualification_native_probe_script()
                 + "$contract=[pscustomobject]@{legacy_server_bytes=32;"
                 + "legacy_server_sha256='" + "a" * 64 + "';"
+                + "python_id=@('" + expected_path_sha256 + "',100,'"
+                + "b" * 64 + "');"
                 + "legacy_deployment_id=" + OpenSSHColdRestore._literal(LEGACY_ID) + "};"
                 + "$caseExecutable=" + OpenSSHColdRestore._literal(executable) + ";"
                 + "$caseCommand=" + OpenSSHColdRestore._literal(command_line) + ";"
@@ -1464,9 +1529,11 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
                 + "function Get-CimInstance{[pscustomobject]@{ProcessId=42;"
                 + "ExecutablePath=$caseExecutable;CommandLine=$caseCommand}};"
                 + "function Get-Item{param($LiteralPath,[switch]$Force,$ErrorAction);"
-                + "[pscustomobject]@{PSIsContainer=$false;Attributes=0;Length=32}};"
+                + "[pscustomobject]@{PSIsContainer=$false;Attributes=0;Length="
+                + "$(if($LiteralPath-eq$caseExecutable){100}else{32})}};"
                 + "function Get-FileHash{param($LiteralPath,$Algorithm);"
-                + "[pscustomobject]@{Hash='" + "a" * 64 + "'}};"
+                + "[pscustomobject]@{Hash=$(if($LiteralPath-eq$caseExecutable){'"
+                + observed_python_sha256 + "'}else{'" + "a" * 64 + "'})}};"
                 + "function Invoke-WebRequest{[pscustomobject]@{StatusCode=200;Content="
                 + OpenSSHColdRestore._literal(deployment)
                 + "}};"
@@ -1477,14 +1544,27 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             )
             return run_powershell(script)
 
-        valid = invoke(r"C:\quant_platform\python\python.exe")
+        fixed = r"C:\opaque\fixed\python.exe"
+        valid = invoke(fixed, expected_executable=fixed)
         self.assertEqual(0, valid.returncode, valid.stderr)
         self.assertTrue(json.loads(valid.stdout)["passed"])
-        rejected = invoke(r"C:\Windows\python.exe")
-        self.assertEqual(0, rejected.returncode, rejected.stderr)
-        value = json.loads(rejected.stdout)
-        self.assertFalse(value["passed"])
-        self.assertEqual("listener_not_exact_legacy_argv", value["error"])
+        cases = (
+            (r"C:\Windows\python.exe", "b" * 64),
+            (r"D:\quant\quant_platform\tooling\python\python.exe", "b" * 64),
+            (r"C:\opaque\sibling\python.exe", "b" * 64),
+            (fixed, "c" * 64),
+        )
+        for executable, observed_hash in cases:
+            with self.subTest(executable=executable, observed_hash=observed_hash[:1]):
+                rejected = invoke(
+                    executable,
+                    expected_executable=fixed,
+                    observed_python_sha256=observed_hash,
+                )
+                self.assertEqual(0, rejected.returncode, rejected.stderr)
+                value = json.loads(rejected.stdout)
+                self.assertFalse(value["passed"])
+                self.assertEqual("listener_legacy_authority_differs", value["error"])
 
     @unittest.skipUnless(os.name == "nt", "qualification guard requires Windows")
     def test_real_powershell_replay_accepts_only_exact_remaining_top_children(self) -> None:
@@ -1748,6 +1828,15 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
         self.assertEqual(
             "legacy_powershell_hashtable_v1",
             contract["materialization_event_remote_serialization"],
+        )
+        self.assertEqual(105288, contract["legacy_python_bytes"])
+        self.assertEqual(
+            "187c79755d766743dd778487a796b354597c18a676888168fb75f09eba9539b0",
+            contract["legacy_python_path_sha256"],
+        )
+        self.assertEqual(
+            "f3c05e11e9fc3fc0941fda221b1dfb0aac39d6ef298078054a5d949d620f3d6c",
+            contract["legacy_python_sha256"],
         )
 
     @unittest.skipUnless(os.name == "nt", "candidate residue guard requires PS 5.1")

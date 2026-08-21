@@ -52,6 +52,13 @@ _QUALIFICATION_RESET_APPLY_SCHEMA = (
     "qrh-prepare-empty-qualification-reset-application/v1"
 )
 _LEGACY_V39_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
+_LEGACY_V39_PYTHON_PATH_SHA256 = (
+    "187c79755d766743dd778487a796b354597c18a676888168fb75f09eba9539b0"
+)
+_LEGACY_V39_PYTHON_BYTES = 105288
+_LEGACY_V39_PYTHON_SHA256 = (
+    "f3c05e11e9fc3fc0941fda221b1dfb0aac39d6ef298078054a5d949d620f3d6c"
+)
 _TRANSFER_ATTEMPT_SCHEMA = "qrh-cold-restore-transfer-attempt/v1"
 _LEGACY_MATERIALIZATION_SERIALIZATION = "legacy_powershell_hashtable_v1"
 
@@ -192,12 +199,9 @@ def _qualification_native_probe_script() -> str:
         "$exeFull=[IO.Path]::GetFullPath($ExecutablePath).TrimEnd('\\');"
         "$argvExe=[IO.Path]::GetFullPath([string]$argv[0]).TrimEnd('\\');"
         "$serverFull=[IO.Path]::GetFullPath($Server).TrimEnd('\\');"
-        "$legacyRoot='C:\\quant_platform';"
         "return $argv.Count-eq 3-and$exeFull.Equals($argvExe,"
         "[StringComparison]::OrdinalIgnoreCase)-and"
-        "$exeFull.StartsWith($legacyRoot+'\\',[StringComparison]::OrdinalIgnoreCase)-and"
-        "@('python.exe','pythonw.exe')-contains([IO.Path]::GetFileName($exeFull)."
-        "ToLowerInvariant())-and$argv[1]-eq'-I'-and"
+        "$argv[1]-eq'-I'-and"
         "([IO.Path]::GetFullPath([string]$argv[2]).TrimEnd('\\')).Equals($serverFull,"
         "[StringComparison]::OrdinalIgnoreCase)}catch{return $false}};"
         "function Test-QrhContainsDRoot([object]$Value){"
@@ -307,11 +311,9 @@ def _qualification_candidate_residue_guard_script() -> str:
         "$cursor=$relative;while($true){[void]$expectedDirs.Add($cursor);"
         "if(-not$cursor.Contains('/')){break};"
         "$cursor=$cursor.Substring(0,$cursor.LastIndexOf('/'))};"
-        "$prefix=$relative+'/';foreach($file in $snapshot.files.Keys){"
-        "if($file.StartsWith($prefix,[StringComparison]::Ordinal))"
-            "{throw 'qualification_candidate_directory_not_empty'}};"
-        "foreach($directory in $snapshot.directories){if("
-        "$directory.StartsWith($prefix,[StringComparison]::Ordinal))"
+        "$prefix=$relative+'/';foreach($entry in "
+        "@(@($snapshot.files.Keys)+@($snapshot.directories))){if("
+        "$entry.StartsWith($prefix,[StringComparison]::Ordinal))"
             "{throw 'qualification_candidate_directory_not_empty'}}}};"
     )
 
@@ -328,19 +330,26 @@ def _qualification_legacy_guard_script() -> str:
         "-ErrorAction Stop);if($process.Count-ne 1){throw 'legacy_process_identity'};"
         "$listenerPid=[int]$pids[0];$command=$process[0].CommandLine;"
         "$executable=$process[0].ExecutablePath;"
-        "if($command-isnot[string]-or$executable-isnot[string])"
-        "{throw 'legacy_process_scalar_type'};"
-        "$exeFull=[IO.Path]::GetFullPath($executable).TrimEnd('\\');"
         "$server='C:\\quant_platform\\tools\\viewer\\server.py';"
         "if(-not(Test-QrhExactLegacyArgv $command $executable $server))"
         "{throw 'listener_not_exact_legacy_argv'};"
+        "$exeFull=[IO.Path]::GetFullPath($executable).TrimEnd('\\');"
         "$exeItem=Get-Item -LiteralPath $exeFull -Force -ErrorAction Stop;"
         "$serverItem=Get-Item -LiteralPath $server -Force -ErrorAction Stop;"
+        "$pp=(New-Object Text.UTF8Encoding($false)).GetBytes("
+        "$exeFull.ToLowerInvariant());$ph=([BitConverter]::ToString("
+        "([Security.Cryptography.SHA256]::Create()).ComputeHash($pp)))."
+        "Replace('-','').ToLowerInvariant();"
+        "$eh=(Get-FileHash -LiteralPath $exeFull -Algorithm SHA256).Hash."
+        "ToLowerInvariant();"
         "$serverHash=(Get-FileHash -LiteralPath $server -Algorithm SHA256).Hash."
         "ToLowerInvariant();"
         "if($exeItem.PSIsContainer-or$serverItem.PSIsContainer-or"
         "(($exeItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
         "(($serverItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)-or"
+        "$ph-ne[string]$contract.python_id[0]-or"
+        "$exeItem.Length-ne[long]$contract.python_id[1]-or"
+        "$eh-ne[string]$contract.python_id[2]-or"
         "$serverItem.Length-ne[long]$contract.legacy_server_bytes-or"
         "$serverHash-ne([string]$contract.legacy_server_sha256))"
         "{throw 'listener_legacy_authority_differs'};"
@@ -402,7 +411,8 @@ class OpenSSHColdRestore:
         return "'" + value.replace("'", "''") + "'"
 
     def _ssh(
-        self, script: str, *, compressed: bool = False
+        self, script: str, *, compressed: bool = False,
+        compact_qualification_wrapper: bool = False,
     ) -> Mapping[str, object]:
         target_guard = (
             "$ssh=($env:SSH_CONNECTION -split ' ');"
@@ -414,22 +424,45 @@ class OpenSSHColdRestore:
             compressed_bytes = gzip.compress(effective.encode("utf-8"), mtime=0)
             payload = base64.b64encode(compressed_bytes).decode("ascii")
             payload_hash = hashlib.sha256(compressed_bytes).hexdigest()
-            effective = (
-                f"$b=[Convert]::FromBase64String({self._literal(payload)});"
-                f"if($b.Length-ne{len(compressed_bytes)})"
-                "{throw 'compressed_script_length_differs'};"
-                "$h=[Security.Cryptography.SHA256]::Create();try{"
-                "$d=([BitConverter]::ToString($h.ComputeHash($b))).Replace('-','')."
-                "ToLowerInvariant()}finally{$h.Dispose()};"
-                f"if($d-ne{self._literal(payload_hash)})"
-                "{throw 'compressed_script_hash_differs'};"
-                "$m=New-Object IO.MemoryStream(,$b);"
-                "$z=New-Object IO.Compression.GzipStream($m,"
-                "[IO.Compression.CompressionMode]::Decompress);"
-                "$r=New-Object IO.StreamReader($z,(New-Object Text.UTF8Encoding($false)));"
-                "try{$s=$r.ReadToEnd()}finally{$r.Dispose();$z.Dispose();$m.Dispose()};"
-                "&([scriptblock]::Create($s))"
+            length_error = (
+                "gz_l" if compact_qualification_wrapper
+                else "compressed_script_length_differs"
             )
+            hash_error = (
+                "gz_h" if compact_qualification_wrapper
+                else "compressed_script_hash_differs"
+            )
+            if compact_qualification_wrapper:
+                payload_hash = payload_hash.upper()
+                effective = (
+                    f"$b=[Convert]::FromBase64String({self._literal(payload)});"
+                    f"if($b.Length-ne{len(compressed_bytes)}){{throw 'gz_l'}};"
+                    "$d=([BitConverter]::ToString(([Security.Cryptography.SHA256]"
+                    "::Create()).ComputeHash($b))).Replace('-','');"
+                    f"if($d-ne{self._literal(payload_hash)}){{throw 'gz_h'}};"
+                    "$m=[IO.MemoryStream]::new([byte[]]$b);$z=[IO.Compression.GzipStream]"
+                    "::new($m,[IO.Compression.CompressionMode]::Decompress);"
+                    "$r=[IO.StreamReader]::new($z,[Text.UTF8Encoding]::new($false));"
+                    "try{$s=$r.ReadToEnd()}finally{$r.Dispose();$z.Dispose();$m.Dispose()};"
+                    "&([scriptblock]::Create($s))"
+                )
+            else:
+                effective = (
+                    f"$b=[Convert]::FromBase64String({self._literal(payload)});"
+                    f"if($b.Length-ne{len(compressed_bytes)})"
+                    f"{{throw {self._literal(length_error)}}};"
+                    "$h=[Security.Cryptography.SHA256]::Create();try{"
+                    "$d=([BitConverter]::ToString($h.ComputeHash($b))).Replace('-','')."
+                    "ToLowerInvariant()}finally{$h.Dispose()};"
+                    f"if($d-ne{self._literal(payload_hash)})"
+                    f"{{throw {self._literal(hash_error)}}};"
+                    "$m=New-Object IO.MemoryStream(,$b);"
+                    "$z=New-Object IO.Compression.GzipStream($m,"
+                    "[IO.Compression.CompressionMode]::Decompress);"
+                    "$r=New-Object IO.StreamReader($z,(New-Object Text.UTF8Encoding($false)));"
+                    "try{$s=$r.ReadToEnd()}finally{$r.Dispose();$z.Dispose();$m.Dispose()};"
+                    "&([scriptblock]::Create($s))"
+                )
         encoded = base64.b64encode(effective.encode("utf-16-le")).decode("ascii")
         result = self.command_runner(
             (
@@ -810,6 +843,10 @@ class OpenSSHColdRestore:
             ) from error
         expected_event_bytes = self._canonical_bytes(expected_event)
         legacy_event_bytes = _legacy_materialization_event_bytes(expected_event)
+        if len(expected_event_bytes) != len(legacy_event_bytes):
+            raise ColdRestoreCLIError(
+                "qualification legacy event byte length profile differs"
+            )
         expected_facts_bytes = (
             json.dumps(
                 production,
@@ -936,6 +973,9 @@ class OpenSSHColdRestore:
             "checkpoint_manifest_sha256": report.checkpoint_manifest_sha256,
             "recovery_manifest_sha256": report.recovery_manifest_sha256,
             "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "legacy_python_path_sha256": _LEGACY_V39_PYTHON_PATH_SHA256,
+            "legacy_python_bytes": _LEGACY_V39_PYTHON_BYTES,
+            "legacy_python_sha256": _LEGACY_V39_PYTHON_SHA256,
             "legacy_server_bytes": int(legacy_server_records[0]["bytes"]),
             "legacy_server_sha256": str(legacy_server_records[0]["sha256"]),
             "closure_inventory_sha256": closure_sha256,
@@ -1398,8 +1438,10 @@ class OpenSSHColdRestore:
         remote_fields = {
             "active_bytes", "active_sha256", "bundle_id",
             "declared_write_set_sha256", "legacy_deployment_id",
+            "legacy_python_path_sha256", "legacy_python_bytes",
+            "legacy_python_sha256",
             "legacy_server_bytes", "legacy_server_sha256",
-            "operational_bootstrap_bytes",
+            "materialization_event_bytes", "operational_bootstrap_bytes",
             "operational_bootstrap_sha256", "production_host_facts_bytes",
             "production_host_facts_file_sha256", "python_bytes", "python_sha256",
             "release_id", "release_manifest_bytes", "release_manifest_sha256",
@@ -1411,13 +1453,16 @@ class OpenSSHColdRestore:
             remote_fields.update({
                 "production_host_facts_relative_path",
                 "materialization_event_remote_sha256",
-                "materialization_event_remote_bytes",
             })
         if not remote_fields.issubset(contract):
             raise ColdRestoreCLIError("qualification reset remote contract is incomplete")
-        contract_bytes = self._canonical_bytes(
-            {key: contract[key] for key in sorted(remote_fields)}
-        )
+        remote_contract = {key: contract[key] for key in sorted(remote_fields)}
+        remote_contract["python_id"] = [
+            remote_contract.pop("legacy_python_path_sha256"),
+            remote_contract.pop("legacy_python_bytes"),
+            remote_contract.pop("legacy_python_sha256"),
+        ]
+        contract_bytes = self._canonical_bytes(remote_contract)
         contract_literal = self._literal(contract_bytes.decode("utf-8"))
         # The destructive application consumes the immutable inspection hash and
         # never executes D tooling.  Canonical audit execution is inspection-only,
@@ -1493,9 +1538,6 @@ class OpenSSHColdRestore:
             "{throw 'qualification_inventory_relative_path'};"
             "if($item.PSIsContainer){$directoryCount++;[void]$directories.Add($relative);"
             "[void]$records.Add('D'+[char]9+$relative+[char]10);continue};"
-            "$streams=@(Get-Item -LiteralPath $item.FullName -Stream * -ErrorAction Stop);"
-            "if($streams.Count-ne 1-or$streams[0].Stream-ne':$DATA')"
-            "{throw 'qualification_inventory_alternate_stream'};"
             "$fileCount++;$bytes+=[long]$item.Length;"
             "$hash=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash."
             "ToLowerInvariant();if($files.ContainsKey($relative))"
@@ -1584,7 +1626,7 @@ class OpenSSHColdRestore:
             "([long]$contract.restore_tool_bytes) ([string]$contract.restore_tool_sha256);"
             "$eventRelative='audit/events/cold-materialization-'+$contract.bundle_id+'.json';"
             "Add-ExpectedFile $eventRelative "
-            "([long]$contract.materialization_event_remote_bytes) "
+            "([long]$contract.materialization_event_bytes) "
             "([string]$contract.materialization_event_remote_sha256);"
             "$factsRelative=[string]$contract.production_host_facts_relative_path;"
             "Add-ExpectedFile $factsRelative ([long]$contract.production_host_facts_bytes) "
@@ -1944,6 +1986,7 @@ class OpenSSHColdRestore:
                 expected_inventory_sha256=None,
             ),
             compressed=True,
+            compact_qualification_wrapper=True,
         )
         self._qualification_reset_identity(result, apply=False)
         if any(
@@ -1996,6 +2039,9 @@ class OpenSSHColdRestore:
             ],
             "closure_inventory_sha256": contract["closure_inventory_sha256"],
             "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "legacy_python_path_sha256": contract["legacy_python_path_sha256"],
+            "legacy_python_bytes": contract["legacy_python_bytes"],
+            "legacy_python_sha256": contract["legacy_python_sha256"],
             "pre_delete_inventory_sha256": result["inventory_sha256"],
             "top_level_children": result["top_level_children"],
             "remote_gates": {
@@ -2103,6 +2149,9 @@ class OpenSSHColdRestore:
             ],
             "closure_inventory_sha256": contract["closure_inventory_sha256"],
             "legacy_deployment_id": _LEGACY_V39_DEPLOYMENT_ID,
+            "legacy_python_path_sha256": contract["legacy_python_path_sha256"],
+            "legacy_python_bytes": contract["legacy_python_bytes"],
+            "legacy_python_sha256": contract["legacy_python_sha256"],
             "pre_delete_inventory_sha256": expected_pre_delete_inventory_sha256,
             "top_level_children": inspection.get("top_level_children"),
         }
@@ -2190,6 +2239,7 @@ class OpenSSHColdRestore:
                 expected_inventory_sha256=expected_pre_delete_inventory_sha256,
             ),
             compressed=True,
+            compact_qualification_wrapper=True,
         )
         self._qualification_reset_identity(result, apply=True)
         if any(

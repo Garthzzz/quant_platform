@@ -149,9 +149,12 @@ apply-intent 重试。空根可直接复核；若只完成了部分 top-level ch
 `RECOVERY_ROOT\evidence\prepare-empty-qualification-reset`。
 
 旧 C V39 健康门禁必须把 8765 的唯一 listener owning PID 绑定到同一个 CIM process；
-`ExecutablePath` 与 Windows 官方 argv 解析后的 argv0 必须是同一个
-`C:\quant_platform` 内 Python，argv 必须恰好为 `<python> -I
-C:\quant_platform\tools\viewer\server.py`。server bytes/hash、`/deploymentz` 的严格字段集、
+`ExecutablePath` 与 Windows 官方 argv 解析后的 argv0 必须是同一个 regular、non-reparse
+Python，argv 必须恰好为 `<python> -I C:\quant_platform\tools\viewer\server.py`。解释器
+绝对路径不写入公开代码或证据；qualification 合同以 normalized lowercase path 的 UTF-8
+SHA-256、binary size 和 binary SHA-256 三项固定身份绑定现场 V39 解释器。这三项进入
+inspection、apply-intent、applied 的 closed evidence；`C:\Windows`、D 根、sibling 路径或
+同名但字节不同的 Python 均拒绝。server bytes/hash、`/deploymentz` 的严格字段集、
 PID、端口与固定 `quant-hub-v39-company-broadcast-20260731-hotfix1` identity 必须同时一致；
 仅在 CommandLine 中出现 C 路径子串不算通过。
 
