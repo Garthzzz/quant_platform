@@ -18,6 +18,8 @@ from quant_hub.ops.cold_restore_cli import (
     ColdRestoreCLIError,
     OpenSSHColdRestore,
     _CANONICAL_AUDIT_PROBE,
+    _legacy_materialization_event_bytes,
+    _qualification_candidate_residue_guard_script,
     _qualification_closure_guard_script,
     _qualification_legacy_guard_script,
     _qualification_native_probe_script,
@@ -39,7 +41,10 @@ LEGACY_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
 INVENTORY_HASH = "b" * 64
 TOP_LEVEL_CHILDREN = [
     {"name": name, "inventory_sha256": hashlib.sha256(name.encode()).hexdigest()}
-    for name in ("audit", "control", "releases", "state", "tmp", "tooling", "tools")
+    for name in (
+        "audit", "backups", "control", "incoming", "releases", "state", "tmp",
+        "tooling", "tools",
+    )
 ]
 
 
@@ -458,7 +463,7 @@ class QualificationResetRunner:
                     "file_count": 1328,
                     "directory_count": 200,
                     "total_bytes": 1000000,
-                    "top_level_count": 7,
+                    "top_level_count": len(TOP_LEVEL_CHILDREN),
                     "top_level_children": TOP_LEVEL_CHILDREN,
                     "deleted": False,
                 }
@@ -916,21 +921,17 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             "qualification_inventory_reparse",
             "qualification_inventory_alternate_stream",
             "qualification_expected_file_differs",
-            "materialization_event_bytes",
+            "materialization_event_remote_bytes",
+            "production_host_facts_relative_path",
             "production_host_facts_file_sha256",
             "qualification_candidate_audit_count",
             "qualification_candidate_audit_declared_set",
             "qualification_candidate_audit_write_shape",
             "qualification_candidate_audit_residue_unbound",
-            "qualification_authority_receipt_or_journal_exists",
             "qualification_candidate_sidecar_wal_nonzero",
             "qualification_candidate_sidecar_shm_shape",
             "qualification_unknown_file",
             "qualification_unknown_directory",
-            "qualification_unknown_top_level",
-            "qualification_pending_authority_exists",
-            "control/pending_activation.json",
-            "control/writer_handoff_pending.json",
             "control/active_release.json",
             "release_manifest.json",
             "operational_bootstrap.json",
@@ -1682,6 +1683,163 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
                 finally:
                     path.write_bytes(originals[name])
 
+    @unittest.skipUnless(os.name == "nt", "legacy event profile requires PS 5.1")
+    def test_legacy_materialization_profile_matches_real_powershell_exact_bytes(self) -> None:
+        event = {
+            "schema_version": "qrh-recovery-materialization-event/v1",
+            "event_id": "cold-materialization-qualification-1",
+            "kind": "cold_recovery_materialized",
+            "authority": "evidence_only",
+            "fields": {
+                "bundle_id": "qualification-1",
+                "release_id": "release-v39",
+                "manifest_sha256": "a" * 64,
+                "empty_root_precondition": True,
+                "import_cleaned": True,
+                "runtime_tmp_cleaned": True,
+            },
+        }
+        expected = _legacy_materialization_event_bytes(event)
+        script = (
+            "$e=@{schema_version='qrh-recovery-materialization-event/v1';"
+            "event_id='cold-materialization-qualification-1';"
+            "kind='cold_recovery_materialized';authority='evidence_only';fields=@{"
+            "bundle_id='qualification-1';release_id='release-v39';"
+            "manifest_sha256='" + "a" * 64 + "';empty_root_precondition=$true;"
+            "import_cleaned=$true;runtime_tmp_cleaned=$true}};"
+            "$j=$e|ConvertTo-Json -Compress -Depth 4;"
+            "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($j))"
+        )
+        completed = run_powershell(script)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(expected, base64.b64decode(completed.stdout.strip()))
+        self.assertNotEqual(canonical_bytes(event), expected)
+        reordered = json.dumps(
+            event, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        whitespace = json.dumps(event, ensure_ascii=False, indent=1).encode("utf-8")
+        self.assertNotEqual(expected, reordered)
+        self.assertNotEqual(expected, whitespace)
+
+        operator = self.operator()
+        bundle, report, restore_name, _python, _tool = operator._verified_bundle(
+            self.bundle
+        )
+        contract = operator._qualification_reset_contract(
+            bundle, report, restore_name,
+            expected_legacy_deployment_id=LEGACY_ID,
+        )
+        self.assertEqual(
+            "audit/evidence/production-host-facts-qualification-1.json",
+            contract["production_host_facts_relative_path"],
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                _legacy_materialization_event_bytes({
+                    **event,
+                    "fields": {
+                        **event["fields"],
+                        "manifest_sha256": report.release_manifest_sha256,
+                    },
+                })
+            ).hexdigest(),
+            contract["materialization_event_remote_sha256"],
+        )
+        self.assertEqual(
+            "legacy_powershell_hashtable_v1",
+            contract["materialization_event_remote_serialization"],
+        )
+
+    @unittest.skipUnless(os.name == "nt", "candidate residue guard requires PS 5.1")
+    def test_real_powershell_candidate_residue_guard_closes_real_shape(self) -> None:
+        sidecars = {
+            "state/comments.sqlite3-wal": {"bytes": 0, "sha256": "0" * 64},
+            "state/comments.sqlite3-shm": {"bytes": 32768, "sha256": "1" * 64},
+            "state/research_workspace.sqlite3-wal": {
+                "bytes": 0, "sha256": "2" * 64,
+            },
+            "state/research_workspace.sqlite3-shm": {
+                "bytes": 32768, "sha256": "3" * 64,
+            },
+        }
+        directory_changes = {
+            "audit": "modified", "audit/receipts": "created",
+            "backups": "created", "incoming": "created", "state": "modified",
+            "state/locks": "created", "tmp": "modified",
+            "tmp/candidate-probes": "created",
+        }
+        writes = [
+            {
+                "bytes": 0, "change": change, "entry_type": "directory",
+                "path": str(PureWindowsPath(r"D:\quant\quant_platform").joinpath(
+                    *relative.split("/")
+                )),
+                "relative_path": relative, "sha256": None,
+            }
+            for relative, change in directory_changes.items()
+        ] + [
+            {
+                "bytes": value["bytes"], "change": "created", "entry_type": "file",
+                "path": str(PureWindowsPath(r"D:\quant\quant_platform").joinpath(
+                    *relative.split("/")
+                )),
+                "relative_path": relative, "sha256": value["sha256"],
+            }
+            for relative, value in sidecars.items()
+        ]
+        directories = [*directory_changes, "tmp/deployment-cli"]
+
+        def invoke(observed, dirs, files):
+            data = json.dumps(
+                {"observed_writes": observed}, separators=(",", ":")
+            )
+            file_data = json.dumps(files, separators=(",", ":"))
+            dir_data = json.dumps(dirs, separators=(",", ":"))
+            script = (
+                "$ErrorActionPreference='Stop';$root='D:\\quant\\quant_platform';"
+                + _qualification_candidate_residue_guard_script()
+                + "$audit=" + OpenSSHColdRestore._literal(data) + "|ConvertFrom-Json;"
+                + "$rawFiles=" + OpenSSHColdRestore._literal(file_data)
+                + "|ConvertFrom-Json;$files=@{};foreach($p in $rawFiles.PSObject.Properties)"
+                + "{$files[$p.Name]=$p.Value};$dirs=New-Object "
+                + "'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal);"
+                + "foreach($d in @((" + OpenSSHColdRestore._literal(dir_data)
+                + "|ConvertFrom-Json))){[void]$dirs.Add([string]$d)};"
+                + "$expected=New-Object 'System.Collections.Generic.HashSet[string]' "
+                + "([StringComparer]::Ordinal);$snapshot=[pscustomobject]@{files=$files;"
+                + "directories=$dirs};try{Assert-QrhCandidateResidueAudit $audit "
+                + "$snapshot $expected;$result='pass'}catch{$result=$_.Exception.Message};"
+                + "$result"
+            )
+            completed = run_powershell(script)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            return completed.stdout.strip()
+
+        self.assertEqual("pass", invoke(writes, directories, sidecars))
+        self.assertEqual(
+            "qualification_candidate_audit_residue_unbound",
+            invoke([item for item in writes if item["relative_path"] != "backups"],
+                   directories, sidecars),
+        )
+        deployment_write = {
+            "bytes": 0, "change": "created", "entry_type": "directory",
+            "path": r"D:\quant\quant_platform\tmp\deployment-cli",
+            "relative_path": "tmp/deployment-cli", "sha256": None,
+        }
+        self.assertEqual(
+            "qualification_candidate_audit_write_shape",
+            invoke([*writes, deployment_write], directories, sidecars),
+        )
+        self.assertEqual(
+            "qualification_candidate_directory_not_empty",
+            invoke(
+                writes, directories,
+                {**sidecars, "tmp/deployment-cli/foreign.bin": {
+                    "bytes": 1, "sha256": "4" * 64,
+                }},
+            ),
+        )
+
     def test_script_closes_exact_failed_audit_and_authority_absence(self) -> None:
         operator = self.operator()
         bundle, report, restore_name, _python, _tool = operator._verified_bundle(
@@ -1707,9 +1865,12 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             "$audit.outcome-ne'failed'",
             "vm-write-audit-[0-9a-f]{32}",
             "qualification_candidate_audit_residue_unbound",
-            "control/pending_activation.json",
-            "writer_handoff_pending.json",
-            "qualification_authority_receipt_or_journal_exists",
+            "audit/receipts",
+            "backups='created'",
+            "incoming='created'",
+            "state/locks",
+            "tmp/deployment-cli",
+            "Assert-QrhClosedSnapshot",
         ):
             self.assertIn(closed_contract, script)
 

@@ -97,16 +97,24 @@ D 资格重置还要求 failure-domain attestation 原始文件逐字节等于 c
 file SHA-256 必须进入 inspection、apply-intent 与 applied 三份 closed evidence。apply 在
 写 intent 前和发出远端删除前均重新读取并验证同一 canonical bytes/file SHA，语义等价的
 空白或字段重排也视为 identity 改变并拒绝。
-D 内 materialization event 与 production host facts 则必须分别逐字节等于正式发布到
-off-host 的 canonical event 和 production-facts 文件（长度与 SHA-256 都相同），不能只做
-字段近似比较。
+D 内 production host facts 的相对路径必须从已验证的 `bundle_id` 精确派生为
+`audit/evidence/production-host-facts-<bundle_id>.json`，且其 bytes/SHA-256 必须与
+off-host 正式文件逐字节相同。off-host canonical materialization event 仍是语义权威；本次
+已物化 V39 资格根中的远端 event 是原 restore 的普通 PowerShell 5.1 hashtable 序列化。
+reset 仅兼容机械重建并经本机 PowerShell 5.1 逐字节复现的
+`legacy_powershell_hashtable_v1` 唯一 bytes/SHA-256，同时在 inspection、apply-intent 与
+applied 证据中记录 canonical authority SHA、legacy serialization identity 及 observed
+remote SHA。任意其他字段重排、空白或语义等价 JSON 都拒绝，不存在宽泛 semantic fallback。
 
 当前真实失败路径必须恰好存在一份 `deploy-candidate_only` / `failed` VM write audit。
 audit 自身必须是 `write_atomic_new_json` 的 canonical bytes，且 `audit_id`、路径、closed
 declared write set、每条 `path/relative_path/change/entry_type/bytes/sha256` 都与当前残留
-机械一致。唯一可识别的残留是两库成对出现的零字节 WAL、标准 32 KiB SHM，以及空的
-`tmp\candidate-probes` / `tmp\deployment-cli`（允许 audit 记录现有 `state` 目录的 metadata
-变化）；缺少或多出 audit/残留都会拒绝。它们仍被纳入 inspect 的 exact inventory hash、
+机械一致。该真实 audit 必须精确记录 `audit`、`audit/receipts`、`backups`、`incoming`、
+`state`、`state/locks`、`tmp`、`tmp/candidate-probes` 的既定 created/modified 变化，以及
+两库成对出现的零字节 WAL 和标准 32 KiB SHM。`tmp/deployment-cli` 是 OpenSSH deployment
+invoker 在 deploy CLI 启动、VM write-audit before-snapshot 之前创建的固定 TEMP/TMP，因此
+必须在当前根中存在且为空、必须不出现在该 audit 的 observed writes；出现内容、被 audit
+记录、缺失或出现任何其他目录/文件均拒绝。上述空目录和 sidecar 均纳入 inspect 的 exact inventory hash、
 逐 top-level subtree hash 和 apply 的 TOCTOU 复核。apply 只删除已复核的 exact root
 children，成功后保留空根，不生成 activation 或 recovery receipt，并须立即用同一 bundle
 重新 `restore`。

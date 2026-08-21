@@ -53,6 +53,41 @@ _QUALIFICATION_RESET_APPLY_SCHEMA = (
 )
 _LEGACY_V39_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
 _TRANSFER_ATTEMPT_SCHEMA = "qrh-cold-restore-transfer-attempt/v1"
+_LEGACY_MATERIALIZATION_SERIALIZATION = "legacy_powershell_hashtable_v1"
+
+
+def _legacy_materialization_event_bytes(event: Mapping[str, object]) -> bytes:
+    """Rebuild the one already-published PS 5.1 hashtable byte profile.
+
+    The first qualification restore used an ordinary PowerShell hashtable. On
+    the qualification host that fixed implementation emitted the order below.
+    This is deliberately not a semantic-JSON fallback: reset accepts only the
+    resulting exact bytes/hash, alongside the canonical off-host authority.
+    """
+
+    fields = event.get("fields")
+    if not isinstance(fields, dict):
+        raise ColdRestoreCLIError("qualification materialization fields are invalid")
+    legacy = {
+        "schema_version": event["schema_version"],
+        "authority": event["authority"],
+        "event_id": event["event_id"],
+        "fields": {
+            "import_cleaned": fields["import_cleaned"],
+            "empty_root_precondition": fields["empty_root_precondition"],
+            "bundle_id": fields["bundle_id"],
+            "runtime_tmp_cleaned": fields["runtime_tmp_cleaned"],
+            "manifest_sha256": fields["manifest_sha256"],
+            "release_id": fields["release_id"],
+        },
+        "kind": event["kind"],
+    }
+    return json.dumps(
+        legacy,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 # The D-root Python may run only after the complete operational/file closure is
 # proven.  It is used solely to prove the existing VM-write audit has the exact
@@ -232,6 +267,52 @@ def _qualification_closure_guard_script() -> str:
         "foreach($relative in $snapshot.directories){"
         "if(-not$expectedDirectories.Contains($relative))"
         "{throw 'qualification_unknown_directory'}}};"
+    )
+
+
+def _qualification_candidate_residue_guard_script() -> str:
+    """Return the exact failed-candidate audit and empty-residue contract."""
+
+    return (
+        "function Assert-QrhCandidateResidueAudit($audit,$snapshot,$expectedDirs){"
+        "$directoryChanges=@{audit='modified';'audit/receipts'='created';"
+        "backups='created';incoming='created';state='modified';"
+        "'state/locks'='created';tmp='modified';'tmp/candidate-probes'='created'};"
+        "$sidecars=@('state/comments.sqlite3-wal','state/comments.sqlite3-shm',"
+        "'state/research_workspace.sqlite3-wal','state/research_workspace.sqlite3-shm');"
+        "$expected=@($directoryChanges.Keys)+$sidecars;$seen=@{};"
+        "foreach($write in @($audit.observed_writes)){"
+        "$keys=@($write.PSObject.Properties.Name|Sort-Object);"
+        "$relative=[string]$write.relative_path;if(($keys-join ',')-ne"
+        "'bytes,change,entry_type,path,relative_path,sha256'-or"
+        "$seen.ContainsKey($relative)-or$expected-notcontains$relative-or"
+        "$write.path-ne($root+'\\'+$relative.Replace('/','\\')))"
+        "{throw 'qualification_candidate_audit_write_shape'};"
+        "if($directoryChanges.ContainsKey($relative)){if("
+        "$write.change-ne$directoryChanges[$relative]-or"
+        "$write.entry_type-ne'directory'-or[long]$write.bytes-ne 0-or"
+        "$null-ne$write.sha256-or-not$snapshot.directories.Contains($relative))"
+            "{throw 'qualification_candidate_audit_directory_shape'}}"
+        "else{if($write.change-ne'created'-or$write.entry_type-ne'file'-or"
+        "-not$snapshot.files.ContainsKey($relative)-or"
+        "[long]$write.bytes-ne[long]$snapshot.files[$relative].bytes-or"
+        "[string]$write.sha256-ne[string]$snapshot.files[$relative].sha256)"
+            "{throw 'qualification_candidate_audit_file_shape'}};$seen[$relative]=$true};"
+        "foreach($relative in $expected){if(-not$seen.ContainsKey($relative))"
+        "{throw 'qualification_candidate_audit_residue_unbound'}};"
+        "$empty=@('audit/receipts','backups','incoming','state/locks',"
+        "'tmp/candidate-probes','tmp/deployment-cli');"
+        "foreach($relative in $empty){if(-not$snapshot.directories.Contains($relative))"
+            "{throw 'qualification_candidate_directory_absent'};"
+        "$cursor=$relative;while($true){[void]$expectedDirs.Add($cursor);"
+        "if(-not$cursor.Contains('/')){break};"
+        "$cursor=$cursor.Substring(0,$cursor.LastIndexOf('/'))};"
+        "$prefix=$relative+'/';foreach($file in $snapshot.files.Keys){"
+        "if($file.StartsWith($prefix,[StringComparison]::Ordinal))"
+            "{throw 'qualification_candidate_directory_not_empty'}};"
+        "foreach($directory in $snapshot.directories){if("
+        "$directory.StartsWith($prefix,[StringComparison]::Ordinal))"
+            "{throw 'qualification_candidate_directory_not_empty'}}}};"
     )
 
 
@@ -728,6 +809,7 @@ class OpenSSHColdRestore:
                 "qualification formally published evidence is unreadable"
             ) from error
         expected_event_bytes = self._canonical_bytes(expected_event)
+        legacy_event_bytes = _legacy_materialization_event_bytes(expected_event)
         expected_facts_bytes = (
             json.dumps(
                 production,
@@ -873,11 +955,21 @@ class OpenSSHColdRestore:
                 expected_event_bytes
             ).hexdigest(),
             "materialization_event_bytes": len(event_bytes),
+            "materialization_event_remote_serialization": (
+                _LEGACY_MATERIALIZATION_SERIALIZATION
+            ),
+            "materialization_event_remote_sha256": hashlib.sha256(
+                legacy_event_bytes
+            ).hexdigest(),
+            "materialization_event_remote_bytes": len(legacy_event_bytes),
             "failure_domain_attestation_sha256": rebuilt.sha256,
             "failure_domain_attestation_file_sha256": hashlib.sha256(
                 attestation_bytes
             ).hexdigest(),
             "production_host_facts_sha256": production["facts_sha256"],
+            "production_host_facts_relative_path": (
+                f"audit/evidence/production-host-facts-{report.bundle_id}.json"
+            ),
             "production_host_facts_file_sha256": hashlib.sha256(
                 production_facts_bytes
             ).hexdigest(),
@@ -1307,8 +1399,7 @@ class OpenSSHColdRestore:
             "active_bytes", "active_sha256", "bundle_id",
             "declared_write_set_sha256", "legacy_deployment_id",
             "legacy_server_bytes", "legacy_server_sha256",
-            "materialization_event_bytes", "materialization_event_id",
-            "materialization_event_sha256", "operational_bootstrap_bytes",
+            "operational_bootstrap_bytes",
             "operational_bootstrap_sha256", "production_host_facts_bytes",
             "production_host_facts_file_sha256", "python_bytes", "python_sha256",
             "release_id", "release_manifest_bytes", "release_manifest_sha256",
@@ -1316,6 +1407,12 @@ class OpenSSHColdRestore:
         }
         if apply:
             remote_fields.add("inspected_top_level_children")
+        else:
+            remote_fields.update({
+                "production_host_facts_relative_path",
+                "materialization_event_remote_sha256",
+                "materialization_event_remote_bytes",
+            })
         if not remote_fields.issubset(contract):
             raise ColdRestoreCLIError("qualification reset remote contract is incomplete")
         contract_bytes = self._canonical_bytes(
@@ -1359,6 +1456,9 @@ class OpenSSHColdRestore:
             "{throw 'qualification_audit_probe_shape'};return $value};"
             if not apply else ""
         )
+        residue_guard_script = (
+            _qualification_candidate_residue_guard_script() if not apply else ""
+        )
         expected_hash = self._literal(expected_inventory_sha256 or "")
         intent_hash = self._literal(intent_nonce_sha256)
         schema = (
@@ -1377,6 +1477,7 @@ class OpenSSHColdRestore:
             + _qualification_legacy_guard_script()
             + _qualification_no_d_execution_guard_script()
             + audit_probe_script
+            + residue_guard_script
             + "function Get-CanonicalRootInventory{"
             "$rootItem=Get-Item -LiteralPath $root -Force -ErrorAction Stop;"
             "if(-not$rootItem.PSIsContainer-or(($rootItem.Attributes-band"
@@ -1481,10 +1582,11 @@ class OpenSSHColdRestore:
             "([long]$record.bytes) ([string]$record.sha256)};"
             "Add-ExpectedFile ([string]$contract.restore_tool_path) "
             "([long]$contract.restore_tool_bytes) ([string]$contract.restore_tool_sha256);"
-            "$eventRelative='audit/events/'+$contract.materialization_event_id+'.json';"
-            "Add-ExpectedFile $eventRelative ([long]$contract.materialization_event_bytes) "
-            "([string]$contract.materialization_event_sha256);"
-            "$factsRelative='audit/evidence/production-host-facts.json';"
+            "$eventRelative='audit/events/cold-materialization-'+$contract.bundle_id+'.json';"
+            "Add-ExpectedFile $eventRelative "
+            "([long]$contract.materialization_event_remote_bytes) "
+            "([string]$contract.materialization_event_remote_sha256);"
+            "$factsRelative=[string]$contract.production_host_facts_relative_path;"
             "Add-ExpectedFile $factsRelative ([long]$contract.production_host_facts_bytes) "
             "([string]$contract.production_host_facts_file_sha256);"
             "$writeAudits=@($snapshot.files.Keys|Where-Object{"
@@ -1503,30 +1605,7 @@ class OpenSSHColdRestore:
             "$auditRelative-ne('audit/events/'+$audit.audit_id+'.json')-or"
             "$audit.audit_record_path-ne($root+'\\'+$auditRelative.Replace('/','\\')))"
             "{throw 'qualification_candidate_audit_identity'};"
-            "$residues=@('state/comments.sqlite3-wal','state/comments.sqlite3-shm',"
-            "'state/research_workspace.sqlite3-wal','state/research_workspace.sqlite3-shm',"
-            "'tmp','tmp/candidate-probes','tmp/deployment-cli');$seen=@{};"
-            "foreach($write in @($audit.observed_writes)){"
-            "$writeKeys=@($write.PSObject.Properties.Name|Sort-Object);"
-            "$relative=[string]$write.relative_path;if(($writeKeys-join ',')-ne"
-            "'bytes,change,entry_type,path,relative_path,sha256'-or"
-            "$seen.ContainsKey($relative)-or(@('state')+$residues)-notcontains$relative-or"
-            "$write.path-ne($root+'\\'+$relative.Replace('/','\\')))"
-            "{throw 'qualification_candidate_audit_write_shape'};"
-            "if($relative-eq'state'){if($write.change-ne'modified'-or"
-            "$write.entry_type-ne'directory'-or[long]$write.bytes-ne 0-or$null-ne$write.sha256)"
-            "{throw 'qualification_candidate_audit_state_shape'}}"
-            "elseif($relative.StartsWith('tmp')){if($write.change-ne'created'-or"
-            "$write.entry_type-ne'directory'-or[long]$write.bytes-ne 0-or$null-ne$write.sha256-or"
-            "-not$snapshot.directories.Contains($relative))"
-            "{throw 'qualification_candidate_audit_directory_shape'}}"
-            "else{if($write.change-ne'created'-or$write.entry_type-ne'file'-or"
-            "-not$snapshot.files.ContainsKey($relative)-or"
-            "[long]$write.bytes-ne[long]$snapshot.files[$relative].bytes-or"
-            "[string]$write.sha256-ne[string]$snapshot.files[$relative].sha256)"
-            "{throw 'qualification_candidate_audit_file_shape'}};$seen[$relative]=$true};"
-            "foreach($relative in $residues){if(-not$seen.ContainsKey($relative))"
-            "{throw 'qualification_candidate_audit_residue_unbound'}};"
+            "Assert-QrhCandidateResidueAudit $audit $snapshot $expectedDirectories;"
             "$auditRecord=$snapshot.files[$auditRelative];Add-ExpectedFile $auditRelative "
             "([long]$auditRecord.bytes) ([string]$auditRecord.sha256)};"
             "$sidecars=@('state/comments.sqlite3-wal','state/comments.sqlite3-shm',"
@@ -1542,26 +1621,7 @@ class OpenSSHColdRestore:
             "if($snapshot.files[$shm].bytes-ne 32768)"
             "{throw 'qualification_candidate_sidecar_shm_shape'};"
             "[void]$expectedFiles.Add($wal);[void]$expectedFiles.Add($shm)};"
-            "foreach($relative in $expectedFiles){$cursor=$relative;while($cursor.Contains('/')){"
-            "$cursor=$cursor.Substring(0,$cursor.LastIndexOf('/'));"
-            "[void]$expectedDirectories.Add($cursor)}};"
-            "foreach($relative in @('tmp','tmp/candidate-probes','tmp/deployment-cli')){"
-            "[void]$expectedDirectories.Add($relative);"
-            "if(-not$snapshot.directories.Contains($relative))"
-            "{throw 'qualification_candidate_directory_absent'}};"
             "Assert-QrhClosedSnapshot $snapshot $expectedFiles $expectedDirectories;"
-            "$top=@(Get-ChildItem -LiteralPath $root -Force);foreach($item in $top){"
-            "if(@('audit','control','releases','state','tmp','tooling','tools')-notcontains$item.Name)"
-            "{throw 'qualification_unknown_top_level'}};"
-            "$forbidden=@('control/pending_activation.json','control/writer_handoff_pending.json',"
-            "'control/writer_handoff_terminal.json','control/writer_handoff_journal.json');"
-            "foreach($relative in $forbidden){if($snapshot.files.ContainsKey($relative))"
-            "{throw 'qualification_pending_authority_exists'}};"
-            "foreach($relative in $snapshot.files.Keys){if("
-            "($relative.StartsWith('audit/receipts/')-or$relative.StartsWith('control/'))-and"
-            "($relative-match'(?i)(activation|recovery).*(receipt|journal)|"
-            "(receipt|journal).*(activation|recovery)|writer[_-]handoff'))"
-            "{throw 'qualification_authority_receipt_or_journal_exists'}};"
             "$canonicalAudit=Invoke-QualificationAuditProbe $auditRelative;"
             "if($canonicalAudit.canonical_json_sha256-ne"
             "$snapshot.files[$auditRelative].sha256)"
@@ -1913,6 +1973,15 @@ class OpenSSHColdRestore:
             "materialization_event_sha256": contract[
                 "materialization_event_sha256"
             ],
+            "materialization_event_remote_serialization": contract[
+                "materialization_event_remote_serialization"
+            ],
+            "materialization_event_remote_sha256": contract[
+                "materialization_event_remote_sha256"
+            ],
+            "materialization_event_remote_bytes": contract[
+                "materialization_event_remote_bytes"
+            ],
             "failure_domain_attestation_sha256": contract[
                 "failure_domain_attestation_sha256"
             ],
@@ -2010,6 +2079,15 @@ class OpenSSHColdRestore:
             "materialization_event_id": contract["materialization_event_id"],
             "materialization_event_sha256": contract[
                 "materialization_event_sha256"
+            ],
+            "materialization_event_remote_serialization": contract[
+                "materialization_event_remote_serialization"
+            ],
+            "materialization_event_remote_sha256": contract[
+                "materialization_event_remote_sha256"
+            ],
+            "materialization_event_remote_bytes": contract[
+                "materialization_event_remote_bytes"
             ],
             "failure_domain_attestation_sha256": contract[
                 "failure_domain_attestation_sha256"
