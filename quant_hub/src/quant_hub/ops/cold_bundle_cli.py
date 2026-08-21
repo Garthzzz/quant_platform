@@ -139,47 +139,93 @@ class ColdBundleBuilder:
                     "--release-manifest-sha256", release_manifest_sha256,
                 )
             )
-        value = self._remote(arguments)
-        expected_root = (
-            PureWindowsPath(self.config.vm.root)
-            / "tmp" / "publish-recovery" / "checkpoints" / checkpoint_id
-        )
-        if (
-            value.get("schema_version") != "qrh-publish-checkpoint-result/v1"
-            or value.get("checkpoint_id") != checkpoint_id
-            or PureWindowsPath(str(value.get("checkpoint_root"))) != expected_root
-            or (source == "legacy_c" and value.get("source_authority") != "legacy_c_read_only")
-        ):
-            raise ColdBundleCLIError("checkpoint response identity/path differs")
+        primary_error: BaseException | None = None
+        capture_command_succeeded = False
+        try:
+            value = self._remote(arguments)
+            capture_command_succeeded = True
+            expected_root = (
+                PureWindowsPath(self.config.vm.root)
+                / "tmp" / "publish-recovery" / "checkpoints" / checkpoint_id
+            )
+            if (
+                value.get("schema_version") != "qrh-publish-checkpoint-result/v1"
+                or value.get("checkpoint_id") != checkpoint_id
+                or PureWindowsPath(str(value.get("checkpoint_root"))) != expected_root
+                or (
+                    source == "legacy_c"
+                    and value.get("source_authority") != "legacy_c_read_only"
+                )
+            ):
+                raise ColdBundleCLIError("checkpoint response identity/path differs")
 
-        intake = self.config.recovery.recovery_root / "checkpoint-intake"
-        intake.mkdir(parents=True, exist_ok=True)
-        ensure_no_reparse_components(intake)
-        destination = intake / checkpoint_id
-        if destination.exists():
-            raise ColdBundleCLIError("checkpoint intake identity already exists")
-        remote_source = f"{self.config.vm.ssh_alias}:" + str(expected_root).replace("\\", "/")
-        copied = self.command_runner(
+            intake = self.config.recovery.recovery_root / "checkpoint-intake"
+            intake.mkdir(parents=True, exist_ok=True)
+            ensure_no_reparse_components(intake)
+            destination = intake / checkpoint_id
+            if destination.exists():
+                raise ColdBundleCLIError("checkpoint intake identity already exists")
+            remote_source = (
+                f"{self.config.vm.ssh_alias}:"
+                + str(expected_root).replace("\\", "/")
+            )
+            copied = self.command_runner(
+                (
+                    "scp", "-q", "-r", "-o", "BatchMode=yes", "-o",
+                    "ConnectTimeout=20", "-o",
+                    f"HostName={self.config.vm.target_address}", "--",
+                    remote_source, str(intake),
+                )
+            )
+            if copied.returncode != 0 or not destination.is_dir():
+                raise ColdBundleCLIError("checkpoint download failed")
+            scratch = self.config.recovery.recovery_root / "checkpoint-verify-scratch"
+            scratch.mkdir(exist_ok=True)
+            ensure_no_reparse_components(scratch)
+            report = verify_sqlite_checkpoint(destination, scratch_root=scratch)
+            if (
+                not report.valid
+                or report.checkpoint_id != checkpoint_id
+                or report.manifest_sha256 != value.get("checkpoint_manifest_sha256")
+            ):
+                raise ColdBundleCLIError("downloaded checkpoint identity differs")
+            return destination
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            try:
+                self._cleanup_checkpoint_capture(
+                    checkpoint_id=checkpoint_id,
+                    require_removed=capture_command_succeeded,
+                )
+            except BaseException as cleanup_error:
+                cleanup_failure = ColdBundleCLIError(
+                    "VM checkpoint staging cleanup failed"
+                )
+                if primary_error is None:
+                    raise cleanup_failure from cleanup_error
+                primary_error.add_note(
+                    f"{cleanup_failure}: {cleanup_error}"
+                )
+
+    def _cleanup_checkpoint_capture(
+        self, *, checkpoint_id: str, require_removed: bool = True
+    ) -> None:
+        value = self._remote(
             (
-                "scp", "-q", "-r", "-o", "BatchMode=yes", "-o",
-                "ConnectTimeout=20", "-o",
-                f"HostName={self.config.vm.target_address}", "--",
-                remote_source, str(intake),
+                "-B", "-m", "quant_hub.ops.publish_recovery_cli",
+                "cleanup-capture", "--vm-root", str(self.config.vm.root),
+                "--checkpoint-id", checkpoint_id,
             )
         )
-        if copied.returncode != 0 or not destination.is_dir():
-            raise ColdBundleCLIError("checkpoint download failed")
-        scratch = self.config.recovery.recovery_root / "checkpoint-verify-scratch"
-        scratch.mkdir(exist_ok=True)
-        ensure_no_reparse_components(scratch)
-        report = verify_sqlite_checkpoint(destination, scratch_root=scratch)
         if (
-            not report.valid
-            or report.checkpoint_id != checkpoint_id
-            or report.manifest_sha256 != value.get("checkpoint_manifest_sha256")
+            value.get("schema_version") != "qrh-publish-checkpoint-cleanup/v1"
+            or value.get("checkpoint_id") != checkpoint_id
+            or not isinstance(value.get("staging_removed"), bool)
+            or (require_removed and value.get("staging_removed") is not True)
         ):
-            raise ColdBundleCLIError("downloaded checkpoint identity differs")
-        return destination
+            raise ColdBundleCLIError("VM checkpoint cleanup identity differs")
 
     def build(self, *, release_root: Path, bundle_id: str, state_source: str) -> ColdBundleBuildResult:
         if state_source not in {"legacy_c", "d_active"}:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path, PureWindowsPath
 import shutil
@@ -7,11 +8,17 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 from quant_hub.ops.operational_source_cli import (
+    MAX_TRANSPORT_MEMBER_NAME_CHARS,
     OperationalSourceError,
     OperationalSourceOrchestrator,
+    _build_transport_archive,
     _tree_records,
+    _validate_archive_member_name,
+    _validate_transport_archive,
     inspect_portable_runtime,
     prepare_operational_control,
 )
@@ -93,9 +100,11 @@ class FakeBackend:
 
     def _ssh(self, script):
         self.ssh_calls.append(script)
-        if len(self.ssh_calls) == 1:
+        if "exact_staging_cleared" in script:
             return '{"status":"absent"}'
-        if len(self.ssh_calls) == 2:
+        if "archive_unpacked" in script:
+            return '{"status":"archive_unpacked","generation":"op-generation-1"}'
+        if "tooling_adopted" in script:
             return '{"status":"tooling_adopted","generation":"op-generation-1"}'
         return '{"status":"operational_staging_removed"}'
 
@@ -104,6 +113,8 @@ class FakeBackend:
 
     def upload(self, source, target):
         self.uploads.append((Path(source), PureWindowsPath(target)))
+        self.upload_payloads = getattr(self, "upload_payloads", [])
+        self.upload_payloads.append(Path(source).read_bytes())
 
 
 class OperationalSourceTests(unittest.TestCase):
@@ -195,8 +206,49 @@ class OperationalSourceTests(unittest.TestCase):
             portable, generation="op-generation-1"
         )
         self.assertEqual("prepared_no_scm", result["status"])
-        self.assertEqual(len(runtime.inventory["files"]) + 1, len(backend.uploads))
-        adoption = backend.ssh_calls[1]
+        self.assertEqual(1, len(backend.uploads))
+        self.assertEqual("op-generation-1.zip", backend.uploads[0][1].name)
+        archive_copy = self.root / "captured.zip"
+        archive_copy.write_bytes(backend.upload_payloads[0])
+        with zipfile.ZipFile(archive_copy) as archive:
+            self.assertEqual(
+                {"runtime_inventory.json"}
+                | {f"python/{row['path']}" for row in runtime.inventory["files"]},
+                set(archive.namelist()),
+            )
+        stage_probe = backend.ssh_calls[0]
+        self.assertIn("operational_generation_staging_exists", stage_probe)
+        self.assertIn("active_exists", stage_probe)
+        self.assertIn("release_exists", stage_probe)
+        self.assertIn("state_exists", stage_probe)
+        self.assertIn("root_parent_reparse", stage_probe)
+        unpack = backend.ssh_calls[1]
+        self.assertIn("transport_entry_traversal", unpack)
+        self.assertIn("transport_entry_case_collision", unpack)
+        self.assertIn("transport_uncompressed_size", unpack)
+        self.assertIn("transport_archive_hash", unpack)
+        self.assertIn(
+            hashlib.sha256(backend.upload_payloads[0]).hexdigest(), unpack
+        )
+        self.assertIn("transport_entry_output_size", unpack)
+        self.assertIn("transport_destination_too_long", unpack)
+        self.assertIn("transport_extract_escape", unpack)
+        for powershell_script in (stage_probe, unpack):
+            parsed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[void][scriptblock]::Create([Console]::In.ReadToEnd())",
+                ],
+                input=powershell_script,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, parsed.returncode, parsed.stderr)
+        adoption = backend.ssh_calls[2]
         self.assertIn("existing_tooling_requires_explicit_replace", adoption)
         self.assertIn("root_parent_reparse", adoption)
         self.assertLess(adoption.index("root_parent_reparse"), adoption.index("Move-Item"))
@@ -205,11 +257,109 @@ class OperationalSourceTests(unittest.TestCase):
         self.assertIn(runtime.python_sha256, script)
         self.assertIn(runtime.package_inventory_sha256, script)
         self.assertNotIn("sc.exe", script.casefold())
-        self.assertEqual(3, len(backend.ssh_calls))
+        self.assertEqual(4, len(backend.ssh_calls))
         cleanup = backend.ssh_calls[-1]
         self.assertIn("operational_staging_removed", cleanup)
+        self.assertIn("cleanup_archive_type", cleanup)
+        self.assertIn("Remove-VerifiedRegularTree $p", cleanup)
+        self.assertNotIn("Remove-Item -LiteralPath $p -Recurse", cleanup)
         self.assertIn("root_parent_reparse", cleanup)
         self.assertLess(cleanup.index("root_parent_reparse"), cleanup.index("Remove-Item"))
+
+    def test_transport_archive_rejects_traversal_and_case_collision(self) -> None:
+        portable = portable_runtime(self.root / "portable")
+        runtime = inspect_portable_runtime(portable, "op-generation-1")
+        valid = self.root / "valid.zip"
+        (
+            entry_count,
+            uncompressed_bytes,
+            archive_bytes,
+            archive_sha256,
+        ) = _build_transport_archive(valid, runtime)
+        self.assertEqual(len(runtime.inventory["files"]) + 1, entry_count)
+        self.assertGreater(uncompressed_bytes, 0)
+        self.assertEqual(valid.stat().st_size, archive_bytes)
+        self.assertRegex(archive_sha256, r"^[0-9a-f]{64}$")
+
+        traversal = self.root / "traversal.zip"
+        with zipfile.ZipFile(traversal, "w") as archive:
+            archive.writestr("runtime_inventory.json", b"{}")
+            archive.writestr("python/../escape.txt", b"escape")
+        with self.assertRaisesRegex(OperationalSourceError, "path is unsafe"):
+            _validate_transport_archive(traversal, runtime)
+
+        collision = self.root / "collision.zip"
+        with zipfile.ZipFile(collision, "w") as archive:
+            archive.writestr("runtime_inventory.json", b"{}")
+            archive.writestr("python/A.txt", b"a")
+            archive.writestr("python/a.txt", b"b")
+        with self.assertRaisesRegex(OperationalSourceError, "case-colliding"):
+            _validate_transport_archive(collision, runtime)
+
+        symlink = self.root / "symlink.zip"
+        with zipfile.ZipFile(symlink, "w") as archive:
+            archive.writestr("runtime_inventory.json", b"{}")
+            info = zipfile.ZipInfo("python/link")
+            info.create_system = 3
+            info.external_attr = (0o120777 << 16)
+            archive.writestr(info, b"target")
+        with self.assertRaisesRegex(OperationalSourceError, "type is unsafe"):
+            _validate_transport_archive(symlink, runtime)
+
+        with patch(
+            "quant_hub.ops.operational_source_cli.MAX_TRANSPORT_ARCHIVE_BYTES",
+            valid.stat().st_size - 1,
+        ), self.assertRaisesRegex(OperationalSourceError, "exceeds its cap"):
+            _validate_transport_archive(valid, runtime)
+
+    def test_transport_member_rejects_windows_devices_ads_unc_and_long_paths(self) -> None:
+        unsafe = (
+            "python/CON.txt",
+            "python/CON .txt",
+            "python/com1",
+            "python/data.txt:payload",
+            r"python\\escape.txt",
+            "/python/escape.txt",
+            "python/" + "x" * (MAX_TRANSPORT_MEMBER_NAME_CHARS + 1),
+            "python/question?.txt",
+            "python/control\x01.txt",
+            "python//double.txt",
+            "python/trailing/",
+        )
+        for member in unsafe:
+            with self.subTest(member=member), self.assertRaisesRegex(
+                OperationalSourceError, "path is unsafe"
+            ):
+                _validate_archive_member_name(member)
+
+    def test_interrupted_stage_cleanup_requires_explicit_empty_d(self) -> None:
+        portable = portable_runtime(self.root / "portable")
+        runtime = inspect_portable_runtime(portable, "op-generation-1")
+        orchestrator = OperationalSourceOrchestrator(
+            config(self.root), backend=FakeBackend()
+        )
+        strict = orchestrator._stage_probe_script(
+            runtime, replace_existing_empty_d=False
+        )
+        self.assertIn("$replace=$false", strict)
+        self.assertIn("operational_generation_staging_exists", strict)
+        self.assertNotIn("Remove-Item -LiteralPath $partial -Recurse -Force};if", strict.split(
+            "if(-not $replace)"
+        )[0])
+
+        replace = orchestrator._stage_probe_script(
+            runtime, replace_existing_empty_d=True
+        )
+        self.assertIn("$replace=$true", replace)
+        cleanup_invocation = replace.index("Remove-VerifiedRegularTree $partial")
+        for gate in ("active_exists", "release_exists", "state_exists"):
+            self.assertLess(replace.index(gate), cleanup_invocation)
+        self.assertIn("Remove-VerifiedRegularTree $partial", replace)
+        self.assertNotIn("Remove-Item -LiteralPath $partial -Recurse -Force", replace)
+        self.assertIn("staging_tree_reparse", replace)
+        self.assertIn("Remove-Item -LiteralPath $archive -Force", replace)
+        self.assertIn("Remove-Item -LiteralPath $uploadPartial -Force", replace)
+        self.assertNotIn("D:\\quant\\quant_platform\\tooling", replace)
 
     def test_portable_cache_or_secret_is_rejected(self) -> None:
         portable = portable_runtime(self.root / "portable")

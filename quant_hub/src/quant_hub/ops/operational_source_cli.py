@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 from typing import Callable, Mapping, Sequence
 from uuid import uuid4
+import zipfile
 
 from quant_hub.config import ensure_no_reparse_components, stat_is_reparse_point
 from quant_hub.runtime_seal import read_json, write_atomic_new_json
@@ -49,6 +50,16 @@ from .windows_service import build_install_candidate, quant_hub_package_inventor
 GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 REMOTE_PREPARE_SCHEMA = "qrh-operational-prepare/v1"
 SOURCE_RECEIPT_SCHEMA = "qrh-operational-source-receipt/v1"
+MAX_TRANSPORT_ENTRIES = 20_000
+MAX_TRANSPORT_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TRANSPORT_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TRANSPORT_MEMBER_BYTES = 512 * 1024 * 1024
+MAX_TRANSPORT_MEMBER_NAME_CHARS = 240
+WINDOWS_RESERVED_STEMS = {
+    "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
 
 
 class OperationalSourceError(RuntimeError):
@@ -306,6 +317,154 @@ def inspect_portable_runtime(root: Path, generation: str) -> PortableRuntime:
     )
 
 
+def _transport_member_name(relative: str) -> str:
+    _validate_archive_member_name(relative)
+    return f"python/{PurePosixPath(relative).as_posix()}"
+
+
+def _validate_archive_member_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise OperationalSourceError("operational transport member path is unsafe")
+    pure = PurePosixPath(name)
+    if (
+        not name
+        or len(name) > MAX_TRANSPORT_MEMBER_NAME_CHARS
+        or "\\" in name
+        or pure.is_absolute()
+        or name != pure.as_posix()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+        or any(
+            len(part) > 255
+            or ":" in part
+            or part.endswith((".", " "))
+            or any(character in '<>"|?*' or ord(character) < 32 for character in part)
+            or part.split(".", 1)[0].rstrip().upper() in WINDOWS_RESERVED_STEMS
+            for part in pure.parts
+        )
+    ):
+        raise OperationalSourceError("operational transport member path is unsafe")
+    return pure.as_posix()
+
+
+def _zip_info(name: str) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = (stat.S_IFREG | 0o600) << 16
+    return info
+
+
+def _validate_transport_archive(path: Path, portable: PortableRuntime) -> None:
+    manifest_bytes = _canonical(portable.inventory)
+    expected: dict[str, tuple[int, str | None]] = {
+        "runtime_inventory.json": (
+            len(manifest_bytes), hashlib.sha256(manifest_bytes).hexdigest()
+        )
+    }
+    expected_folded = {"runtime_inventory.json"}
+    for record in portable.inventory["files"]:
+        member = _transport_member_name(str(record["path"]))
+        folded = member.casefold()
+        if folded in expected_folded:
+            raise OperationalSourceError("operational transport has case-colliding paths")
+        expected_folded.add(folded)
+        expected[member] = (int(record["bytes"]), str(record["sha256"]))
+    try:
+        archive_bytes = path.stat().st_size
+        if archive_bytes > MAX_TRANSPORT_ARCHIVE_BYTES:
+            raise OperationalSourceError("operational transport archive exceeds its cap")
+        with zipfile.ZipFile(path, "r") as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_TRANSPORT_ENTRIES:
+                raise OperationalSourceError("operational transport entry count exceeds its cap")
+            observed: dict[str, zipfile.ZipInfo] = {}
+            folded: set[str] = set()
+            total = 0
+            for info in infos:
+                name = _validate_archive_member_name(info.filename)
+                if name != "runtime_inventory.json" and not name.startswith("python/"):
+                    raise OperationalSourceError(
+                        "operational transport member path escapes its scope"
+                    )
+                if info.is_dir() or info.flag_bits & 1:
+                    raise OperationalSourceError(
+                        "operational transport member type is unsafe"
+                    )
+                unix_mode = (info.external_attr >> 16) & 0xFFFF
+                if info.create_system == 3 and unix_mode and not stat.S_ISREG(unix_mode):
+                    raise OperationalSourceError(
+                        "operational transport member type is unsafe"
+                    )
+                if (
+                    info.file_size < 0
+                    or info.file_size > MAX_TRANSPORT_MEMBER_BYTES
+                    or info.compress_size < 0
+                    or info.file_size > MAX_TRANSPORT_UNCOMPRESSED_BYTES - total
+                ):
+                    raise OperationalSourceError(
+                        "operational transport member size exceeds its cap"
+                    )
+                total += info.file_size
+                if name.casefold() in folded:
+                    raise OperationalSourceError(
+                        "operational transport has duplicate/case-colliding paths"
+                    )
+                folded.add(name.casefold())
+                observed[name] = info
+            if total > MAX_TRANSPORT_UNCOMPRESSED_BYTES:
+                raise OperationalSourceError(
+                    "operational transport uncompressed size exceeds its cap"
+                )
+            if set(observed) != set(expected):
+                raise OperationalSourceError("operational transport members differ")
+            for name, (expected_bytes, expected_hash) in expected.items():
+                info = observed[name]
+                if info.file_size != expected_bytes:
+                    raise OperationalSourceError("operational transport member size differs")
+                digest = hashlib.sha256()
+                with archive.open(info, "r") as stream:
+                    for block in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(block)
+                if expected_hash is not None and digest.hexdigest() != expected_hash:
+                    raise OperationalSourceError("operational transport member hash differs")
+    except OperationalSourceError:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError) as error:
+        raise OperationalSourceError("operational transport archive is invalid") from error
+
+
+def _build_transport_archive(
+    path: Path, portable: PortableRuntime
+) -> tuple[int, int, int, str]:
+    manifest_bytes = _canonical(portable.inventory)
+    records = tuple(portable.inventory["files"])
+    uncompressed_bytes = len(manifest_bytes) + sum(
+        int(record["bytes"]) for record in records
+    )
+    if len(records) + 1 > MAX_TRANSPORT_ENTRIES:
+        raise OperationalSourceError("operational transport entry count exceeds its cap")
+    if uncompressed_bytes > MAX_TRANSPORT_UNCOMPRESSED_BYTES:
+        raise OperationalSourceError(
+            "operational transport uncompressed size exceeds its cap"
+        )
+    if any(int(record["bytes"]) > MAX_TRANSPORT_MEMBER_BYTES for record in records):
+        raise OperationalSourceError("operational transport member size exceeds its cap")
+    with zipfile.ZipFile(path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(_zip_info("runtime_inventory.json"), manifest_bytes)
+        for record in records:
+            relative = str(record["path"])
+            info = _zip_info(_transport_member_name(relative))
+            with portable.root.joinpath(*PurePosixPath(relative).parts).open("rb") as source:
+                with archive.open(info, "w") as destination:
+                    shutil.copyfileobj(source, destination, length=1024 * 1024)
+    _validate_transport_archive(path, portable)
+    return (
+        len(records) + 1,
+        uncompressed_bytes,
+        path.stat().st_size,
+        _sha256(path),
+    )
+
+
 class OperationalSourceOrchestrator:
     def __init__(
         self,
@@ -323,6 +482,162 @@ class OperationalSourceOrchestrator:
     @staticmethod
     def _ps(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
+
+    @staticmethod
+    def _verified_tree_delete_script() -> str:
+        """Delete an exact ordinary tree without recursing through a reparse point."""
+
+        return (
+            "function Remove-VerifiedRegularTree([string]$path){"
+            "$item=Get-Item -LiteralPath $path -Force;"
+            "if(-not$item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'staging_tree_root_type'};"
+            "foreach($child in @(Get-ChildItem -LiteralPath $path -Force)){"
+            "if(($child.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'staging_tree_reparse'};"
+            "if($child.PSIsContainer){Remove-VerifiedRegularTree $child.FullName}"
+            "elseif($child-is[IO.FileInfo]){Remove-Item -LiteralPath $child.FullName -Force}"
+            "else{throw 'staging_tree_entry_type'}};"
+            "Remove-Item -LiteralPath $path -Force};"
+        )
+
+    def _stage_probe_script(
+        self, portable: PortableRuntime, *, replace_existing_empty_d: bool
+    ) -> str:
+        root = self.config.vm.root
+        import_root = root / "tmp" / "operational-import"
+        partial = import_root / f"{portable.generation}.partial"
+        archive = import_root / f"{portable.generation}.zip"
+        upload_partial = archive.with_name(f".{archive.name}.upload.partial")
+        replace = "$true" if replace_existing_empty_d else "$false"
+        return (
+            "$ErrorActionPreference='Stop';"
+            + OpenSSHVMBackend._ensure_directory_script(import_root)
+            + self._verified_tree_delete_script()
+            + f"$partial={self._ps(str(partial))};$archive={self._ps(str(archive))};"
+            f"$uploadPartial={self._ps(str(upload_partial))};"
+            f"$replace={replace};$stagingExists=(Test-Path -LiteralPath $partial)-or"
+            "(Test-Path -LiteralPath $archive)-or"
+            "(Test-Path -LiteralPath $uploadPartial);if($stagingExists){"
+            "if(-not $replace){throw 'operational_generation_staging_exists'};"
+            f"if(Test-Path -LiteralPath {self._ps(str(root / 'control' / 'active_release.json'))})"
+            "{throw 'active_exists'};"
+            f"if((Test-Path -LiteralPath {self._ps(str(root / 'releases'))})-and"
+            f"@(Get-ChildItem -LiteralPath {self._ps(str(root / 'releases'))} -Force).Count-ne 0)"
+            "{throw 'release_exists'};"
+            f"if((Test-Path -LiteralPath {self._ps(str(root / 'state'))})-and"
+            f"@(Get-ChildItem -LiteralPath {self._ps(str(root / 'state'))} -Force).Count-ne 0)"
+            "{throw 'state_exists'};"
+            "if(Test-Path -LiteralPath $partial){$item=Get-Item -LiteralPath $partial -Force;"
+            "if(-not $item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'staging_partial_type'};"
+            "Remove-VerifiedRegularTree $partial};"
+            "if(Test-Path -LiteralPath $archive){$item=Get-Item -LiteralPath $archive -Force;"
+            "if($item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'staging_archive_type'};"
+            "Remove-Item -LiteralPath $archive -Force};"
+            "if(Test-Path -LiteralPath $uploadPartial){$item=Get-Item -LiteralPath "
+            "$uploadPartial -Force;if($item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'staging_upload_type'};"
+            "Remove-Item -LiteralPath $uploadPartial -Force}};"
+            "@{status=if($stagingExists){'exact_staging_cleared'}else{'absent'}}"
+            "|ConvertTo-Json -Compress"
+        )
+
+    def _unpack_script(
+        self,
+        portable: PortableRuntime,
+        *,
+        expected_entry_count: int,
+        expected_uncompressed_bytes: int,
+        expected_archive_bytes: int,
+        expected_archive_sha256: str,
+    ) -> str:
+        root = self.config.vm.root
+        import_root = root / "tmp" / "operational-import"
+        partial = import_root / f"{portable.generation}.partial"
+        archive = import_root / f"{portable.generation}.zip"
+        return (
+            "$ErrorActionPreference='Stop';"
+            + exact_production_root_parent_guard_script()
+            + f"$archive={self._ps(str(archive))};$partial={self._ps(str(partial))};"
+            f"$expectedCount={expected_entry_count};"
+            f"$expectedBytes=[Int64]{expected_uncompressed_bytes};"
+            f"$expectedArchiveBytes=[Int64]{expected_archive_bytes};"
+            f"$expectedArchiveHash={self._ps(expected_archive_sha256)};"
+            f"if($expectedCount-gt{MAX_TRANSPORT_ENTRIES}-or"
+            f"$expectedBytes-gt{MAX_TRANSPORT_UNCOMPRESSED_BYTES}-or"
+            f"$expectedArchiveBytes-gt{MAX_TRANSPORT_ARCHIVE_BYTES})"
+            "{throw 'transport_expected_cap'};"
+            "$archiveItem=Get-Item -LiteralPath $archive -Force;"
+            "if($archiveItem.PSIsContainer-or(($archiveItem.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'transport_archive_type'};"
+            "if(Test-Path -LiteralPath $partial){throw 'transport_partial_exists'};"
+            "Add-Type -AssemblyName System.IO.Compression;"
+            "Add-Type -AssemblyName System.IO.Compression.FileSystem;"
+            "$archiveStream=[IO.File]::Open($archive,[IO.FileMode]::Open,"
+            "[IO.FileAccess]::Read,[IO.FileShare]::Read);try{"
+            "if($archiveStream.Length-ne$expectedArchiveBytes)"
+            "{throw 'transport_archive_size'};"
+            "$sha=[Security.Cryptography.SHA256]::Create();try{"
+            "$archiveHash=([BitConverter]::ToString($sha.ComputeHash($archiveStream)))."
+            "Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};"
+            "if($archiveHash-ne$expectedArchiveHash){throw 'transport_archive_hash'};"
+            "$archiveStream.Position=0;"
+            "$zip=[IO.Compression.ZipArchive]::new($archiveStream,"
+            "[IO.Compression.ZipArchiveMode]::Read,$true);try{$entries=@($zip.Entries);"
+            "if($entries.Count-ne$expectedCount){throw 'transport_entry_count'};"
+            "$names=[Collections.Generic.HashSet[string]]::new("
+            "[StringComparer]::OrdinalIgnoreCase);$total=[Int64]0;$manifestCount=0;"
+            "foreach($entry in $entries){$name=[string]$entry.FullName;"
+            "if([string]::IsNullOrWhiteSpace($name)-or$name.Contains('\\')-or"
+            f"$name.Length-gt{MAX_TRANSPORT_MEMBER_NAME_CHARS}-or"
+            "$name.StartsWith('/')-or$name.EndsWith('/')-or$name.Contains(':'))"
+            "{throw 'transport_entry_path'};$parts=@($name.Split('/'));"
+            "if(@($parts|Where-Object{$_-eq''-or$_-eq'.'-or$_-eq'..'-or"
+            "$_.Length-gt 255-or$_.EndsWith('.')-or$_.EndsWith(' ')-or"
+            "$_.IndexOfAny([char[]]'<>\"|?*')-ge 0-or"
+            "@($_.ToCharArray()|Where-Object{[int]$_-lt 32}).Count-ne 0-or"
+            "@('CON','PRN','AUX','NUL','CLOCK$','CONIN$','CONOUT$',"
+            "'COM1','COM2','COM3','COM4','COM5','COM6','COM7','COM8','COM9',"
+            "'LPT1','LPT2','LPT3','LPT4','LPT5','LPT6','LPT7','LPT8','LPT9')"
+            "-contains($_.Split('.')[0].TrimEnd().ToUpperInvariant())}).Count-ne 0)"
+            "{throw 'transport_entry_traversal'};"
+            "if($name-ne'runtime_inventory.json'-and-not$name.StartsWith('python/'))"
+            "{throw 'transport_entry_scope'};"
+            "if(-not$names.Add($name)){throw 'transport_entry_case_collision'};"
+            f"if($entry.Length-lt 0-or$entry.Length-gt{MAX_TRANSPORT_MEMBER_BYTES})"
+            "{throw 'transport_entry_size'};"
+            "if([Int64]$entry.Length-gt($expectedBytes-$total))"
+            "{throw 'transport_entry_size'};$total+=[Int64]$entry.Length;"
+            "if($name-eq'runtime_inventory.json'){$manifestCount++}};"
+            "if($manifestCount-ne 1){throw 'transport_manifest_count'};"
+            "if($total-ne$expectedBytes){throw 'transport_uncompressed_size'};"
+            "$partialItem=New-Item -ItemType Directory -LiteralPath $partial;"
+            "if(($partialItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'transport_partial_reparse'};$partialFull=$partialItem.FullName;"
+            "foreach($entry in $entries){$relative=$entry.FullName.Replace('/','\\');"
+            "$destination=[IO.Path]::GetFullPath((Join-Path $partialFull $relative));"
+            "if(-not$destination.StartsWith($partialFull+'\\',"
+            "[StringComparison]::OrdinalIgnoreCase)){throw 'transport_extract_escape'};"
+            "if($destination.Length-gt 247){throw 'transport_destination_too_long'};"
+            "$parent=Split-Path -Parent $destination;"
+            "[IO.Directory]::CreateDirectory($parent)|Out-Null;"
+            "$input=$entry.Open();try{$output=[IO.File]::Open($destination,"
+            "[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None);"
+            "try{$remaining=[Int64]$entry.Length;$buffer=New-Object byte[] 1048576;"
+            "while(($read=$input.Read($buffer,0,$buffer.Length))-gt 0){"
+            "if($read-gt$remaining){throw 'transport_entry_output_size'};"
+            "$output.Write($buffer,0,$read);$remaining-=$read};"
+            "if($remaining-ne 0){throw 'transport_entry_output_size'}}"
+            "finally{$output.Dispose()}}finally{$input.Dispose()}}}"
+            "finally{$zip.Dispose()}}finally{$archiveStream.Dispose()};"
+            "if(@(Get-ChildItem -LiteralPath $partial -Recurse -Force|Where-Object{"
+            "($_.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0}).Count-ne 0)"
+            "{throw 'transport_extracted_reparse'};"
+            f"@{{status='archive_unpacked';generation={self._ps(portable.generation)}}}"
+            "|ConvertTo-Json -Compress"
+        )
 
     def _adopt_script(
         self, portable: PortableRuntime, *, replace_existing_empty_d: bool
@@ -392,26 +707,44 @@ class OperationalSourceOrchestrator:
         if portable.root.is_relative_to(self.config.project_root.resolve(strict=True)):
             raise OperationalSourceError("portable runtime source must remain outside public Git")
         root = self.config.vm.root
+        import_root = root / "tmp" / "operational-import"
         partial = root / "tmp" / "operational-import" / f"{generation}.partial"
-        probe = (
-            f"if(Test-Path -LiteralPath {self._ps(str(partial))})"
-            "{throw 'operational_generation_staging_exists'};"
-            "@{status='absent'}|ConvertTo-Json -Compress"
-        )
-        self.backend._ssh(probe)
-        python_root = partial / "python"
-        self.backend.ensure_directory(python_root)
-        for record in portable.inventory["files"]:
-            relative = PurePosixPath(str(record["path"]))
-            self.backend.upload(
-                portable.root.joinpath(*relative.parts),
-                python_root.joinpath(*relative.parts),
+        archive_remote = import_root / f"{generation}.zip"
+        probe = json.loads(
+            self.backend._ssh(
+                self._stage_probe_script(
+                    portable,
+                    replace_existing_empty_d=replace_existing_empty_d,
+                )
             )
+        )
+        if probe not in ({"status": "absent"}, {"status": "exact_staging_cleared"}):
+            raise OperationalSourceError("remote operational staging probe differs")
         self.config.state_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=self.config.state_root) as temporary:
-            manifest = Path(temporary) / "runtime_inventory.json"
-            manifest.write_bytes(_canonical(portable.inventory))
-            self.backend.upload(manifest, partial / "runtime_inventory.json")
+            archive = Path(temporary) / f"{generation}.zip"
+            (
+                entry_count,
+                uncompressed_bytes,
+                archive_bytes,
+                archive_sha256,
+            ) = _build_transport_archive(
+                archive, portable
+            )
+            self.backend.upload(archive, archive_remote)
+            unpacked = json.loads(
+                self.backend._ssh(
+                    self._unpack_script(
+                        portable,
+                        expected_entry_count=entry_count,
+                        expected_uncompressed_bytes=uncompressed_bytes,
+                        expected_archive_bytes=archive_bytes,
+                        expected_archive_sha256=archive_sha256,
+                    )
+                )
+            )
+        if unpacked != {"status": "archive_unpacked", "generation": generation}:
+            raise OperationalSourceError("remote operational archive evidence differs")
         adopted = json.loads(
             self.backend._ssh(
                 self._adopt_script(
@@ -467,8 +800,21 @@ class OperationalSourceOrchestrator:
         cleanup = (
             "$ErrorActionPreference='Stop';"
             + exact_production_root_parent_guard_script()
-            + f"$p={self._ps(str(partial))};if(Test-Path -LiteralPath $p){{"
-            "Remove-Item -LiteralPath $p -Recurse -Force};"
+            + self._verified_tree_delete_script()
+            + f"$p={self._ps(str(partial))};$z={self._ps(str(archive_remote))};"
+            f"$u={self._ps(str(archive_remote.with_name(f'.{archive_remote.name}.upload.partial')))};"
+            "if(Test-Path -LiteralPath $p){$item=Get-Item -LiteralPath $p -Force;"
+            "if(-not$item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'cleanup_partial_type'};"
+            "Remove-VerifiedRegularTree $p};"
+            "if(Test-Path -LiteralPath $z){$item=Get-Item -LiteralPath $z -Force;"
+            "if($item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'cleanup_archive_type'};"
+            "Remove-Item -LiteralPath $z -Force};"
+            "if(Test-Path -LiteralPath $u){$item=Get-Item -LiteralPath $u -Force;"
+            "if($item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'cleanup_upload_type'};"
+            "Remove-Item -LiteralPath $u -Force};"
             "@{status='operational_staging_removed'}|ConvertTo-Json -Compress"
         )
         cleanup_result = json.loads(self.backend._ssh(cleanup))

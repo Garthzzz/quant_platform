@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from quant_hub.collaboration.checkpoint import create_sqlite_checkpoint
-from quant_hub.ops.cold_bundle_cli import ColdBundleBuilder
+from quant_hub.ops.cold_bundle_cli import ColdBundleBuilder, ColdBundleCLIError
 from quant_hub.ops.cold_restore_cli import ColdRestoreCLIError, OpenSSHColdRestore
 from quant_hub.ops.publish_adapters import CommandResult, GitHubCIConfig, VMConfig
 from quant_hub.ops.publish_recovery_cli import capture_legacy
@@ -191,7 +191,6 @@ class ColdBundleBuilderTests(unittest.TestCase):
             self.assertIn("package_inventory_hash_mismatch", script)
             self.assertIn("& $python @a", script)
             self.assertNotIn("& python", script)
-            self.assertIn("capture-legacy", script)
             self.assertIn("SSH_CONNECTION", script)
             self.assertIn("10.5.1.240", script)
             self.assertIn("root_full_path_differs", script)
@@ -202,6 +201,21 @@ class ColdBundleBuilderTests(unittest.TestCase):
                 script.index("New-Item -ItemType Directory"),
             )
             self.assertIn(r"D:\quant\quant_platform\tmp\publish-recovery", script)
+            if "cleanup-capture" in script:
+                self.assertNotIn("capture-legacy", script)
+                self.assertNotIn("C:\\", script)
+                self.assertNotIn("active_release.json", script)
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "schema_version": "qrh-publish-checkpoint-cleanup/v1",
+                            "checkpoint_id": "checkpoint-v39-cold",
+                            "staging_removed": True,
+                        }
+                    ),
+                )
+            self.assertIn("capture-legacy", script)
             return CommandResult(
                 0,
                 json.dumps(
@@ -246,8 +260,144 @@ class ColdBundleBuilderTests(unittest.TestCase):
         )
         self.assertEqual("ssh", self.calls[0][0])
         self.assertEqual("scp", self.calls[1][0])
+        self.assertEqual("ssh", self.calls[2][0])
+        cleanup_script = base64.b64decode(self.calls[2][-1]).decode("utf-16-le")
+        self.assertIn("cleanup-capture", cleanup_script)
         self.assertNotIn("10.5.1.223", repr(self.calls))
         self.assertNotIn("10.5.1.235", repr(self.calls))
+
+    def test_download_verification_failure_still_cleans_vm_staging(self) -> None:
+        def runner(arguments):
+            result = self.runner(arguments)
+            if arguments[0] == "scp" and result.returncode == 0:
+                destination = (
+                    Path(arguments[-1])
+                    / self.remote_checkpoint.checkpoint_id
+                    / "checkpoint_manifest.json"
+                )
+                destination.write_bytes(b"{}\n")
+            return result
+
+        with self.assertRaisesRegex(
+            ColdBundleCLIError, "downloaded checkpoint identity differs"
+        ):
+            ColdBundleBuilder(
+                self.config,
+                command_runner=runner,
+                preflight=lambda: None,
+            ).build(
+                release_root=self.release,
+                bundle_id="v39-cold",
+                state_source="legacy_c",
+            )
+        self.assertEqual(["ssh", "scp", "ssh"], [call[0] for call in self.calls])
+        self.assertIn(
+            "cleanup-capture",
+            base64.b64decode(self.calls[-1][-1]).decode("utf-16-le"),
+        )
+
+    def test_capture_command_failure_still_attempts_exact_cleanup(self) -> None:
+        calls = []
+
+        def runner(arguments):
+            call = tuple(arguments)
+            calls.append(call)
+            self.assertEqual("ssh", call[0])
+            script = base64.b64decode(call[-1]).decode("utf-16-le")
+            if "cleanup-capture" in script:
+                return CommandResult(
+                    0,
+                    json.dumps(
+                        {
+                            "schema_version": "qrh-publish-checkpoint-cleanup/v1",
+                            "checkpoint_id": "checkpoint-v39-cold",
+                            "staging_removed": False,
+                        }
+                    ),
+                )
+            return CommandResult(1, "capture failed after partial staging")
+
+        with self.assertRaisesRegex(
+            ColdBundleCLIError, "fixed .240 checkpoint command failed"
+        ) as caught:
+            ColdBundleBuilder(
+                self.config,
+                command_runner=runner,
+                preflight=lambda: None,
+            ).build(
+                release_root=self.release,
+                bundle_id="v39-cold",
+                state_source="legacy_c",
+            )
+        self.assertEqual(2, len(calls))
+        cleanup_script = base64.b64decode(calls[-1][-1]).decode("utf-16-le")
+        self.assertIn("cleanup-capture", cleanup_script)
+        self.assertNotIn("capture-legacy", cleanup_script)
+        self.assertFalse(getattr(caught.exception, "__notes__", ()))
+
+    def test_cleanup_failure_after_verified_download_is_explicit_failure(self) -> None:
+        def runner(arguments):
+            call = tuple(arguments)
+            if call[0] == "ssh":
+                script = base64.b64decode(call[-1]).decode("utf-16-le")
+                if "cleanup-capture" in script:
+                    self.calls.append(call)
+                    return CommandResult(1, "cleanup failed")
+            return self.runner(arguments)
+
+        with self.assertRaisesRegex(
+            ColdBundleCLIError, "VM checkpoint staging cleanup failed"
+        ):
+            ColdBundleBuilder(
+                self.config,
+                command_runner=runner,
+                preflight=lambda: None,
+            ).build(
+                release_root=self.release,
+                bundle_id="v39-cold",
+                state_source="legacy_c",
+            )
+        self.assertEqual(["ssh", "scp", "ssh"], [call[0] for call in self.calls])
+        self.assertFalse(
+            (self.config.recovery.recovery_root / "cold-recovery-v39-cold").exists()
+        )
+
+    def test_verification_error_precedes_cleanup_error_and_records_both(self) -> None:
+        def runner(arguments):
+            call = tuple(arguments)
+            if call[0] == "ssh":
+                script = base64.b64decode(call[-1]).decode("utf-16-le")
+                if "cleanup-capture" in script:
+                    self.calls.append(call)
+                    return CommandResult(1, "cleanup failed")
+            result = self.runner(arguments)
+            if call[0] == "scp" and result.returncode == 0:
+                destination = (
+                    Path(call[-1])
+                    / self.remote_checkpoint.checkpoint_id
+                    / "checkpoint_manifest.json"
+                )
+                destination.write_bytes(b"{}\n")
+            return result
+
+        with self.assertRaisesRegex(
+            ColdBundleCLIError, "downloaded checkpoint identity differs"
+        ) as caught:
+            ColdBundleBuilder(
+                self.config,
+                command_runner=runner,
+                preflight=lambda: None,
+            ).build(
+                release_root=self.release,
+                bundle_id="v39-cold",
+                state_source="legacy_c",
+            )
+        notes = getattr(caught.exception, "__notes__", ())
+        self.assertTrue(
+            any("VM checkpoint staging cleanup failed" in note for note in notes),
+            notes,
+        )
+        self.assertEqual(["ssh", "scp", "ssh"], [call[0] for call in self.calls])
 
     def test_initial_legacy_qualification_bundle_does_not_require_future_attestation(self) -> None:
         self.assertFalse(self.config.recovery.attestation_path.exists())
@@ -310,7 +460,13 @@ class ColdBundleBuilderTests(unittest.TestCase):
                 bundle_id="v39-cold",
                 state_source="legacy_c",
             )
-        self.assertEqual(["ssh"], [call[0] for call in calls])
+        # Capture failure is conservatively followed by one exact-id cleanup
+        # attempt.  The same root guard fails before either command can write.
+        self.assertEqual(["ssh", "ssh"], [call[0] for call in calls])
+        self.assertIn(
+            "cleanup-capture",
+            base64.b64decode(calls[-1][-1]).decode("utf-16-le"),
+        )
 
     def test_missing_operational_closure_cannot_produce_bundle(self) -> None:
         (self.operational / "tooling" / "python" / "python.exe").unlink()
