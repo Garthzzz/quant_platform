@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import stat
 from typing import Callable, Mapping, Sequence
@@ -40,6 +40,8 @@ _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _PREPARE_INSPECTION_SCHEMA = "qrh-prepare-empty-inspection/v1"
 _PREPARE_APPLY_SCHEMA = "qrh-prepare-empty-application/v1"
+_LEGACY_V39_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
+_TRANSFER_ATTEMPT_SCHEMA = "qrh-cold-restore-transfer-attempt/v1"
 
 
 class OpenSSHColdRestore:
@@ -235,6 +237,9 @@ class OpenSSHColdRestore:
             or not report.bundle_id
             or not report.release_id
             or not report.release_manifest_sha256
+            or not report.recovery_manifest_sha256
+            or _SHA256.fullmatch(report.release_manifest_sha256) is None
+            or _SHA256.fullmatch(report.recovery_manifest_sha256) is None
             or _SAFE_ID.fullmatch(report.bundle_id) is None
         ):
             raise ColdRestoreCLIError("off-host recovery bundle is not verified")
@@ -260,6 +265,225 @@ class OpenSSHColdRestore:
         ) != tool_identity:
             raise ColdRestoreCLIError("bootstrap identity changed during local seal")
         return bundle, report, restore_name, python_identity, tool_identity
+
+    def _transfer_attempt(
+        self, bundle: Path, report: RecoveryVerification
+    ) -> tuple[bytes, int, int, int]:
+        """Bind a retryable SCP attempt to one verified, bounded local tree."""
+
+        file_count = 0
+        directory_count = 0
+        total_bytes = 0
+        for path in bundle.rglob("*"):
+            ensure_no_reparse_components(path)
+            info = path.lstat()
+            if path.is_symlink():
+                raise ColdRestoreCLIError("verified transfer tree contains a reparse entry")
+            if stat.S_ISDIR(info.st_mode):
+                directory_count += 1
+            elif stat.S_ISREG(info.st_mode):
+                file_count += 1
+                total_bytes += info.st_size
+            else:
+                raise ColdRestoreCLIError("verified transfer tree contains a special entry")
+        if file_count < 1 or directory_count < 1 or total_bytes < 1:
+            raise ColdRestoreCLIError("verified transfer tree has invalid bounds")
+        inventory_hash = hashlib.sha256(
+            (bundle / "closure_inventory.json").read_bytes()
+        ).hexdigest()
+        marker = {
+            "schema_version": _TRANSFER_ATTEMPT_SCHEMA,
+            "bundle_id": report.bundle_id,
+            "bundle_directory": bundle.name,
+            "release_id": report.release_id,
+            "release_manifest_sha256": report.release_manifest_sha256,
+            "recovery_manifest_sha256": report.recovery_manifest_sha256,
+            "closure_inventory_sha256": inventory_hash,
+            "transfer_file_count": file_count,
+            "transfer_directory_count": directory_count,
+            "transfer_total_bytes": total_bytes,
+        }
+        return (
+            self._canonical_bytes(marker), file_count, directory_count, total_bytes
+        )
+
+    def _restore_transfer_prepare_script(
+        self,
+        *,
+        remote_bundle: PureWindowsPath,
+        import_parent: PureWindowsPath,
+        marker_bytes: bytes,
+        maximum_files: int,
+        maximum_directories: int,
+        maximum_bytes: int,
+    ) -> str:
+        """Accept an empty root or reset only our own interrupted SCP partial."""
+
+        runtime_tmp = import_parent.parent / "recovery-runtime"
+        runtime_work = runtime_tmp / "work"
+        marker_path = runtime_tmp / ".cold-restore-attempt.json"
+        marker_b64 = base64.b64encode(marker_bytes).decode("ascii")
+        return (
+            "$ErrorActionPreference='Stop';"
+            + exact_production_root_parent_guard_script()
+            + "$root=$rootFull;"
+            f"$importParent={self._literal(str(import_parent))};"
+            f"$remoteBundle={self._literal(str(remote_bundle))};"
+            f"$runtimeTmp={self._literal(str(runtime_tmp))};"
+            f"$runtimeWork={self._literal(str(runtime_work))};"
+            f"$marker={self._literal(str(marker_path))};"
+            f"$expectedMarkerB64={self._literal(marker_b64)};"
+            f"$maximumFiles=[long]{maximum_files};"
+            f"$maximumDirectories=[long]{maximum_directories};"
+            f"$maximumBytes=[long]{maximum_bytes};"
+            "function Assert-RealDirectory([string]$Path,[string]$Failure){"
+            "$item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop;"
+            "if(-not $item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw $Failure}};"
+            "function Assert-NoAlternateStreams([string]$Path,[string]$Failure){"
+            "$item=Get-Item -LiteralPath $Path -Force -ErrorAction Stop;"
+            "$streams=@(Get-Item -LiteralPath $Path -Stream * -ErrorAction Stop);"
+            "if($item.PSIsContainer){if($streams.Count-ne 0){throw $Failure}}"
+            "elseif($streams.Count-ne 1-or$streams[0].Stream-ne':$DATA'){throw $Failure}};"
+            "function Assert-LegacyV39{"
+            "$listeners=@(Get-NetTCPConnection -LocalPort 8765 -State Listen "
+            "-ErrorAction Stop);$pids=@($listeners|Select-Object -ExpandProperty "
+            "OwningProcess -Unique);if($pids.Count-ne 1){throw 'retry_legacy_listener_identity'};"
+            "$process=@(Get-CimInstance Win32_Process -Filter ('ProcessId='+$pids[0]) "
+            "-ErrorAction Stop);if($process.Count-ne 1){throw 'retry_legacy_process_identity'};"
+            "$command=[string]$process[0].CommandLine;$normalized=$command.Replace('/','\\');"
+            "$legacyPrefix=([char]67)+':\\quant_platform\\';"
+            "if($normalized.IndexOf($legacyPrefix,"
+            "[StringComparison]::OrdinalIgnoreCase)-lt 0-or"
+            "$normalized.IndexOf($root,[StringComparison]::OrdinalIgnoreCase)-ge 0)"
+            "{throw 'retry_listener_not_legacy_c'};"
+            "$response=Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 "
+            "-Uri 'http://127.0.0.1:8765/deploymentz';"
+            "if($response.StatusCode-ne 200){throw 'retry_legacy_deploymentz_status'};"
+            "$deployment=$response.Content|ConvertFrom-Json;"
+            f"if($deployment.deployment_id-ne{self._literal(_LEGACY_V39_DEPLOYMENT_ID)})"
+            "{throw 'retry_legacy_deployment_id_differs'}};"
+            "function Write-AttemptMarker{"
+            "$bytes=[Convert]::FromBase64String($expectedMarkerB64);"
+            "$stream=[IO.File]::Open($marker,[IO.FileMode]::CreateNew,"
+            "[IO.FileAccess]::Write,[IO.FileShare]::None);"
+            "try{$stream.Write($bytes,0,$bytes.Length);$stream.Flush($true)}"
+            "finally{$stream.Dispose()}};"
+            "function Assert-AttemptMarker{"
+            "$item=Get-Item -LiteralPath $marker -Force -ErrorAction Stop;"
+            "if($item.PSIsContainer-or(($item.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'retry_marker_type'};"
+            "Assert-NoAlternateStreams $marker 'retry_marker_alternate_stream';"
+            "$actual=[Convert]::ToBase64String([IO.File]::ReadAllBytes($marker));"
+            "if($actual-ne$expectedMarkerB64){throw 'retry_bundle_identity_mismatch'}};"
+            "function Assert-SafePartial{"
+            "Assert-RealDirectory $remoteBundle 'retry_partial_type';"
+            "Assert-NoAlternateStreams $remoteBundle 'retry_partial_alternate_stream';"
+            "$bundleFull=[IO.Path]::GetFullPath($remoteBundle).TrimEnd('\\');"
+            "$expectedParent=[IO.Path]::GetFullPath($importParent).TrimEnd('\\');"
+            "$actualParent=[IO.Path]::GetFullPath((Split-Path -Parent $bundleFull)).TrimEnd('\\');"
+            "if(-not $actualParent.Equals($expectedParent,[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'retry_partial_not_exact_child'};"
+            "$files=[long]0;$directories=[long]0;$bytes=[long]0;"
+            "$items=@(Get-ChildItem -LiteralPath $remoteBundle -Force -Recurse);"
+            "foreach($item in $items){"
+            "$full=[IO.Path]::GetFullPath($item.FullName);"
+            "if(-not $full.StartsWith($bundleFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'retry_partial_path_escape'};"
+            "$relative=$full.Substring($bundleFull.Length).TrimStart('\\');"
+            "if(-not $relative-or(@($relative -split '\\\\')|Where-Object{"
+            "$_-eq'.'-or$_-eq'..'-or$_.Contains(':')}).Count-ne 0)"
+            "{throw 'retry_partial_relative_path'};"
+            "if(($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'retry_partial_reparse'};"
+            "Assert-NoAlternateStreams $item.FullName 'retry_partial_alternate_stream';"
+            "if($item.PSIsContainer){$directories++;continue};"
+            "if($item -is [IO.FileInfo]){"
+            "$files++;$bytes+=[long]$item.Length}else{throw 'retry_partial_special_entry'}};"
+            "if($files-gt$maximumFiles-or$directories-gt$maximumDirectories-or"
+            "$bytes-gt$maximumBytes){throw 'retry_partial_exceeds_verified_bounds'}};"
+            "function Assert-SafeRuntimeWork{"
+            "Assert-RealDirectory $runtimeWork 'retry_runtime_work_type';"
+            "$workFull=[IO.Path]::GetFullPath($runtimeWork).TrimEnd('\\');"
+            "$expectedParent=[IO.Path]::GetFullPath($runtimeTmp).TrimEnd('\\');"
+            "$actualParent=[IO.Path]::GetFullPath((Split-Path -Parent $workFull)).TrimEnd('\\');"
+            "if(-not $actualParent.Equals($expectedParent,[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'retry_runtime_work_not_exact_child'};"
+            "$files=[long]0;$directories=[long]0;$bytes=[long]0;"
+            "$items=@(Get-ChildItem -LiteralPath $runtimeWork -Force -Recurse);"
+            "foreach($item in $items){"
+            "$full=[IO.Path]::GetFullPath($item.FullName);"
+            "if(-not $full.StartsWith($workFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'retry_runtime_work_path_escape'};"
+            "if(($item.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+            "{throw 'retry_runtime_work_reparse'};"
+            "if($item.PSIsContainer){$directories++;continue};"
+            "if($item -is [IO.FileInfo]){"
+            "Assert-NoAlternateStreams $item.FullName 'retry_runtime_work_alternate_stream';"
+            "$files++;$bytes+=[long]$item.Length}else{throw 'retry_runtime_work_special_entry'}};"
+            "if($files-gt$maximumFiles-or$directories-gt$maximumDirectories-or"
+            "$bytes-gt$maximumBytes){throw 'retry_runtime_work_exceeds_verified_bounds'}};"
+            "Assert-RealDirectory $root 'retry_exact_root_type';"
+            "$active=Join-Path $root 'control\\active_release.json';"
+            "$pending=Join-Path $root 'control\\pending_activation.json';"
+            "$state=Join-Path $root 'state';$releases=Join-Path $root 'releases';"
+            "if((Test-Path -LiteralPath $active)-or(Test-Path -LiteralPath $pending)-or"
+            "(Test-Path -LiteralPath $state)-or(Test-Path -LiteralPath $releases))"
+            "{throw 'retry_d_authority_or_release_exists'};"
+            "$top=@(Get-ChildItem -LiteralPath $root -Force);"
+            "if($top.Count-eq 0){"
+            "New-Item -ItemType Directory -Force -Path $importParent|Out-Null;"
+            "New-Item -ItemType Directory -Force -Path $runtimeTmp|Out-Null;"
+            + exact_production_root_parent_guard_script()
+            + "$root=$rootFull;Assert-RealDirectory (Join-Path $root 'tmp') 'new_tmp_type';"
+            "Assert-RealDirectory $importParent 'new_import_parent_type';"
+            "Assert-RealDirectory $runtimeTmp 'new_runtime_type';Write-AttemptMarker}"
+            "else{"
+            "if($top.Count-ne 1-or$top[0].Name-ne'tmp')"
+            "{throw 'exact_d_root_not_empty_retry_unknown_root_child'};"
+            "Assert-RealDirectory $top[0].FullName 'retry_tmp_type';"
+            "$tmpChildren=@(Get-ChildItem -LiteralPath $top[0].FullName -Force);"
+            "foreach($child in $tmpChildren){if($child.Name-ne'recovery-import'-and"
+            "$child.Name-ne'recovery-runtime'){throw 'retry_unknown_tmp_child'}};"
+            "if(-not($tmpChildren.Name-contains'recovery-import'))"
+            "{throw 'retry_import_parent_absent'};"
+            "Assert-RealDirectory $importParent 'retry_import_parent_type';"
+            "$importChildren=@(Get-ChildItem -LiteralPath $importParent -Force);"
+            "foreach($child in $importChildren){if($child.Name-ne"
+            f"{self._literal(remote_bundle.name)}){{throw 'retry_unknown_import_child'}}}};"
+            "$hasMarker=Test-Path -LiteralPath $marker;"
+            "$hasPartial=Test-Path -LiteralPath $remoteBundle;"
+            "if($hasMarker){Assert-AttemptMarker};"
+            "if(-not $hasMarker){Assert-LegacyV39};"
+            "if(Test-Path -LiteralPath $runtimeTmp){"
+            "Assert-RealDirectory $runtimeTmp 'retry_runtime_type';"
+            "$runtimeChildren=@(Get-ChildItem -LiteralPath $runtimeTmp -Force);"
+            "foreach($child in $runtimeChildren){if($child.Name-ne"
+            "'.cold-restore-attempt.json'-and$child.Name-ne'work')"
+            "{throw 'retry_unknown_runtime_child'}};"
+            "if(Test-Path -LiteralPath $runtimeWork){Assert-SafeRuntimeWork;"
+            "Assert-SafeRuntimeWork;Remove-Item -LiteralPath $runtimeWork -Recurse -Force}}"
+            "else{New-Item -ItemType Directory -Force -Path $runtimeTmp|Out-Null;"
+            "Assert-RealDirectory $runtimeTmp 'retry_runtime_type'};"
+            "if($hasPartial){Assert-SafePartial;"
+            "$partial=Get-Item -LiteralPath $remoteBundle -Force -ErrorAction Stop;"
+            "$partialParent=[IO.Path]::GetFullPath((Split-Path -Parent $partial.FullName)).TrimEnd('\\');"
+            "$expectedParent=[IO.Path]::GetFullPath($importParent).TrimEnd('\\');"
+            "if(-not $partialParent.Equals($expectedParent,[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'retry_delete_target_not_exact_child'};"
+            "Assert-SafePartial;"
+            "Remove-Item -LiteralPath $partial.FullName -Recurse -Force};"
+            "if(-not $hasMarker){Write-AttemptMarker};"
+            "$remaining=@(Get-ChildItem -LiteralPath $importParent -Force);"
+            "if($remaining.Count-ne 0)"
+            "{throw 'retry_cleanup_not_closed'};"
+            "$runtimeRemaining=@(Get-ChildItem -LiteralPath $runtimeTmp -Force);"
+            "if($runtimeRemaining.Count-ne 1-or"
+            "$runtimeRemaining[0].Name-ne'.cold-restore-attempt.json')"
+            "{throw 'retry_runtime_cleanup_not_closed'}};"
+            "@{status='prepared_empty_root';empty_root_precondition=$true}"
+            "|ConvertTo-Json -Compress"
+        )
 
     def _prepare_empty_script(
         self,
@@ -654,17 +878,20 @@ class OpenSSHColdRestore:
         # A conflicting local authority must block before the first remote
         # write. Exact existing bytes are the sole idempotent case.
         self._preflight_immutable_evidence(evidence_path, expected_event)
-        root = str(self.config.vm.root)
         import_parent = self.config.vm.root / "tmp" / "recovery-import"
         runtime_tmp = self.config.vm.root / "tmp" / "recovery-runtime"
         expected_name = bundle.name
         remote_bundle = import_parent / expected_name
-        prepare = (
-            exact_production_root_parent_guard_script()
-            + "$root=$approvedRoot;"
-            "if(@(Get-ChildItem -LiteralPath $root -Force).Count-ne 0){throw 'exact_d_root_not_empty'};"
-            f"New-Item -ItemType Directory -Force -Path {self._literal(str(import_parent))}|Out-Null;"
-            "@{status='prepared_empty_root';empty_root_precondition=$true}|ConvertTo-Json -Compress"
+        marker_bytes, maximum_files, maximum_directories, maximum_bytes = (
+            self._transfer_attempt(bundle, report)
+        )
+        prepare = self._restore_transfer_prepare_script(
+            remote_bundle=remote_bundle,
+            import_parent=import_parent,
+            marker_bytes=marker_bytes,
+            maximum_files=maximum_files,
+            maximum_directories=maximum_directories,
+            maximum_bytes=maximum_bytes,
         )
         prepared = self._ssh(prepare)
         if prepared != {"status": "prepared_empty_root", "empty_root_precondition": True}:
@@ -682,8 +909,22 @@ class OpenSSHColdRestore:
         python = remote_bundle / "operational" / "tooling" / "python" / "python.exe"
         tool = remote_bundle / "tools" / "restore" / restore_name
         audit_path = self.config.vm.root / "audit" / "events" / f"{audit_id}.json"
+        marker_path = runtime_tmp / ".cold-restore-attempt.json"
+        marker_b64 = base64.b64encode(marker_bytes).decode("ascii")
         materialize = (
-            f"$root={self._literal(root)};$bundle={self._literal(str(remote_bundle))};"
+            exact_production_root_parent_guard_script()
+            + f"$root=$rootFull;$bundle={self._literal(str(remote_bundle))};"
+            f"$marker={self._literal(str(marker_path))};"
+            f"$expectedMarkerB64={self._literal(marker_b64)};"
+            "if(-not(Test-Path -LiteralPath $marker)){throw 'transfer_attempt_marker_absent'};"
+            "$markerItem=Get-Item -LiteralPath $marker -Force -ErrorAction Stop;"
+            "if($markerItem.PSIsContainer-or(($markerItem.Attributes-band"
+            "[IO.FileAttributes]::ReparsePoint)-ne 0)){throw 'transfer_attempt_marker_type'};"
+            "$markerStreams=@(Get-Item -LiteralPath $marker -Stream * -ErrorAction Stop);"
+            "if($markerStreams.Count-ne 1-or$markerStreams[0].Stream-ne':$DATA')"
+            "{throw 'transfer_attempt_marker_alternate_stream'};"
+            "$actualMarkerB64=[Convert]::ToBase64String([IO.File]::ReadAllBytes($marker));"
+            "if($actualMarkerB64-ne$expectedMarkerB64){throw 'transfer_attempt_marker_differs'};"
             "function Assert-BootstrapFile{param([string]$Path,[long]$Size,[string]$Sha256);"
             "$full=[IO.Path]::GetFullPath($Path);$rootFull=[IO.Path]::GetFullPath($root).TrimEnd('\\');"
             "if(-not $full.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
@@ -701,7 +942,13 @@ class OpenSSHColdRestore:
             "if($actual-ne $Sha256){throw 'bootstrap_hash_mismatch'}};"
             f"Assert-BootstrapFile {self._literal(str(python))} {python_size} {self._literal(python_hash)};"
             f"Assert-BootstrapFile {self._literal(str(tool))} {tool_size} {self._literal(tool_hash)};"
-            f"$tmp={self._literal(str(runtime_tmp))};"
+            "$importChildren=@(Get-ChildItem -LiteralPath "
+            f"{self._literal(str(import_parent))} -Force);"
+            "if($importChildren.Count-ne 1-or-not"
+            f"$importChildren[0].Name.Equals({self._literal(remote_bundle.name)},"
+            "[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'transfer_import_shape_differs'};"
+            f"$tmp={self._literal(str(runtime_tmp / 'work'))};"
             "New-Item -ItemType Directory -Force -Path $tmp|Out-Null;"
             "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
             f"$lines=& {self._literal(str(python))} -I -B {self._literal(str(tool))} "
@@ -710,8 +957,9 @@ class OpenSSHColdRestore:
             "$result=($lines|Select-Object -Last 1|ConvertFrom-Json);"
             "if($result.status-ne'materialized_pending_post_restore_verification'"
             "-or $result.empty_root_precondition-ne $true){throw 'materialization_identity_failed'};"
+            "Remove-Item -LiteralPath $marker -Force;"
             f"Remove-Item -LiteralPath {self._literal(str(import_parent))} -Recurse -Force;"
-            "Remove-Item -LiteralPath $tmp -Recurse -Force;"
+            f"Remove-Item -LiteralPath {self._literal(str(runtime_tmp))} -Recurse -Force;"
             f"$audit={self._literal(str(audit_path))};"
             "$auditParent=Split-Path -Parent $audit;"
             "New-Item -ItemType Directory -Force -Path $auditParent|Out-Null;"

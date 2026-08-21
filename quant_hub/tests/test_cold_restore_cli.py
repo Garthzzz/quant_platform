@@ -142,6 +142,49 @@ class PrepareRunner:
         )
 
 
+class InterruptedTransferRunner:
+    """Model the remote states exercised by the generated fail-closed script."""
+
+    def __init__(self, event: dict[str, object]) -> None:
+        self.calls = []
+        self.event = event
+        self.partial_exists = False
+        self.fail_first_scp = True
+
+    def __call__(self, arguments):
+        self.calls.append(tuple(arguments))
+        if arguments[0] == "scp":
+            if self.fail_first_scp:
+                self.fail_first_scp = False
+                self.partial_exists = True
+                return CommandResult(1, "")
+            self.partial_exists = False
+            return CommandResult(0, "")
+        script = decode_ssh(arguments)
+        if "retry_unknown_root_child" in script:
+            if self.partial_exists:
+                # The real script permits only the exact recovery-import shape,
+                # validates it, removes that exact child, and keeps its marker.
+                for required in (
+                    "Assert-LegacyV39",
+                    "retry_d_authority_or_release_exists",
+                    "retry_unknown_root_child",
+                    "retry_unknown_tmp_child",
+                    "retry_unknown_import_child",
+                    "retry_partial_reparse",
+                    "retry_partial_alternate_stream",
+                    "retry_bundle_identity_mismatch",
+                    "retry_delete_target_not_exact_child",
+                ):
+                    if required not in script:
+                        return CommandResult(1, "")
+            return CommandResult(
+                0,
+                '{"status":"prepared_empty_root","empty_root_precondition":true}',
+            )
+        return CommandResult(0, json.dumps(self.event))
+
+
 class ColdRestorePrepareEmptyTests(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -322,6 +365,11 @@ class ColdRestorePrepareEmptyTests(unittest.TestCase):
             self.assertNotIn("New-Item -ItemType Directory -Force -LiteralPath", script)
             if "prepared_empty_root" in script:
                 return CommandResult(0, '{"status":"prepared_empty_root","empty_root_precondition":true}')
+            self.assertIn("transfer_attempt_marker_differs", script)
+            self.assertLess(
+                script.index("materialization_identity_failed"),
+                script.index("Remove-Item -LiteralPath $marker"),
+            )
             return CommandResult(0, json.dumps(event))
 
         operator = OpenSSHColdRestore(
@@ -361,6 +409,118 @@ class ColdRestorePrepareEmptyTests(unittest.TestCase):
         with self.assertRaises(ColdRestoreCLIError):
             operator.restore(self.bundle, evidence_output=output)
         self.assertFalse(output.exists())
+
+    def test_interrupted_scp_partial_is_safely_reset_then_retry_succeeds(self) -> None:
+        event = {
+            "schema_version": "qrh-recovery-materialization-event/v1",
+            "event_id": "cold-materialization-qualification-1",
+            "kind": "cold_recovery_materialized",
+            "authority": "evidence_only",
+            "fields": {
+                "bundle_id": "qualification-1",
+                "release_id": "release-v39",
+                "manifest_sha256": "a" * 64,
+                "empty_root_precondition": True,
+                "import_cleaned": True,
+                "runtime_tmp_cleaned": True,
+            },
+        }
+        runner = InterruptedTransferRunner(event)
+        operator = OpenSSHColdRestore(
+            self.config, command_runner=runner, bundle_verifier=self.verifier
+        )
+        output = (
+            self.config.recovery.recovery_root / "evidence" /
+            "cold-materialization" / "retry.json"
+        )
+        with self.assertRaisesRegex(ColdRestoreCLIError, "transfer"):
+            operator.restore(self.bundle, evidence_output=output)
+        self.assertTrue(runner.partial_exists)
+        self.assertFalse(output.exists())
+
+        result = operator.restore(self.bundle, evidence_output=output)
+        self.assertEqual("cold_recovery_materialized", result["status"])
+        self.assertFalse(runner.partial_exists)
+        self.assertTrue(output.is_file())
+        scp_calls = [call for call in runner.calls if call[0] == "scp"]
+        self.assertEqual(2, len(scp_calls))
+        prepare_scripts = [
+            decode_ssh(call) for call in runner.calls
+            if call[0] == "ssh" and "retry_unknown_root_child" in decode_ssh(call)
+        ]
+        self.assertEqual(2, len(prepare_scripts))
+        retry_script = prepare_scripts[-1]
+        self.assertIn(LEGACY_ID, retry_script)
+        self.assertIn("$legacyPrefix=([char]67)+':\\quant_platform\\'", retry_script)
+        self.assertIn("Remove-Item -LiteralPath $partial.FullName", retry_script)
+        self.assertNotIn("Remove-Item -LiteralPath $root", retry_script)
+        self.assertNotIn("Remove-Item -LiteralPath $top[0]", retry_script)
+
+    def test_retry_unknown_reparse_and_identity_mismatch_fail_before_scp(self) -> None:
+        for token in (
+            "retry_unknown_root_child",
+            "retry_partial_reparse",
+            "retry_bundle_identity_mismatch",
+        ):
+            with self.subTest(token=token):
+                calls = []
+
+                def runner(arguments, expected=token):
+                    calls.append(tuple(arguments))
+                    self.assertEqual("ssh", arguments[0])
+                    self.assertIn(expected, decode_ssh(arguments))
+                    return CommandResult(1, "")
+
+                operator = OpenSSHColdRestore(
+                    self.config, command_runner=runner, bundle_verifier=self.verifier
+                )
+                output = (
+                    self.config.recovery.recovery_root / "evidence" /
+                    "cold-materialization" / f"{token}.json"
+                )
+                with self.assertRaises(ColdRestoreCLIError):
+                    operator.restore(self.bundle, evidence_output=output)
+                self.assertEqual(1, len(calls))
+                self.assertFalse(output.exists())
+
+    def test_retry_prepare_script_parses_and_delete_is_exact_child_only(self) -> None:
+        operator = OpenSSHColdRestore(self.config, bundle_verifier=self.verifier)
+        marker, files, directories, total_bytes = operator._transfer_attempt(
+            self.bundle, self.report
+        )
+        import_parent = self.config.vm.root / "tmp" / "recovery-import"
+        script = operator._restore_transfer_prepare_script(
+            remote_bundle=import_parent / self.bundle.name,
+            import_parent=import_parent,
+            marker_bytes=marker,
+            maximum_files=files,
+            maximum_directories=directories,
+            maximum_bytes=total_bytes,
+        )
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        completed = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                f"[scriptblock]::Create([Text.Encoding]::Unicode.GetString("
+                f"[Convert]::FromBase64String('{encoded}'))) | Out-Null",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertGreaterEqual(script.count("root_parent_reparse"), 2)
+        self.assertIn("retry_partial_exceeds_verified_bounds", script)
+        self.assertIn("retry_partial_alternate_stream", script)
+        self.assertIn("retry_marker_alternate_stream", script)
+        self.assertIn("$relative -split '\\\\'", script)
+        self.assertIn("if(-not $hasMarker){Assert-LegacyV39}", script)
+        self.assertNotIn("else{Assert-LegacyV39", script)
+        self.assertIn("if($item.PSIsContainer){if($streams.Count-ne 0)", script)
+        self.assertIn("Remove-Item -LiteralPath $partial.FullName", script)
+        self.assertNotIn("Remove-Item -LiteralPath $root", script)
+        self.assertNotIn("D:\\quant' -Recurse", script)
+        self.assertNotIn("C:\\quant_platform' -Recurse", script)
 
     def test_conflicting_local_materialization_evidence_blocks_before_remote(self) -> None:
         calls = []
