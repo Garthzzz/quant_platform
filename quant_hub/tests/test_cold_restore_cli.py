@@ -1590,10 +1590,12 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             script = (
                 "$ErrorActionPreference='Continue';$probeSource="
                 + OpenSSHColdRestore._literal(_CANONICAL_AUDIT_PROBE)
-                + ";$bootstrap=\"import sys;exec(compile(sys.stdin.read(),"
-                + "'<probe>','exec'))\";$raw=$probeSource|&"
+                + ";$probeEncoded=[Convert]::ToBase64String("
+                + "[Text.Encoding]::UTF8.GetBytes($probeSource));"
+                + "$bootstrap=\"import base64,sys;exec(compile(base64.b64decode("
+                + "sys.argv.pop(1)),'<probe>','exec'))\";$raw=&"
                 + OpenSSHColdRestore._literal(os.fspath(Path(os.sys.executable)))
-                + " -I -B -c $bootstrap "
+                + " -I -B -c $bootstrap $probeEncoded "
                 + OpenSSHColdRestore._literal(os.fspath(root))
                 + " "
                 + OpenSSHColdRestore._literal(os.fspath(audit))

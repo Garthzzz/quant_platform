@@ -1379,7 +1379,8 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 agents_path = project / "AGENTS.md"
                 client_path = data_root / "quant-research-knowledge" / "client.json"
                 real_replace = install_module.os.replace
-                real_unlink = Path.unlink
+                path_class = type(client_path)
+                real_unlink = path_class.unlink
                 config_rollback_attempted = False
 
                 def injected_replace(source, destination):
@@ -1414,7 +1415,7 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
 
                 with patch.object(
                     install_module.os, "replace", side_effect=injected_replace
-                ), patch.object(Path, "unlink", new=injected_unlink):
+                ), patch.object(path_class, "unlink", new=injected_unlink):
                     with self.assertRaisesRegex(
                         ProfileInstallError,
                         "rolled back" if not failures else "incomplete",
