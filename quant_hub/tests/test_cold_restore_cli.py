@@ -1348,6 +1348,7 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "qualification native guard requires Windows")
     def test_real_powershell_process_identity_and_d_path_aliases(self) -> None:
         root = Path(__file__).resolve().parents[2]
+        forward_root = os.fspath(root).replace("\\", "/")
         native = _qualification_native_probe_script()
         server = r"C:\quant_platform\tools\viewer\server.py"
         good = rf'"C:\quant_platform\python\python.exe" -I "{server}"'
@@ -1372,11 +1373,17 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             + "'C:\\Windows\\python.exe' $server);"
             + "substring=(Test-QrhExactLegacyArgv $substring "
             + "'C:\\quant_platform\\python\\python.exe' $server);"
-            + "forward=(Test-QrhContainsDRoot ('python D:/quant/quant_platform/app.py'));"
+            + "forward=(Test-QrhContainsDRoot "
+            + OpenSSHColdRestore._literal(f'python "{forward_root}/app.py"')
+            + ");"
             + "extended=(Test-QrhContainsDRoot ('python \\\\?\\'+$root+'\\app.py'));"
             + "short=(Test-QrhContainsDRoot ('python '+$short+'\\app.py'));"
-            + "sibling=(Test-QrhContainsDRoot ('python D:/quant/quant_platform_evil/app.py'));"
-            + "prefix=(Test-QrhContainsDRoot ('python XD:/quant/quant_platform/app.py'));"
+            + "sibling=(Test-QrhContainsDRoot "
+            + OpenSSHColdRestore._literal(f'python "{forward_root}_evil/app.py"')
+            + ");"
+            + "prefix=(Test-QrhContainsDRoot "
+            + OpenSSHColdRestore._literal(f'python "X{forward_root}/app.py"')
+            + ");"
             + "short_path=$short}|ConvertTo-Json -Compress"
         )
         completed = run_powershell(command)
@@ -1395,6 +1402,7 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "qualification guard requires Windows")
     def test_real_powershell_full_no_d_execution_guard_normalizes_forward_slash(self) -> None:
         root = Path(__file__).resolve().parents[2]
+        forward_root = os.fspath(root).replace("\\", "/")
 
         def invoke(command_line: str) -> dict:
             script = (
@@ -1417,11 +1425,11 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             self.assertEqual(0, completed.returncode, completed.stderr)
             return json.loads(completed.stdout)
 
-        rejected = invoke("python D:/quant/quant_platform/tooling/task.py")
+        rejected = invoke(f'python "{forward_root}/tooling/task.py"')
         self.assertFalse(rejected["passed"])
         self.assertEqual("qualification_d_process_exists", rejected["error"])
         self.assertTrue(
-            invoke("python D:/quant/quant_platform_sibling/tooling/task.py")["passed"]
+            invoke(f'python "{forward_root}_sibling/tooling/task.py"')["passed"]
         )
 
     @unittest.skipUnless(os.name == "nt", "qualification guard requires Windows")
