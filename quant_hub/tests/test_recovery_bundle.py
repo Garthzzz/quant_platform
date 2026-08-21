@@ -22,6 +22,7 @@ from quant_hub.ops.recovery_bundle import (
     restore_recovery_bundle,
     verify_recovery_bundle,
     _scan_no_secret,
+    _scan_regular_payload,
     _scan_sqlite_logical_text,
 )
 from quant_hub.ops.release_identity import canonical_manifest_bytes, manifest_sha256
@@ -393,6 +394,210 @@ class RecoveryBundleTests(unittest.TestCase):
         rendered = str(caught.exception)
         for secret in (github, deepseek, bearer):
             self.assertNotIn(secret, rendered)
+
+    def test_sqlite_fts5_external_content_scans_authority_without_querying_virtual_table(self) -> None:
+        database = self.root / "state" / "external-content.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                "CREATE TABLE document_search_projection("
+                "rowid INTEGER PRIMARY KEY, body TEXT);"
+                "INSERT INTO document_search_projection(body) VALUES ('public research');"
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='document_search_projection', content_rowid='rowid');"
+                "INSERT INTO document_fts(document_fts) VALUES ('rebuild');"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertEqual(set(), _scan_sqlite_logical_text(database))
+        self.assertEqual("pass", _scan_no_secret(self.root, [database])["verdict"])
+
+    def test_sqlite_fts5_external_content_secret_is_blocked_without_leaking_value(self) -> None:
+        database = self.root / "state" / "external-content-secret.sqlite3"
+        secret = "Authorization: Bearer " + "H" * 40
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                "CREATE TABLE document_search_projection("
+                "rowid INTEGER PRIMARY KEY, body TEXT);"
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='document_search_projection', content_rowid='rowid');"
+            )
+            connection.execute(
+                "INSERT INTO document_search_projection(body) VALUES (?)", (secret,)
+            )
+            connection.execute(
+                "INSERT INTO document_fts(document_fts) VALUES ('rebuild')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertIn(
+            "authorization_bearer", _scan_sqlite_logical_text(database)
+        )
+        with self.assertRaises(RecoveryBundleError) as caught:
+            _scan_no_secret(self.root, [database])
+        self.assertIn("authorization_bearer", str(caught.exception))
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_sqlite_like_wildcard_cannot_hide_external_content_authority(self) -> None:
+        database = self.root / "state" / "literal-sqlite-prefix.sqlite3"
+        secret = "Authorization: Bearer " + "Y" * 40
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA page_size=512")
+            connection.execute("VACUUM")
+            connection.executescript(
+                "CREATE TABLE sqliteXprojection("
+                "rowid INTEGER PRIMARY KEY, body TEXT);"
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='sqliteXprojection', content_rowid='rowid');"
+            )
+            # SQLite record/overflow pages can physically split this value, so
+            # the raw-byte pass alone cannot be treated as a logical row scan.
+            connection.execute(
+                "INSERT INTO sqliteXprojection(body) VALUES (?)",
+                (secret + "B" * 3000,),
+            )
+            connection.execute(
+                "INSERT INTO document_fts(document_fts) VALUES ('rebuild')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertNotIn(
+            "authorization_bearer", _scan_regular_payload(database)[2]
+        )
+        self.assertIn(
+            "authorization_bearer", _scan_sqlite_logical_text(database)
+        )
+        with self.assertRaises(RecoveryBundleError) as caught:
+            _scan_no_secret(self.root, [database])
+        self.assertIn("authorization_bearer", str(caught.exception))
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_sqlite_virtual_tables_fail_closed_without_external_fts5_authority(self) -> None:
+        fixtures = {
+            "contentless": (
+                "CREATE VIRTUAL TABLE document_fts USING fts5(body, content='')"
+            ),
+            "implicit-content": (
+                "CREATE VIRTUAL TABLE document_fts USING fts5(body)"
+            ),
+            "missing-content-table": (
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='missing_projection')"
+            ),
+            "unknown-module": (
+                "CREATE VIRTUAL TABLE document_fts USING fts4(body)"
+            ),
+        }
+        for name, statement in fixtures.items():
+            with self.subTest(name=name):
+                database = self.root / "state" / f"{name}.sqlite3"
+                connection = sqlite3.connect(database)
+                try:
+                    if name == "unknown-module":
+                        # Persist an unknown virtual-table declaration without
+                        # requiring that unsafe module to be loadable in the
+                        # test process.
+                        connection.execute("PRAGMA writable_schema=ON")
+                        connection.execute(
+                            "INSERT INTO sqlite_schema("
+                            "type,name,tbl_name,rootpage,sql) VALUES(?,?,?,?,?)",
+                            ("table", "document_fts", "document_fts", 0, statement),
+                        )
+                        connection.execute("PRAGMA writable_schema=OFF")
+                    else:
+                        connection.execute(statement)
+                    connection.commit()
+                finally:
+                    connection.close()
+                with self.assertRaises(RecoveryBundleError):
+                    _scan_sqlite_logical_text(database)
+
+        database = self.root / "state" / "virtual-content-authority.sqlite3"
+        connection = sqlite3.connect(database)
+        try:
+            connection.executescript(
+                "CREATE TABLE source_projection(rowid INTEGER PRIMARY KEY, body TEXT);"
+                "CREATE VIRTUAL TABLE authority_fts USING fts5("
+                "body, content='source_projection', content_rowid='rowid');"
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='authority_fts', content_rowid='rowid');"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(RecoveryBundleError, "not an ordinary table"):
+            _scan_sqlite_logical_text(database)
+
+    def test_sqlite_internal_table_cannot_be_external_content_authority(self) -> None:
+        database = self.root / "state" / "internal-authority.sqlite3"
+        secret = "Authorization: Bearer " + "Z" * 40
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA page_size=512")
+            connection.execute("VACUUM")
+            connection.execute(
+                "CREATE TABLE seed(id INTEGER PRIMARY KEY AUTOINCREMENT)"
+            )
+            connection.execute("INSERT INTO seed DEFAULT VALUES")
+            connection.execute(
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "name, content='sqlite_sequence', content_rowid='rowid')"
+            )
+            connection.execute(
+                "UPDATE sqlite_sequence SET name=? WHERE name='seed'",
+                (secret + "B" * 3000,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertNotIn(
+            "authorization_bearer", _scan_regular_payload(database)[2]
+        )
+        with self.assertRaisesRegex(
+            RecoveryBundleError, "authority was not logically scanned"
+        ) as caught:
+            _scan_sqlite_logical_text(database)
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_sqlite_external_content_index_must_match_scanned_authority(self) -> None:
+        database = self.root / "state" / "stale-external-index.sqlite3"
+        secret = "Authorization: Bearer " + "W" * 40
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA page_size=512")
+            connection.execute("VACUUM")
+            connection.executescript(
+                "CREATE TABLE projection(rowid INTEGER PRIMARY KEY, body TEXT);"
+                "CREATE VIRTUAL TABLE document_fts USING fts5("
+                "body, content='projection', content_rowid='rowid');"
+            )
+            # Deliberately mutate only the FTS index.  The ordinary authority
+            # remains empty while the tokenized shadow tables hold the value.
+            connection.execute(
+                "INSERT INTO document_fts(rowid,body) VALUES (?,?)",
+                (1, secret + "B" * 3000),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        self.assertNotIn(
+            "authorization_bearer", _scan_regular_payload(database)[2]
+        )
+        with self.assertRaisesRegex(
+            RecoveryBundleError, "SQLite logical no-secret scan failed"
+        ) as caught:
+            _scan_sqlite_logical_text(database)
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_nonempty_restore_target_is_rejected(self) -> None:
         bundle = self._build()

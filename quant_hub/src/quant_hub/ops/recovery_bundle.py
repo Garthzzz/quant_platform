@@ -33,7 +33,7 @@ from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
 
 
 CLOSURE_SCHEMA = "qrh-recovery-closure-inventory/v1"
-SCANNER_VERSION = "qrh-recovery-no-secret/v2"
+SCANNER_VERSION = "qrh-recovery-no-secret/v3"
 RESTORE_PROTOCOL = "qrh-restore/v1"
 OPERATIONAL_BOOTSTRAP_SCHEMA = "qrh-operational-bootstrap/v1"
 PRODUCTION_VM_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
@@ -272,6 +272,142 @@ def _is_sqlite_payload(path: Path) -> bool:
         return stream.read(16) == b"SQLite format 3\x00"
 
 
+def _split_sql_arguments(payload: str) -> list[str]:
+    """Split a virtual-table argument list without interpreting SQL."""
+
+    arguments: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(payload):
+        character = payload[index]
+        if quote is not None:
+            if quote == "[":
+                if character == "]":
+                    if index + 1 < len(payload) and payload[index + 1] == "]":
+                        index += 2
+                        continue
+                    quote = None
+            elif character == quote:
+                if index + 1 < len(payload) and payload[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif character in ("'", '"', "`"):
+            quote = character
+        elif character == "[":
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                raise RecoveryBundleError("SQLite virtual table SQL is malformed")
+            depth -= 1
+        elif character == "," and depth == 0:
+            arguments.append(payload[start:index].strip())
+            start = index + 1
+        index += 1
+    if quote is not None or depth != 0:
+        raise RecoveryBundleError("SQLite virtual table SQL is malformed")
+    arguments.append(payload[start:].strip())
+    return arguments
+
+
+def _fts5_external_content(create_sql: str) -> str:
+    """Return the explicit external-content authority for one FTS5 table."""
+
+    match = re.search(r"\bUSING\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", create_sql, re.I)
+    if match is None:
+        raise RecoveryBundleError("SQLite virtual table module is unreadable")
+    if match.group(1).casefold() != "fts5":
+        raise RecoveryBundleError("SQLite virtual table module is not allowed")
+
+    body_start = match.end()
+    depth = 0
+    quote: str | None = None
+    body_end: int | None = None
+    index = body_start
+    while index < len(create_sql):
+        character = create_sql[index]
+        if quote is not None:
+            if quote == "[":
+                if character == "]":
+                    if index + 1 < len(create_sql) and create_sql[index + 1] == "]":
+                        index += 2
+                        continue
+                    quote = None
+            elif character == quote:
+                if index + 1 < len(create_sql) and create_sql[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif character in ("'", '"', "`"):
+            quote = character
+        elif character == "[":
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            if depth == 0:
+                body_end = index
+                break
+            depth -= 1
+        index += 1
+    if body_end is None or create_sql[body_end + 1 :].strip().rstrip(";").strip():
+        raise RecoveryBundleError("SQLite virtual table SQL is malformed")
+
+    content_values: list[str] = []
+    for argument in _split_sql_arguments(create_sql[body_start:body_end]):
+        option = re.fullmatch(r"content\s*=\s*(.+)", argument, re.I | re.S)
+        if option is not None:
+            content_values.append(option.group(1).strip())
+    if len(content_values) != 1:
+        raise RecoveryBundleError(
+            "SQLite FTS5 table requires one explicit external content authority"
+        )
+    literal = content_values[0]
+    if len(literal) < 2 or literal[0] != "'" or literal[-1] != "'":
+        raise RecoveryBundleError(
+            "SQLite FTS5 external content authority must be a quoted table name"
+        )
+    content = literal[1:-1].replace("''", "'")
+    if not content or "'" in content:
+        raise RecoveryBundleError(
+            "SQLite FTS5 external content authority is empty or malformed"
+        )
+    return content
+
+
+def _verify_fts5_external_content_integrity(
+    source: sqlite3.Connection,
+    virtual_table_names: Iterable[str],
+) -> None:
+    """Check each FTS index against its authority without writing the source.
+
+    FTS5 external-content indexes can drift from their ordinary content table.
+    Their shadow-table representation is tokenized and may not preserve a
+    secret pattern as contiguous bytes, so scanning the authority alone is not
+    sufficient.  SQLite's rank=1 integrity command performs the required
+    index/content comparison; it needs a writable connection, therefore the
+    command runs only against an ephemeral in-memory backup of the immutable
+    source database.
+    """
+
+    names = tuple(virtual_table_names)
+    if not names:
+        return
+    with closing(sqlite3.connect(":memory:")) as scratch:
+        source.backup(scratch)
+        scratch.execute("PRAGMA trusted_schema=OFF")
+        for table_name in names:
+            quoted = '"' + table_name.replace('"', '""') + '"'
+            scratch.execute(
+                f"INSERT INTO {quoted}({quoted}, rank) VALUES (?, ?)",
+                ("integrity-check", 1),
+            )
+
+
 def _scan_sqlite_logical_text(path: Path) -> set[str]:
     """Read every readable SQLite value without executing application code."""
 
@@ -283,17 +419,35 @@ def _scan_sqlite_logical_text(path: Path) -> set[str]:
             connection.execute("PRAGMA trusted_schema=OFF")
             tables = connection.execute(
                 "SELECT name,sql FROM sqlite_schema "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                "WHERE type='table' ORDER BY name"
             ).fetchall()
+            table_types: dict[str, str] = {}
+            for schema_name, table_name, table_type, *_unused in connection.execute(
+                "PRAGMA main.table_list"
+            ):
+                if schema_name != "main" or not isinstance(table_name, str):
+                    continue
+                folded = table_name.casefold()
+                if folded in table_types:
+                    raise RecoveryBundleError("SQLite table identity is ambiguous")
+                table_types[folded] = str(table_type).casefold()
+
+            virtual_tables: list[tuple[str, str]] = []
+            scanned_ordinary_tables: set[str] = set()
             for table_name, create_sql in tables:
                 if not isinstance(table_name, str):
                     raise RecoveryBundleError("SQLite table identity is unreadable")
+                # SQLite reserves the literal, case-insensitive ``sqlite_``
+                # prefix.  Do not express this as LIKE 'sqlite_%': ``_`` is a
+                # wildcard there and would also exclude legitimate user tables
+                # such as ``sqliteXprojection`` from the logical secret scan.
+                if table_name.casefold().startswith("sqlite_"):
+                    continue
                 if isinstance(create_sql, str) and create_sql.lstrip().upper().startswith(
                     "CREATE VIRTUAL TABLE"
                 ):
-                    raise RecoveryBundleError(
-                        "SQLite virtual table cannot be proven secret-free"
-                    )
+                    virtual_tables.append((table_name, create_sql))
+                    continue
                 quoted = '"' + table_name.replace('"', '""') + '"'
                 cursor = connection.execute(f"SELECT * FROM {quoted}")
                 for row in cursor:
@@ -302,6 +456,30 @@ def _scan_sqlite_logical_text(path: Path) -> set[str]:
                             kinds.update(_pattern_kinds_text(value))
                         elif isinstance(value, bytes):
                             kinds.update(_scan_binary_value(value))
+                scanned_ordinary_tables.add(table_name.casefold())
+
+            if virtual_tables and not bool(
+                connection.execute(
+                    "SELECT sqlite_compileoption_used('ENABLE_FTS5')"
+                ).fetchone()[0]
+            ):
+                raise RecoveryBundleError("SQLite built-in FTS5 is unavailable")
+            for table_name, create_sql in virtual_tables:
+                if table_types.get(table_name.casefold()) != "virtual":
+                    raise RecoveryBundleError("SQLite virtual table identity is inconsistent")
+                content_table = _fts5_external_content(create_sql)
+                if table_types.get(content_table.casefold()) != "table":
+                    raise RecoveryBundleError(
+                        "SQLite FTS5 external content authority is missing or not an ordinary table"
+                    )
+                if content_table.casefold() not in scanned_ordinary_tables:
+                    raise RecoveryBundleError(
+                        "SQLite FTS5 external content authority was not logically scanned"
+                    )
+            _verify_fts5_external_content_integrity(
+                connection,
+                (table_name for table_name, _create_sql in virtual_tables),
+            )
     except (OSError, sqlite3.Error, UnicodeError) as error:
         raise RecoveryBundleError("SQLite logical no-secret scan failed") from error
     return kinds
