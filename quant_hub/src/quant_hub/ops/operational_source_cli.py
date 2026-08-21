@@ -885,6 +885,11 @@ class OperationalSourceOrchestrator:
         ensure_no_reparse_components(staging.resolve(strict=True))
         try:
             (staging / "control").mkdir()
+            # OpenSSH scp preserves the remote directory basename only when
+            # the local destination directory already exists.  Pre-create
+            # ``tooling`` so ``.../tooling/python`` cannot be flattened into
+            # ``staging/tooling`` and silently change the sealed identity.
+            (staging / "tooling").mkdir()
             sources = (
                 (self.config.vm.root / "tooling" / "python", staging / "tooling"),
                 (

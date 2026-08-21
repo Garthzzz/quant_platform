@@ -408,6 +408,7 @@ class OperationalSourceTests(unittest.TestCase):
             source = str(arguments[-2])
             destination = Path(arguments[-1])
             if source.endswith("/tooling/python"):
+                self.assertTrue(destination.is_dir())
                 shutil.copytree(remote / "tooling/python", destination / "python")
             elif source.endswith("deployment_runtime.json"):
                 shutil.copy2(remote / "control/deployment_runtime.json", destination)
@@ -464,6 +465,7 @@ class OperationalSourceTests(unittest.TestCase):
             source = str(arguments[-2])
             destination = Path(arguments[-1])
             if source.endswith("/tooling/python"):
+                self.assertTrue(destination.is_dir())
                 shutil.copytree(remote / "tooling/python", destination / "python")
             elif source.endswith("deployment_runtime.json"):
                 shutil.copy2(remote / "control/deployment_runtime.json", destination)
