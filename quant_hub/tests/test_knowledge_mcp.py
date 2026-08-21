@@ -1379,9 +1379,9 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 agents_path = project / "AGENTS.md"
                 client_path = data_root / "quant-research-knowledge" / "client.json"
                 real_replace = install_module.os.replace
-                path_class = type(client_path)
-                real_unlink = path_class.unlink
+                real_unlink = install_module.os.unlink
                 config_rollback_attempted = False
+                tombstone_failure_injected = False
 
                 def injected_replace(source, destination):
                     nonlocal config_rollback_attempted
@@ -1405,17 +1405,19 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                     return real_replace(source, destination)
 
                 def injected_unlink(path, *args, **kwargs):
+                    nonlocal tombstone_failure_injected
                     candidate = Path(path)
                     if (
                         candidate.parent == client_path.parent
                         and candidate.name.startswith(".client.json.partial-")
                     ):
+                        tombstone_failure_injected = True
                         raise OSError("injected client tombstone cleanup failure")
                     return real_unlink(path, *args, **kwargs)
 
                 with patch.object(
                     install_module.os, "replace", side_effect=injected_replace
-                ), patch.object(path_class, "unlink", new=injected_unlink):
+                ), patch.object(install_module.os, "unlink", new=injected_unlink):
                     with self.assertRaisesRegex(
                         ProfileInstallError,
                         "rolled back" if not failures else "incomplete",
@@ -1426,6 +1428,7 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                             project_root=project,
                             data_root=data_root,
                         )
+                self.assertTrue(tombstone_failure_injected)
 
                 config_text = config_path.read_text(encoding="utf-8")
                 agents_text = agents_path.read_text(encoding="utf-8")
