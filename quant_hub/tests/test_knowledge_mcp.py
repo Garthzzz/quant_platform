@@ -1386,18 +1386,19 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                     nonlocal config_rollback_attempted
                     source_path = Path(source)
                     destination_path = Path(destination)
+                    destination_name = destination_path.name.casefold()
                     is_rollback = ".rollback-" in source_path.name
-                    if is_rollback and destination_path == config_path:
+                    if is_rollback and destination_name == config_path.name.casefold():
                         config_rollback_attempted = True
                     if (
                         is_rollback
-                        and destination_path == client_path
+                        and destination_name == client_path.name.casefold()
                         and "client" in failures
                     ):
                         raise OSError("injected client rollback failure")
                     if (
                         is_rollback
-                        and destination_path == agents_path
+                        and destination_name == agents_path.name.casefold()
                         and "agents" in failures
                     ):
                         raise OSError("injected AGENTS rollback failure")
