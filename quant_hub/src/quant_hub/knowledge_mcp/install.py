@@ -171,7 +171,7 @@ def _restartable_ordered_payloads(
             if temporary in preserved_temps:
                 continue
             try:
-                temporary.unlink(missing_ok=True)
+                _unlink_path(temporary, missing_ok=True)
             except OSError:
                 # Cleanup failure must not mask the primary failure or make an
                 # inactive profile active. A later idempotent retry can remove
@@ -180,14 +180,14 @@ def _restartable_ordered_payloads(
 
     def restore(path: Path, original: bytes | None) -> None:
         if original is None:
-            path.unlink(missing_ok=True)
+            _unlink_path(path, missing_ok=True)
             return
         rollback = path.parent / f".{path.name}.rollback-{uuid4().hex}"
         try:
             rollback.write_bytes(original)
             os.replace(rollback, path)
         finally:
-            rollback.unlink(missing_ok=True)
+            _unlink_path(rollback, missing_ok=True)
 
     try:
         for path, desired in updates:
@@ -216,7 +216,7 @@ def _restartable_ordered_payloads(
                 # dot-prefixed tombstone is cleaned on a normal return/retry.
                 os.replace(path, temporary)
                 applied.append((path, original))
-                temporary.unlink(missing_ok=True)
+                _unlink_path(temporary, missing_ok=True)
             else:
                 os.replace(temporary, path)
                 applied.append((path, original))
@@ -267,6 +267,12 @@ def _restartable_ordered_payloads(
     finally:
         cleanup_staging()
     return True
+
+
+def _unlink_path(path: Path, *, missing_ok: bool) -> None:
+    """Single filesystem boundary for deterministic failure injection."""
+
+    path.unlink(missing_ok=missing_ok)
 
 
 def _restartable_ordered_text(updates: tuple[tuple[Path, str], ...]) -> bool:
