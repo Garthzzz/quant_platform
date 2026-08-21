@@ -28,6 +28,12 @@ class GitGuardTests(unittest.TestCase):
             self.assertFalse(git_guard.allowed(path, policy), path)
         self.assertTrue(git_guard.allowed("quant_hub/src/quant_hub/app.py", policy))
         self.assertTrue(git_guard.allowed("openspec/changes/design-vm-knowledge-mcp/design.md", policy))
+        self.assertTrue(
+            git_guard.allowed(
+                "docs/verification/STAGE4_PUBLIC_RAG_REPAIR_20260822.md", policy
+            )
+        )
+        self.assertFalse(git_guard.allowed("docs/verification/private-result.md", policy))
 
     def test_gate_reports_secret_by_fingerprint_without_value(self) -> None:
         policy = git_guard.load_policy(ROOT / "config" / "git_tracked_policy.json")
