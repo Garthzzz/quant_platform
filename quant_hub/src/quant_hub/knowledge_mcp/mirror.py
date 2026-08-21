@@ -23,7 +23,11 @@ from quant_hub.config import (
     stat_is_reparse_point,
 )
 from quant_hub.knowledge.contracts import BaseSnapshot, canonical_json, content_hash
-from quant_hub.knowledge.retrieval import ArtifactKnowledgeIndex, KnowledgeIndex
+from quant_hub.knowledge.retrieval import (
+    ArtifactKnowledgeIndex,
+    KnowledgeIndex,
+    citation_ids_for_evidence_bindings,
+)
 from quant_hub.knowledge.semantic import EnrichedSnapshot, KnowledgeGeneration
 from quant_hub.ops.release_identity import (
     manifest_sha256,
@@ -400,18 +404,8 @@ def build_search_artifact(
                 ),
                 [],
             )
-            citation_ids = sorted(
-                {
-                    str(span.attributes["citation_id"])
-                    for block in ir.blocks
-                    for span in block.spans
-                    if span.kind == "citation"
-                    and "citation_id" in span.attributes
-                    and any(
-                        binding.span_id == block.source_span.span_id
-                        for binding in item.evidence
-                    )
-                }
+            citation_ids = list(
+                citation_ids_for_evidence_bindings(ir, item.evidence)
             )
             knowledge_rows.append(
                 {

@@ -22,6 +22,7 @@ from quant_hub.knowledge.retrieval import (
     KnowledgeIndex,
     LikeBaselineIndex,
     TaskContext,
+    citation_ids_for_evidence_bindings,
 )
 from quant_hub.knowledge_mcp.mirror import build_search_artifact
 from quant_hub.knowledge.semantic import (
@@ -369,6 +370,152 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
             "named_anchor:funding-basis",
             unsupported_basis.no_answer_reason or "",
         )
+
+        # A bounded research-request verb at the beginning of an English
+        # prompt is grammar, not a named model/instrument.  It must not turn a
+        # grounded Rank IC question into a closed-world no-answer response.
+        imperative = self.index.search(
+            "Explain why Rank IC is useful for cross-sectional factor selection"
+        )
+        self.assertTrue(imperative.answerable)
+        self.assertEqual(
+            self._record_for_path("factor.md").document_id,
+            imperative.cards[0].document_id,
+        )
+        named_acronym = self.index.search("COMPARE CVA calibration")
+        self.assertFalse(named_acronym.answerable)
+        self.assertIn(
+            "named_anchor:compare", named_acronym.no_answer_reason or ""
+        )
+
+    def test_knowledge_citations_do_not_leak_between_claims_in_one_paragraph(self) -> None:
+        citation_root = self.root / "citation-scope"
+        citation_root.mkdir()
+        first_citation = "cit_" + ("a" * 52)
+        second_citation = "cit_" + ("b" * 52)
+        consecutive_citation = "cit_" + ("c" * 52)
+        first_claim = "Rank IC 在低信噪比下不稳定。"
+        second_claim = "换手成本应在回测中实测。"
+        (citation_root / "claims.md").write_text(
+            "# 相邻论断\n\n"
+            f"{first_claim} ^src:{{{first_citation}}} ^src:{{{consecutive_citation}}} "
+            f"{second_claim} ^src:{{{second_citation}}}\n",
+            encoding="utf-8",
+        )
+        compiled = ReferenceCompiler().compile(citation_root)
+        assert compiled.candidate_snapshot is not None
+        base = compiled.candidate_snapshot
+        document = next(iter(base.documents.values()))
+        assert document.active_version_id is not None
+        paragraph = next(
+            block
+            for block in base.ir_documents[document.active_version_id].blocks
+            if block.kind == "paragraph" and first_claim in block.source_span.text
+        )
+        store = SemanticJobStore(citation_root / "runtime" / "knowledge.sqlite3")
+        for ordinal, (claim, citation_id) in enumerate(
+            ((first_claim, first_citation), (second_claim, second_citation)), 1
+        ):
+            relative = paragraph.source_span.text.index(claim)
+            byte_start = paragraph.source_span.byte_start + len(
+                paragraph.source_span.text[:relative].encode("utf-8")
+            )
+            store.add_item(
+                KnowledgeItem(
+                    knowledge_item_id=f"kitm-citation-scope-{ordinal}",
+                    cluster_id=f"kcl-citation-scope-{ordinal}",
+                    document_id=document.document_id,
+                    document_version_id=document.active_version_id,
+                    kind="evidence",
+                    text=claim,
+                    evidence=(
+                        EvidenceBinding(
+                            paragraph.source_span.span_id,
+                            claim,
+                            hashlib.sha256(claim.encode("utf-8")).hexdigest(),
+                            byte_start,
+                            byte_start + len(claim.encode("utf-8")),
+                        ),
+                    ),
+                    applicability={},
+                    relation=None,
+                    fact_status="source_explicit",
+                    extractor="public-adversarial-fixture",
+                    extractor_version="public-adversarial-fixture/v1",
+                    generation_id=None,
+                    accepted_at="2026-08-21T00:00:00.000000Z",
+                    accepted_by=None,
+                )
+            )
+        first_relative = paragraph.source_span.text.index(first_claim)
+        first_start = paragraph.source_span.byte_start + len(
+            paragraph.source_span.text[:first_relative].encode("utf-8")
+        )
+        second_relative = paragraph.source_span.text.index(second_claim)
+        second_start = paragraph.source_span.byte_start + len(
+            paragraph.source_span.text[:second_relative].encode("utf-8")
+        )
+        forged_offset = EvidenceBinding(
+            paragraph.source_span.span_id,
+            first_claim,
+            hashlib.sha256(first_claim.encode("utf-8")).hexdigest(),
+            second_start,
+            second_start + len(second_claim.encode("utf-8")),
+        )
+        forged_hash = EvidenceBinding(
+            paragraph.source_span.span_id,
+            first_claim,
+            "0" * 64,
+            first_start,
+            first_start + len(first_claim.encode("utf-8")),
+        )
+        for binding in (forged_offset, forged_hash):
+            with self.assertRaisesRegex(ValueError, "differs from quote"):
+                citation_ids_for_evidence_bindings(
+                    base.ir_documents[document.active_version_id], (binding,)
+                )
+        enriched = build_enriched_snapshot(base, store)
+        with KnowledgeIndex(base, enriched) as index:
+            by_id = {
+                record.record_id: record
+                for record in index.records
+                if record.source_kind == "knowledge"
+            }
+            self.assertEqual(
+                tuple(sorted((first_citation, consecutive_citation))),
+                by_id["kitm-citation-scope-1"].citation_ids,
+            )
+            self.assertEqual(
+                (second_citation,), by_id["kitm-citation-scope-2"].citation_ids
+            )
+
+            artifact = json.loads(build_search_artifact(base, enriched=enriched))
+            artifact_rows = {
+                row["knowledge_item_id"]: row
+                for row in artifact["knowledge"]
+            }
+            self.assertEqual(
+                sorted((first_citation, consecutive_citation)),
+                artifact_rows["kitm-citation-scope-1"]["citation_ids"],
+            )
+            self.assertEqual(
+                [second_citation],
+                artifact_rows["kitm-citation-scope-2"]["citation_ids"],
+            )
+            with ArtifactKnowledgeIndex(artifact, base=base) as artifact_index:
+                artifact_records = {
+                    record.record_id: record
+                    for record in artifact_index.records
+                    if record.source_kind == "knowledge"
+                }
+                self.assertEqual(
+                    by_id["kitm-citation-scope-1"].citation_ids,
+                    artifact_records["kitm-citation-scope-1"].citation_ids,
+                )
+                self.assertEqual(
+                    by_id["kitm-citation-scope-2"].citation_ids,
+                    artifact_records["kitm-citation-scope-2"].citation_ids,
+                )
 
     def test_information_anchors_and_explicit_contrast_fail_closed(self) -> None:
         low_information = self.index.search("为什么 什么 应该")

@@ -15,7 +15,7 @@ from .contracts import BaseSnapshot, Chunk, canonical_json
 from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
-INDEX_VERSION = "qrh-structured-lexical-index/v1.9-quant-bilingual"
+INDEX_VERSION = "qrh-structured-lexical-index/v1.10-quant-bilingual"
 RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v2"
 
 # Only relations whose direction adds supporting context may introduce a new
@@ -138,6 +138,14 @@ _ASCII_QUESTION_WORDS = frozenset(
         "may",
         "might",
     }
+)
+# These are ignored as named anchors only in the first ASCII position of a
+# query.  They are ordinary research-request grammar there ("Explain why …"),
+# but can still be searched as source terms elsewhere.  Keeping this list
+# closed avoids weakening the fail-closed treatment of unknown capitalized
+# methods and instruments.
+_ASCII_LEADING_REQUEST_VERBS = frozenset(
+    {"compare", "describe", "explain", "outline", "summarize"}
 )
 _CJK_QUESTION_PHRASES = tuple(
     sorted(
@@ -594,6 +602,92 @@ def _heading_labels(ir: Any, heading_path: Sequence[str]) -> tuple[str, ...]:
     )
 
 
+_CITATION_ADJACENCY_RE = re.compile(r"^[\s\W_]{0,24}$", re.UNICODE)
+
+
+def citation_ids_for_evidence_bindings(
+    ir: Any, bindings: Sequence[Any]
+) -> tuple[str, ...]:
+    """Return only citations mechanically attributable to exact evidence.
+
+    A semantic item may bind one clause inside a larger Markdown paragraph.
+    Assigning every citation from that paragraph lets an adjacent claim lend
+    its source to the item.  A citation is attributable only when its exact IR
+    locator is inside the binding, or immediately follows it with a short gap
+    containing punctuation/Markdown delimiters but no author words.
+    """
+
+    blocks = {
+        block.source_span.span_id: block
+        for block in ir.blocks
+    }
+    citation_ids: set[str] = set()
+    for binding in bindings:
+        block = blocks.get(str(binding.span_id))
+        if block is None:
+            raise ValueError("knowledge evidence binding span is absent")
+        block_span = block.source_span
+        binding_start = int(binding.byte_start)
+        binding_end = int(binding.byte_end)
+        if binding_start == -1 and binding_end == -1:
+            # Legacy/manual in-memory fixtures without byte locators cannot
+            # lend citation authority.  Published artifacts apply their own
+            # stricter exact-locator gate.
+            continue
+        if not (
+            block_span.byte_start <= binding_start < binding_end <= block_span.byte_end
+        ):
+            raise ValueError("knowledge evidence byte locator is invalid")
+        raw = block_span.text.encode("utf-8")
+        relative_binding_start = binding_start - block_span.byte_start
+        relative_binding_end = binding_end - block_span.byte_start
+        quote_bytes = raw[relative_binding_start:relative_binding_end]
+        try:
+            located_quote = quote_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("knowledge evidence byte locator is not UTF-8 aligned") from error
+        if (
+            located_quote != str(binding.quote)
+            or hashlib.sha256(quote_bytes).hexdigest()
+            != str(binding.quote_sha256)
+        ):
+            raise ValueError("knowledge evidence byte locator differs from quote")
+        citations = sorted(
+            (
+                span
+                for span in block.spans
+                if span.kind == "citation"
+                and "citation_id" in span.attributes
+                and span.attributes.get("locator_precision") == "exact"
+            ),
+            key=lambda span: (span.byte_start, span.byte_end, span.span_id),
+        )
+        adjacency_cursor = binding_end
+        for span in citations:
+            contained = binding_start <= span.byte_start and span.byte_end <= binding_end
+            adjacent = False
+            if adjacency_cursor <= span.byte_start:
+                relative_start = adjacency_cursor - block_span.byte_start
+                relative_end = span.byte_start - block_span.byte_start
+                gap_bytes = raw[relative_start:relative_end]
+                if len(gap_bytes) <= 24:
+                    try:
+                        gap = gap_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        gap = ""
+                    adjacent = bool(
+                        gap_bytes == b"" or _CITATION_ADJACENCY_RE.fullmatch(gap)
+                    )
+            if contained or adjacent:
+                citation_ids.add(str(span.attributes["citation_id"]))
+                adjacency_cursor = max(adjacency_cursor, span.byte_end)
+            elif span.byte_start >= binding_end:
+                # Author text (or a non-adjacent source marker) breaks the
+                # attribution run; later citations belong to later claims.
+                break
+    return tuple(sorted(citation_ids))
+
+
 class KnowledgeIndex:
     def __init__(self, base: BaseSnapshot, enriched: EnrichedSnapshot | None = None):
         if enriched is not None and enriched.base_snapshot_id != base.snapshot_id:
@@ -827,18 +921,7 @@ class KnowledgeIndex:
             raise ValueError("knowledge evidence quote is absent or ambiguous")
         prefix = primary.text[: occurrences[0]]
         quote_line_start = primary.line_start + prefix.count("\n")
-        citations = tuple(
-            sorted(
-                {
-                    str(span.attributes["citation_id"])
-                    for block in ir.blocks
-                    for span in block.spans
-                    if span.kind == "citation"
-                    and "citation_id" in span.attributes
-                    and any(binding.span_id == block.source_span.span_id for binding in item.evidence)
-                }
-            )
-        )
+        citations = citation_ids_for_evidence_bindings(ir, item.evidence)
         heading_path = next(
             (
                 block.heading_path
@@ -1025,10 +1108,16 @@ class KnowledgeIndex:
     def _unsupported_named_query_anchors(self, query: str) -> tuple[str, ...]:
         unsupported: list[str] = []
         matches = tuple(_ASCII_RE.finditer(query))
-        for match in matches:
+        for ordinal, match in enumerate(matches):
             surface = match.group(0)
             folded = surface.casefold()
             if folded in _ASCII_QUESTION_WORDS or len(folded) < 2:
+                continue
+            if (
+                ordinal == 0
+                and folded in _ASCII_LEADING_REQUEST_VERBS
+                and not surface.isupper()
+            ):
                 continue
             controlled_facet = _controlled_facet_canonical(surface)
             if controlled_facet is not None:
@@ -1943,4 +2032,5 @@ __all__ = [
     "RETRIEVAL_ARTIFACT_SCHEMA",
     "SearchResponse",
     "TaskContext",
+    "citation_ids_for_evidence_bindings",
 ]
