@@ -340,6 +340,7 @@ class VMDeploymentAdapterTests(unittest.TestCase):
             )
             self.assertNotIn("Get-FileHash", script)
             self.assertIn("[Security.Cryptography.SHA256]::Create()", script)
+            self.assertIn("$packageFull=$packageItem.FullName.TrimEnd", script)
             # Make the regression independent of the developer machine: even
             # if the cmdlet exists locally, a shadowing function proves the
             # generated verifier never resolves or calls it.

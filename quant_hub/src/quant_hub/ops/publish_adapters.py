@@ -529,6 +529,15 @@ def _powershell_package_inventory_verification_script() -> str:
     """Rebuild Python's canonical package inventory using PowerShell bytes."""
 
     return (
+        # A caller may supply the package through an 8.3 alias while
+        # Get-ChildItem reports long FullName values. Canonicalize the existing
+        # directory before deriving relative names; substringing two different
+        # spellings would otherwise create a different inventory on CI/VM.
+        "$packageItem=Get-Item -LiteralPath $packageFull -Force -ErrorAction Stop;"
+        "if(-not $packageItem.PSIsContainer-or"
+        "($packageItem.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0)"
+        "{throw 'package_root_invalid'};"
+        "$packageFull=$packageItem.FullName.TrimEnd('\\');"
         "$packageDirs=@(Get-ChildItem -LiteralPath $packageFull -Directory -Recurse -Force);"
         "if(@($packageDirs|Where-Object{($_.Attributes-band"
         "[IO.FileAttributes]::ReparsePoint)-ne 0}).Count-ne 0){throw 'package_reparse'};"
