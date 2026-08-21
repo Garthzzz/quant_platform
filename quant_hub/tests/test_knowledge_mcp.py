@@ -1379,7 +1379,6 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 agents_path = project / "AGENTS.md"
                 client_path = data_root / "quant-research-knowledge" / "client.json"
                 real_replace = install_module.os.replace
-                real_unlink = install_module._unlink_path
                 config_rollback_attempted = False
                 tombstone_failure_injected = False
 
@@ -1404,21 +1403,17 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                         raise OSError("injected AGENTS rollback failure")
                     return real_replace(source, destination)
 
-                def injected_unlink(path, *, missing_ok):
+                def injected_tombstone_cleanup(path):
                     nonlocal tombstone_failure_injected
-                    candidate = Path(path)
-                    if (
-                        candidate.parent == client_path.parent
-                        and candidate.name.startswith(".client.json.partial-")
-                    ):
-                        tombstone_failure_injected = True
-                        raise OSError("injected client tombstone cleanup failure")
-                    return real_unlink(path, missing_ok=missing_ok)
+                    tombstone_failure_injected = True
+                    raise OSError("injected client tombstone cleanup failure")
 
                 with patch.object(
                     install_module.os, "replace", side_effect=injected_replace
                 ), patch.object(
-                    install_module, "_unlink_path", new=injected_unlink
+                    install_module,
+                    "_discard_profile_tombstone",
+                    new=injected_tombstone_cleanup,
                 ):
                     with self.assertRaisesRegex(
                         ProfileInstallError,

@@ -216,7 +216,7 @@ def _restartable_ordered_payloads(
                 # dot-prefixed tombstone is cleaned on a normal return/retry.
                 os.replace(path, temporary)
                 applied.append((path, original))
-                _unlink_path(temporary, missing_ok=True)
+                _discard_profile_tombstone(temporary)
             else:
                 os.replace(temporary, path)
                 applied.append((path, original))
@@ -273,6 +273,12 @@ def _unlink_path(path: Path, *, missing_ok: bool) -> None:
     """Single filesystem boundary for deterministic failure injection."""
 
     path.unlink(missing_ok=missing_ok)
+
+
+def _discard_profile_tombstone(path: Path) -> None:
+    """Remove a committed deletion tombstone through one testable boundary."""
+
+    _unlink_path(path, missing_ok=True)
 
 
 def _restartable_ordered_text(updates: tuple[tuple[Path, str], ...]) -> bool:
