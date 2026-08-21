@@ -59,6 +59,16 @@ _LEGACY_V39_PYTHON_BYTES = 105288
 _LEGACY_V39_PYTHON_SHA256 = (
     "f3c05e11e9fc3fc0941fda221b1dfb0aac39d6ef298078054a5d949d620f3d6c"
 )
+# The sealed V39 package intentionally carries two empty runtime trees.  Its
+# file inventory binds every byte, while these four directory records are the
+# only byte-free descendants preserved by copytree.  Qualification reset may
+# observe them, but no other unmanifested directory is accepted.
+_LEGACY_V39_EMPTY_RELEASE_DIRECTORIES = (
+    "runtime/inbox",
+    "runtime/inbox/research",
+    "runtime/replay",
+    "runtime/replay/evidence",
+)
 _TRANSFER_ATTEMPT_SCHEMA = "qrh-cold-restore-transfer-attempt/v1"
 _LEGACY_MATERIALIZATION_SERIALIZATION = "legacy_powershell_hashtable_v1"
 
@@ -440,10 +450,16 @@ class OpenSSHColdRestore:
                     "$d=([BitConverter]::ToString(([Security.Cryptography.SHA256]"
                     "::Create()).ComputeHash($b))).Replace('-','');"
                     f"if($d-ne{self._literal(payload_hash)}){{throw 'gz_h'}};"
-                    "$m=[IO.MemoryStream]::new([byte[]]$b);$z=[IO.Compression.GzipStream]"
-                    "::new($m,[IO.Compression.CompressionMode]::Decompress);"
-                    "$r=[IO.StreamReader]::new($z,[Text.UTF8Encoding]::new($false));"
-                    "try{$s=$r.ReadToEnd()}finally{$r.Dispose();$z.Dispose();$m.Dispose()};"
+                    "$m=[IO.MemoryStream]::new($b);$z=[IO.Compression.GzipStream]"
+                    "::new($m,[IO.Compression.CompressionMode]0);"
+                    # The payload is locally generated UTF-8 and its exact
+                    # compressed bytes are already length/hash bound.  The
+                    # one-argument StreamReader constructor is therefore the
+                    # same decoder with a materially shorter Windows command.
+                    "$r=[IO.StreamReader]::new($z);"
+                    # StreamReader owns GZipStream, which owns MemoryStream;
+                    # disposing the outer reader closes the complete chain.
+                    "try{$s=$r.ReadToEnd()}finally{$r.Dispose()};"
                     "&([scriptblock]::Create($s))"
                 )
             else:
@@ -1506,6 +1522,10 @@ class OpenSSHColdRestore:
         )
         expected_hash = self._literal(expected_inventory_sha256 or "")
         intent_hash = self._literal(intent_nonce_sha256)
+        empty_release_suffixes = ",".join(
+            relative.removeprefix("runtime/")
+            for relative in _LEGACY_V39_EMPTY_RELEASE_DIRECTORIES
+        )
         schema = (
             _QUALIFICATION_RESET_APPLY_SCHEMA
             if apply else _QUALIFICATION_RESET_INSPECTION_SCHEMA
@@ -1570,7 +1590,12 @@ class OpenSSHColdRestore:
             "return [pscustomobject]@{inventory_sha256=$hash;files=$files;"
             "directories=$directories;file_count=$fileCount;directory_count=$directoryCount;"
             "total_bytes=$bytes;top_level_count=$top.Count;"
-            "top_level_children=@($topChildren)}};"
+            # Windows PowerShell 5.1 raises System.ArgumentException when an
+            # array subexpression directly wraps List[object] inside a
+            # PSCustomObject literal.  ToArray preserves the same insertion
+            # order and element identities without invoking that broken
+            # binder path.
+            "top_level_children=$topChildren.ToArray()}};"
             + _qualification_replay_guard_script()
             + _qualification_closure_guard_script()
             +
@@ -1606,6 +1631,8 @@ class OpenSSHColdRestore:
             "{throw 'qualification_release_inventory_empty'};foreach($record in $releaseRecords){"
             "Add-ExpectedFile ($releaseBase+'/'+[string]$record.path) ([long]$record.bytes) "
             "([string]$record.sha256)};"
+            f"foreach($r in {self._literal(empty_release_suffixes)}.Split(',')){{"
+            "[void]$expectedDirectories.Add($releaseBase+'/runtime/'+$r)};"
             "$bootstrap='control/operational_bootstrap.json';"
             "Add-ExpectedFile $bootstrap ([long]$contract.operational_bootstrap_bytes) "
             "([string]$contract.operational_bootstrap_sha256);"

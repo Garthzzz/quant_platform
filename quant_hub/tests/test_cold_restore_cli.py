@@ -1225,6 +1225,15 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("Remove-Item", scripts[0])
+        self.assertIn(
+            "top_level_children=$topChildren.ToArray()",
+            scripts[0],
+        )
+        self.assertIn(
+            "'inbox,inbox/research,replay,replay/evidence'.Split(',')",
+            scripts[0],
+        )
+        self.assertIn("$releaseBase+'/runtime/'+$r", scripts[0])
         for script in scripts:
             encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
             completed = subprocess.run(
@@ -1240,6 +1249,28 @@ class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, completed.returncode, completed.stderr)
+
+        # Windows PowerShell 5.1 has a binder bug for @($genericList) inside
+        # a PSCustomObject literal.  Exercise the exact projection used by the
+        # production inventory response so a parse-only test cannot regress
+        # back to the runtime ArgumentException.
+        projection = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "-"],
+            input=(
+                "$ErrorActionPreference='Stop';"
+                "$items=New-Object 'System.Collections.Generic.List[object]';"
+                "[void]$items.Add([pscustomobject]@{name='audit';"
+                "inventory_sha256=('0'*64)});"
+                "$result=[pscustomobject]@{top_level_children=$items.ToArray()};"
+                "@{count=@($result.top_level_children).Count}|"
+                "ConvertTo-Json -Compress\n"
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(0, projection.returncode, projection.stderr)
+        self.assertEqual({"count": 1}, json.loads(projection.stdout))
 
         calls = []
         for script in scripts:
