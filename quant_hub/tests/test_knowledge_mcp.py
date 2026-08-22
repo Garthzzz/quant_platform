@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import base64
 import copy
+from dataclasses import replace
 import hashlib
 from io import StringIO
 import json
@@ -195,6 +196,15 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
 
     def test_fresh_search_get_and_fail_closed_stale_mode(self) -> None:
         service = self.fixture.service()
+        artifact = json.loads(self.fixture.artifact1)
+        unsearched_id = artifact["chunks"][0]["chunk_id"]
+        provenance_blocked = service.get_quant_knowledge(object_id=unsearched_id)
+        self.assertEqual("search_provenance_required", provenance_blocked["status"])
+        self.assertEqual([], provenance_blocked["results"])
+        self.assertEqual(
+            ["search_quant_knowledge", "get_quant_knowledge"],
+            provenance_blocked["requires"],
+        )
         result = service.search_quant_knowledge(query="leakage embargo", limit=2)
         expected = AuthorityIdentity(
             "release-r1",
@@ -202,21 +212,83 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
             self.fixture.snapshot1.snapshot_id,
         )
         self.assertEqual("fresh", result["availability"])
+        self.assertEqual("qrh-knowledge-mcp-response/v2", result["schema_version"])
         self.assertEqual(expected.to_dict(), result["identity"])
         self.assertEqual(expected.to_dict(), result["observed_identity"])
         self.assertIsNotNone(result["authority_verified_at"])
         self.assertEqual("ok", result["status"])
         self.assertTrue(result["results"])
         self.assertTrue(result["continuation"])
+        self.assertEqual("get_quant_knowledge", result["next_action"]["tool"])
+        self.assertEqual(
+            [row["object_id"] for row in result["results"][:3]],
+            result["next_action"]["recommended_object_ids"],
+        )
+        self.assertLessEqual(result["next_action"]["maximum_unique_gets"], 3)
         object_id = result["results"][0]["object_id"]
 
         expanded = service.get_quant_knowledge(object_id=object_id)
+        self.assertEqual("ok", expanded["status"])
         self.assertEqual(expected.to_dict(), expanded["identity"])
         self.assertEqual("source_explicit", result["results"][0]["fact_status"])
         self.assertEqual(
             self.fixture.snapshot1.snapshot_id,
             expanded["identity"]["snapshot_id"],
         )
+        self.assertEqual(object_id, expanded["source_citations"][0]["object_id"])
+        self.assertEqual(
+            result["results"][0]["source_locator"]["source_sha256"],
+            expanded["source_citations"][0]["source_sha256"],
+        )
+        self.assertEqual(
+            result["results"][0]["source_locator"]["span_id"],
+            expanded["source_citations"][0]["span_id"],
+        )
+        artifact = json.loads(self.fixture.artifact1)
+        version = next(
+            row
+            for row in artifact["versions"]
+            if row["version_id"]
+            == result["results"][0]["source_locator"]["document_version_id"]
+        )
+        self.assertEqual(
+            version["logical_path"], expanded["source_citations"][0]["logical_path"]
+        )
+        self.assertEqual(
+            result["results"][0]["citation_ids"],
+            expanded["source_citations"][0]["citation_ids"],
+        )
+        self.assertTrue(expanded["next_action"]["compose_from_expanded_evidence"])
+
+        changed_query = service.search_quant_knowledge(
+            query="walk-forward validation", limit=1
+        )
+        self.assertEqual("ok", changed_query["status"])
+        self.assertNotEqual(object_id, changed_query["results"][0]["object_id"])
+        superseded_recommendation = service.get_quant_knowledge(object_id=object_id)
+        self.assertEqual(
+            "search_provenance_required", superseded_recommendation["status"]
+        )
+        current_recommendation = service.get_quant_knowledge(
+            object_id=changed_query["next_action"]["recommended_object_ids"][0]
+        )
+        self.assertEqual("ok", current_recommendation["status"])
+
+        wide_service = self.fixture.service()
+        wide = wide_service.search_quant_knowledge(
+            query="leakage embargo", limit=4
+        )
+        self.assertEqual(4, len(wide["results"]))
+        outside_recommendation = wide_service.get_quant_knowledge(
+            object_id=wide["results"][3]["object_id"]
+        )
+        self.assertEqual(
+            "search_provenance_required", outside_recommendation["status"]
+        )
+
+        service.close()
+        after_close = service.get_quant_knowledge(object_id=object_id)
+        self.assertEqual("search_provenance_required", after_close["status"])
 
         (self.fixture.control / "active_release.json").rename(
             self.fixture.control / "active_release.offline"
@@ -280,6 +352,8 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertEqual("ok", updates["status"])
         self.assertEqual(self.fixture.snapshot2.snapshot_id, updates["to_snapshot_id"])
         self.assertTrue(updates["updates"])
+        old_get = service.get_quant_knowledge(object_id=first["results"][0]["object_id"])
+        self.assertEqual("search_provenance_required", old_get["status"])
         invalid = service.search_quant_knowledge(
             query="leakage embargo", limit=1, cursor=continuation
         )
@@ -300,6 +374,50 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertEqual(self.fixture.snapshot1.snapshot_id, update_back["to_snapshot_id"])
         after = service.search_quant_knowledge(query="leakage")
         self.assertEqual("release-r1", after["identity"]["release_id"])
+
+    def test_legacy_v1_mirror_self_heals_to_v2_authority(self) -> None:
+        legacy = json.loads(self.fixture.artifact1)
+        legacy["schema_version"] = "qrh-mcp-search-artifact/v1"
+        for row in legacy["knowledge"]:
+            row.pop("source_citations", None)
+        legacy_bytes = canonical_json(legacy).encode("utf-8")
+        validate_search_artifact(
+            legacy, expected_snapshot_id=self.fixture.snapshot1.snapshot_id
+        )
+        legacy_release = copy.deepcopy(self.fixture.release1)
+        legacy_release["content"]["search_sha256"] = hashlib.sha256(
+            legacy_bytes
+        ).hexdigest()
+        release1_root = self.fixture.releases / "release-r1"
+        (release1_root / "content" / "mcp_search.json").write_bytes(legacy_bytes)
+        (release1_root / "release_manifest.json").write_text(
+            canonical_json(legacy_release), encoding="utf-8", newline=""
+        )
+        self.fixture.activate(legacy_release)
+
+        service = self.fixture.service()
+        initial = service.search_quant_knowledge(query="leakage")
+        self.assertEqual("ok", initial["status"])
+        current = service.store.current()
+        assert current is not None
+        self.assertEqual(
+            "qrh-mcp-search-artifact/v1", current.artifact["schema_version"]
+        )
+
+        self.fixture.activate(self.fixture.release2)
+        changed = service.search_quant_knowledge(query="purged folds")
+        self.assertEqual("snapshot_refresh_required", changed["status"])
+        acknowledged = service.list_knowledge_updates(
+            from_snapshot_id=self.fixture.snapshot1.snapshot_id
+        )
+        self.assertTrue(acknowledged["refresh_acknowledged"])
+        refreshed = service.search_quant_knowledge(query="purged folds")
+        self.assertEqual("ok", refreshed["status"])
+        current = service.store.current()
+        assert current is not None
+        self.assertEqual(
+            "qrh-mcp-search-artifact/v2", current.artifact["schema_version"]
+        )
 
     def test_transition_ack_survives_stdio_restart_activation_and_rollback(self) -> None:
         first_session = self.fixture.service()
@@ -489,12 +607,22 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
     def test_stdio_exposes_exactly_three_read_only_tools(self) -> None:
         service = self.fixture.service()
         server = StdioMCPServer(service)
+        guessed_existing_id = json.loads(self.fixture.artifact1)["chunks"][0]["chunk_id"]
         requests = [
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             {
                 "jsonrpc": "2.0",
                 "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_quant_knowledge",
+                    "arguments": {"object_id": guessed_existing_id},
+                },
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
                 "method": "tools/call",
                 "params": {
                     "name": "search_quant_knowledge",
@@ -506,7 +634,7 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         output = StringIO()
         self.assertEqual(0, server.serve(source, output))
         responses = [json.loads(line) for line in output.getvalue().splitlines()]
-        self.assertEqual(3, len(responses))
+        self.assertEqual(4, len(responses))
         names = {tool["name"] for tool in responses[1]["result"]["tools"]}
         self.assertEqual(
             {
@@ -532,12 +660,29 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
             )
         )
         self.assertLessEqual(len(SERVER_INSTRUCTIONS), 512)
-        structured = responses[2]["result"]["structuredContent"]
+        guessed = responses[2]["result"]["structuredContent"]
+        self.assertEqual("search_provenance_required", guessed["status"])
+        self.assertFalse(responses[2]["result"]["isError"])
+        structured = responses[3]["result"]["structuredContent"]
         self.assertEqual("fresh", structured["availability"])
+        selected_id = structured["next_action"]["recommended_object_ids"][0]
+        expanded = server.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_quant_knowledge",
+                    "arguments": {"object_id": selected_id},
+                },
+            }
+        )["result"]["structuredContent"]
+        self.assertEqual("ok", expanded["status"])
+        self.assertEqual(selected_id, expanded["source_citations"][0]["object_id"])
         rejected = server.handle(
             {
                 "jsonrpc": "2.0",
-                "id": 4,
+                "id": 6,
                 "method": "tools/call",
                 "params": {
                     "name": "search_quant_knowledge",
@@ -551,7 +696,9 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertIn("项目历史", SERVER_INSTRUCTIONS)
         self.assertIn("因子、模型、数据处理", SERVER_INSTRUCTIONS)
         self.assertIn("先用 search_quant_knowledge", SERVER_INSTRUCTIONS)
+        self.assertIn("最多 get", SERVER_INSTRUCTIONS)
         self.assertIn("1–3 个关键唯一 ID", SERVER_INSTRUCTIONS)
+        self.assertIn("source_citations", SERVER_INSTRUCTIONS)
         self.assertIn("证据支持的决定、适用条件、限制/失败经验", SERVER_INSTRUCTIONS)
         self.assertIn("证据缺项要明确不足", SERVER_INSTRUCTIONS)
         self.assertIn("纯语法、格式化", SERVER_INSTRUCTIONS)
@@ -774,6 +921,301 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(MirrorError, "successful generation"):
             build_search_artifact(base, enriched=enriched)
 
+    def test_multi_binding_formal_knowledge_preserves_per_locator_citations(self) -> None:
+        citation_a = "cit_" + "a" * 52
+        citation_b = "cit_" + "b" * 52
+        source_root = self.fixture.root / "multi-binding-source"
+        source_root.mkdir()
+        (source_root / "multi.md").write_text(
+            "# Multi Evidence\n\n"
+            f"First alpha claim ^src:{{{citation_a}}}\n\n"
+            f"Second beta claim ^src:{{{citation_b}}}\n",
+            encoding="utf-8",
+        )
+        compiled = ReferenceCompiler(max_chunk_bytes=256).compile(source_root)
+        self.assertIsNotNone(compiled.candidate_snapshot)
+        base = compiled.candidate_snapshot
+        assert base is not None
+        version_id = next(iter(base.active_membership.values()))
+        version = base.versions[version_id]
+        ir = base.ir_documents[version_id]
+
+        def binding_for(quote: str) -> EvidenceBinding:
+            span = next(
+                block.source_span for block in ir.blocks if quote in block.source_span.text
+            )
+            prefix = span.text[: span.text.index(quote)]
+            byte_start = span.byte_start + len(prefix.encode("utf-8"))
+            return EvidenceBinding(
+                span_id=span.span_id,
+                quote=quote,
+                quote_sha256=hashlib.sha256(quote.encode("utf-8")).hexdigest(),
+                byte_start=byte_start,
+                byte_end=byte_start + len(quote.encode("utf-8")),
+            )
+
+        item = KnowledgeItem(
+            knowledge_item_id="knowledge-multi-binding-fixture",
+            cluster_id="cluster-multi-binding-fixture",
+            document_id=version.document_id,
+            document_version_id=version_id,
+            kind="method",
+            text="Combine the alpha claim with the beta claim.",
+            evidence=(
+                binding_for("First alpha claim"),
+                binding_for("Second beta claim"),
+            ),
+            applicability={},
+            relation=None,
+            fact_status="source_explicit",
+            extractor="public-test-fixture",
+            extractor_version="v1",
+            generation_id=None,
+            accepted_at="2026-08-22T00:00:00Z",
+            accepted_by=None,
+        )
+        enriched = EnrichedSnapshot(
+            schema_version="qrh-enriched-knowledge-snapshot/v1",
+            base_snapshot_id=base.snapshot_id,
+            snapshot_id="ksnap-multi-binding-fixture",
+            knowledge_status_membership={version_id: "ready"},
+            generation_membership={},
+            knowledge_items={item.knowledge_item_id: item},
+            coverage_reports={},
+            accepted_knowledge_hash="3" * 64,
+            coverage_hash="4" * 64,
+        )
+        single_item = replace(
+            item,
+            knowledge_item_id="knowledge-single-binding-fixture",
+            cluster_id="cluster-single-binding-fixture",
+            text="Use the first alpha claim.",
+            evidence=(item.evidence[0],),
+        )
+        single_enriched = replace(
+            enriched,
+            snapshot_id="ksnap-single-binding-fixture",
+            knowledge_items={single_item.knowledge_item_id: single_item},
+            accepted_knowledge_hash="5" * 64,
+            coverage_hash="6" * 64,
+        )
+        single_artifact = json.loads(
+            build_search_artifact(base, enriched=single_enriched)
+        )
+        single_artifact["schema_version"] = "qrh-mcp-search-artifact/v1"
+        single_artifact["knowledge"][0].pop("source_citations")
+        single_artifact["retrieval"]["canonical_membership_sha256"] = (
+            hashlib.sha256(
+                canonical_json(
+                    {
+                        key: single_artifact[key]
+                        for key in ("documents", "versions", "chunks", "knowledge")
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        validate_search_artifact(
+            single_artifact,
+            expected_snapshot_id="ksnap-single-binding-fixture",
+        )
+        artifact_bytes = build_search_artifact(base, enriched=enriched)
+        artifact = json.loads(artifact_bytes)
+        self.assertEqual("qrh-mcp-search-artifact/v2", artifact["schema_version"])
+        knowledge = artifact["knowledge"][0]
+        self.assertEqual(2, len(knowledge["source_locators"]))
+        self.assertEqual(
+            [[citation_a], [citation_b]],
+            [row["citation_ids"] for row in knowledge["source_citations"]],
+        )
+        self.assertEqual(
+            knowledge["source_locators"],
+            [row["source_locator"] for row in knowledge["source_citations"]],
+        )
+        validate_search_artifact(
+            artifact, expected_snapshot_id="ksnap-multi-binding-fixture"
+        )
+        tampered = copy.deepcopy(artifact)
+        tampered["knowledge"][0]["source_citations"][0]["citation_ids"] = [
+            citation_b
+        ]
+        with self.assertRaises(MirrorError):
+            validate_search_artifact(
+                tampered, expected_snapshot_id="ksnap-multi-binding-fixture"
+            )
+
+        release = _release(
+            "release-multi-binding", "ksnap-multi-binding-fixture", artifact_bytes
+        )
+        authority = self.fixture.root / "multi-binding-authority"
+        releases = authority / "releases"
+        control = authority / "control"
+        target = releases / "release-multi-binding"
+        (target / "content").mkdir(parents=True)
+        control.mkdir()
+        (target / "release_manifest.json").write_text(
+            canonical_json(release), encoding="utf-8", newline=""
+        )
+        (target / "content" / "mcp_search.json").write_bytes(artifact_bytes)
+        active = {
+            "schema_version": "qrh-active-release/v1",
+            "release_id": "release-multi-binding",
+            "release_path": (
+                r"D:\quant\quant_platform\releases\release-multi-binding"
+            ),
+            "manifest_sha256": manifest_sha256(release),
+        }
+        (control / "active_release.json").write_text(
+            canonical_json(active), encoding="utf-8", newline=""
+        )
+        service = KnowledgeMCPService(
+            store=MirrorStore(self.fixture.root / "multi-binding-mirror"),
+            authority=FileAuthorityProbe(control / "active_release.json", releases),
+            artifact_release_root=releases,
+        )
+        searched = service.search_quant_knowledge(
+            query="alpha claim beta claim", limit=3
+        )
+        self.assertIn(
+            item.knowledge_item_id,
+            searched["next_action"]["recommended_object_ids"],
+        )
+        expanded = service.get_quant_knowledge(object_id=item.knowledge_item_id)
+        self.assertEqual("ok", expanded["status"])
+        self.assertEqual(2, len(expanded["source_citations"]))
+        self.assertEqual(
+            [[citation_a], [citation_b]],
+            [row["citation_ids"] for row in expanded["source_citations"]],
+        )
+        self.assertEqual(
+            [row["span_id"] for row in knowledge["source_locators"]],
+            [row["span_id"] for row in expanded["source_citations"]],
+        )
+
+        legacy_artifact = copy.deepcopy(artifact)
+        legacy_artifact["schema_version"] = "qrh-mcp-search-artifact/v1"
+        legacy_artifact["knowledge"][0].pop("source_citations")
+        legacy_artifact["retrieval"]["canonical_membership_sha256"] = (
+            hashlib.sha256(
+                canonical_json(
+                    {
+                        key: legacy_artifact[key]
+                        for key in ("documents", "versions", "chunks", "knowledge")
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        validate_search_artifact(
+            legacy_artifact,
+            expected_snapshot_id="ksnap-multi-binding-fixture",
+        )
+        legacy_bytes = canonical_json(legacy_artifact).encode("utf-8")
+        legacy_release = _release(
+            "release-multi-binding-v1",
+            "ksnap-multi-binding-fixture",
+            legacy_bytes,
+        )
+        legacy_target = releases / "release-multi-binding-v1"
+        (legacy_target / "content").mkdir(parents=True)
+        (legacy_target / "release_manifest.json").write_text(
+            canonical_json(legacy_release), encoding="utf-8", newline=""
+        )
+        (legacy_target / "content" / "mcp_search.json").write_bytes(legacy_bytes)
+        legacy_active = {
+            "schema_version": "qrh-active-release/v1",
+            "release_id": "release-multi-binding-v1",
+            "release_path": (
+                r"D:\quant\quant_platform\releases\release-multi-binding-v1"
+            ),
+            "manifest_sha256": manifest_sha256(legacy_release),
+        }
+        (control / "active_release.json").write_text(
+            canonical_json(legacy_active), encoding="utf-8", newline=""
+        )
+        legacy_service = KnowledgeMCPService(
+            store=MirrorStore(self.fixture.root / "multi-binding-v1-mirror"),
+            authority=FileAuthorityProbe(control / "active_release.json", releases),
+            artifact_release_root=releases,
+        )
+        legacy_search = legacy_service.search_quant_knowledge(
+            query="alpha claim beta claim", limit=3
+        )
+        legacy_result = next(
+            row
+            for row in legacy_search["results"]
+            if row["object_id"] == item.knowledge_item_id
+        )
+        self.assertEqual(
+            "unavailable_legacy_v1",
+            legacy_result["citation_mapping_status"],
+        )
+        self.assertEqual([], legacy_result["citation_ids"])
+        legacy_get = legacy_service.get_quant_knowledge(
+            object_id=item.knowledge_item_id
+        )
+        self.assertEqual("ok", legacy_get["status"])
+        self.assertEqual(2, len(legacy_get["source_citations"]))
+        self.assertEqual(
+            [[], []],
+            [row["citation_ids"] for row in legacy_get["source_citations"]],
+        )
+        self.assertTrue(
+            all(
+                row["citation_mapping_status"] == "unavailable_legacy_v1"
+                for row in legacy_get["source_citations"]
+            )
+        )
+
+        single_bytes = canonical_json(single_artifact).encode("utf-8")
+        single_release = _release(
+            "release-single-binding-v1",
+            "ksnap-single-binding-fixture",
+            single_bytes,
+        )
+        single_target = releases / "release-single-binding-v1"
+        (single_target / "content").mkdir(parents=True)
+        (single_target / "release_manifest.json").write_text(
+            canonical_json(single_release), encoding="utf-8", newline=""
+        )
+        (single_target / "content" / "mcp_search.json").write_bytes(single_bytes)
+        single_active = {
+            "schema_version": "qrh-active-release/v1",
+            "release_id": "release-single-binding-v1",
+            "release_path": (
+                r"D:\quant\quant_platform\releases\release-single-binding-v1"
+            ),
+            "manifest_sha256": manifest_sha256(single_release),
+        }
+        (control / "active_release.json").write_text(
+            canonical_json(single_active), encoding="utf-8", newline=""
+        )
+        single_service = KnowledgeMCPService(
+            store=MirrorStore(self.fixture.root / "single-binding-v1-mirror"),
+            authority=FileAuthorityProbe(control / "active_release.json", releases),
+            artifact_release_root=releases,
+        )
+        single_search = single_service.search_quant_knowledge(
+            query="first alpha claim", limit=3
+        )
+        single_result = next(
+            row
+            for row in single_search["results"]
+            if row["object_id"] == single_item.knowledge_item_id
+        )
+        self.assertEqual("exact_per_locator", single_result["citation_mapping_status"])
+        self.assertEqual([citation_a], single_result["citation_ids"])
+        single_get = single_service.get_quant_knowledge(
+            object_id=single_item.knowledge_item_id
+        )
+        self.assertEqual("ok", single_get["status"])
+        self.assertEqual(1, len(single_get["source_citations"]))
+        self.assertEqual(
+            [citation_a], single_get["source_citations"][0]["citation_ids"]
+        )
+        self.assertEqual(
+            "exact_per_locator",
+            single_get["source_citations"][0]["citation_mapping_status"],
+        )
+
     def test_pending_source_explicit_artifact_is_closed_and_searchable(self) -> None:
         base = self.fixture.snapshot2
         version_id = next(iter(base.active_membership.values()))
@@ -882,6 +1324,8 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             self.assertIn("search_quant_knowledge", agents)
             self.assertIn("不要为了调用率", agents)
             self.assertIn("不要猜 ID", agents)
+            self.assertIn("最多 get", agents)
+            self.assertIn("source_citations", agents)
             self.assertIn("不得用模型常识补齐", agents)
             self.assertIn("不可信数据", AGENT_ROUTING_RULES)
             loaded = ClientConfig.load(Path(first["client_config_path"]))

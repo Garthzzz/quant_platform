@@ -36,7 +36,8 @@ from quant_hub.ops.release_identity import (
 )
 
 
-SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v1"
+SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v2"
+LEGACY_SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v1"
 MIRROR_METADATA_SCHEMA = "qrh-user-knowledge-mirror/v1"
 MIRROR_POINTER_SCHEMA = "qrh-user-mirror-pointer/v1"
 MIRROR_ACKNOWLEDGED_SCHEMA = "qrh-user-mirror-acknowledged/v1"
@@ -412,8 +413,21 @@ def build_search_artifact(
                 ),
                 [],
             )
-            citation_ids = list(
-                citation_ids_for_evidence_bindings(ir, item.evidence)
+            source_citations = [
+                {
+                    "source_locator": locator,
+                    "citation_ids": list(
+                        citation_ids_for_evidence_bindings(ir, (binding,))
+                    ),
+                }
+                for binding, locator in zip(item.evidence, locators, strict=True)
+            ]
+            citation_ids = sorted(
+                {
+                    citation_id
+                    for member in source_citations
+                    for citation_id in member["citation_ids"]
+                }
             )
             knowledge_rows.append(
                 {
@@ -429,6 +443,7 @@ def build_search_artifact(
                     "source_span_ids": [binding.span_id for binding in item.evidence],
                     "source_locator": locators[0],
                     "source_locators": locators,
+                    "source_citations": source_citations,
                     "applicability": item.applicability,
                     "relation": item.relation,
                     "fact_status": item.fact_status,
@@ -494,8 +509,12 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
         "knowledge",
     }:
         raise MirrorError("search artifact fields are not closed")
-    if value["schema_version"] != SEARCH_ARTIFACT_SCHEMA:
+    if value["schema_version"] not in {
+        LEGACY_SEARCH_ARTIFACT_SCHEMA,
+        SEARCH_ARTIFACT_SCHEMA,
+    }:
         raise MirrorError("unsupported search artifact schema")
+    legacy_v1 = value["schema_version"] == LEGACY_SEARCH_ARTIFACT_SCHEMA
     if value["snapshot_id"] != expected_snapshot_id:
         raise MirrorError("search artifact snapshot identity mismatch")
     identity = value["knowledge_identity"]
@@ -582,6 +601,7 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
         "source_span_ids",
         "source_locator",
         "source_locators",
+        "source_citations",
         "applicability",
         "relation",
         "fact_status",
@@ -591,6 +611,8 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
         "accepted_at",
         "accepted_by",
     }
+    if legacy_v1:
+        knowledge_fields.remove("source_citations")
 
     def indexed(rows: list[object], key: str, fields: set[str]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
@@ -667,6 +689,40 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
                 or not _SHA256.fullmatch(str(locator.get("quote_sha256") or ""))
             ):
                 raise MirrorError("formal knowledge locator escapes source bytes")
+        if (
+            not isinstance(row["citation_ids"], list)
+            or any(
+                not isinstance(citation_id, str) or not citation_id
+                for citation_id in row["citation_ids"]
+            )
+            or row["citation_ids"] != sorted(set(row["citation_ids"]))
+        ):
+            raise MirrorError("formal knowledge citation union is invalid")
+        if not legacy_v1:
+            source_citations = row["source_citations"]
+            if (
+                not isinstance(source_citations, list)
+                or len(source_citations) != len(locators)
+            ):
+                raise MirrorError("formal knowledge source citation membership is invalid")
+            citation_union: set[str] = set()
+            for locator, member in zip(locators, source_citations, strict=True):
+                if (
+                    not isinstance(member, dict)
+                    or set(member) != {"source_locator", "citation_ids"}
+                    or member["source_locator"] != locator
+                    or not isinstance(member["citation_ids"], list)
+                    or any(
+                        not isinstance(citation_id, str) or not citation_id
+                        for citation_id in member["citation_ids"]
+                    )
+                    or member["citation_ids"]
+                    != sorted(set(member["citation_ids"]))
+                ):
+                    raise MirrorError("formal knowledge source citation is invalid")
+                citation_union.update(member["citation_ids"])
+            if row["citation_ids"] != sorted(citation_union):
+                raise MirrorError("formal knowledge citation union is invalid")
         generation = row["generation"]
         generation_fields = {
             "generation_id",

@@ -22,7 +22,7 @@ from .mirror import (
 )
 
 
-SERVICE_SCHEMA = "qrh-knowledge-mcp-response/v1"
+SERVICE_SCHEMA = "qrh-knowledge-mcp-response/v2"
 CONTINUATION_SCHEMA = "qrh-mcp-continuation/v1"
 def _identity(value: AuthorityIdentity | None) -> dict[str, str] | None:
     return value.to_dict() if value is not None else None
@@ -74,6 +74,16 @@ class KnowledgeMCPService:
         self._last_verified_at: str | None = None
         self._search_index_identity: AuthorityIdentity | None = None
         self._search_index: ArtifactKnowledgeIndex | None = None
+        # ``get`` expands a result selected by ``search``; it is not a second
+        # unscoped lookup surface.  Retain the exact matched locator only for
+        # this stdio session and clear it whenever the snapshot changes.
+        self._search_provenance_identity: AuthorityIdentity | None = None
+        self._search_provenance: dict[str, dict[str, object]] = {}
+
+    def _use_provenance_identity(self, identity: AuthorityIdentity) -> None:
+        if self._search_provenance_identity != identity:
+            self._search_provenance_identity = identity
+            self._search_provenance.clear()
 
     def _index_for(self, mirror: MirrorSnapshot) -> ArtifactKnowledgeIndex:
         if self._search_index_identity != mirror.identity:
@@ -88,6 +98,8 @@ class KnowledgeMCPService:
             self._search_index.close()
             self._search_index = None
             self._search_index_identity = None
+        self._search_provenance_identity = None
+        self._search_provenance.clear()
 
     def __del__(self) -> None:
         self.close()
@@ -162,6 +174,7 @@ class KnowledgeMCPService:
             self._session_identity = observed
         elif self._session_identity != observed:
             self._session_identity = observed
+        self._use_provenance_identity(observed)
         return Resolution(
             availability="fresh",
             mirror=local,
@@ -320,6 +333,11 @@ class KnowledgeMCPService:
         ordered: list[dict[str, Any]] = []
         for card in shared.cards:
             knowledge = knowledge_by_id.get(card.evidence_id)
+            legacy_multi_binding = bool(
+                knowledge is not None
+                and "source_citations" not in knowledge
+                and len(knowledge.get("source_locators", [])) > 1
+            )
             ordered.append(
                 {
                     "object_id": card.evidence_id,
@@ -346,7 +364,14 @@ class KnowledgeMCPService:
                         "byte_start": card.locator.byte_start,
                         "byte_end": card.locator.byte_end,
                     },
-                    "citation_ids": list(card.citation_ids),
+                    "citation_ids": (
+                        [] if legacy_multi_binding else list(card.citation_ids)
+                    ),
+                    "citation_mapping_status": (
+                        "unavailable_legacy_v1"
+                        if legacy_multi_binding
+                        else "exact_per_locator"
+                    ),
                     "fact_status": card.fact_status,
                     "knowledge_enrichment": card.knowledge_enrichment,
                     "applicability": card.applicability or "not_assessed",
@@ -400,6 +425,49 @@ class KnowledgeMCPService:
             used += row_size
             index += 1
         truncated = index < len(ordered)
+        self._use_provenance_identity(identity)
+        # A new search establishes a new closed expansion set.  Do not let
+        # recommendations from an earlier task context accumulate across the
+        # lifetime of a long-running stdio process.
+        self._search_provenance.clear()
+        recommended = selected[:3]
+        for row in recommended:
+            knowledge = knowledge_by_id.get(str(row["object_id"]))
+            raw_source_citations = (
+                knowledge["source_citations"]
+                if knowledge is not None and "source_citations" in knowledge
+                else [
+                    {
+                        "source_locator": locator,
+                        "citation_ids": (
+                            row["citation_ids"]
+                            if len(knowledge["source_locators"]) == 1
+                            else []
+                        ),
+                    }
+                    for locator in knowledge["source_locators"]
+                ]
+                if knowledge is not None
+                else [
+                    {
+                        "source_locator": row["source_locator"],
+                        "citation_ids": row["citation_ids"],
+                    }
+                ]
+            )
+            self._search_provenance[str(row["object_id"])] = {
+                "source_citations": [
+                    {
+                        "document_id": row["document_id"],
+                        "document_version_id": row["document_version_id"],
+                        **json.loads(canonical_json(member["source_locator"])),
+                        "citation_ids": list(member["citation_ids"]),
+                        "citation_mapping_status": row["citation_mapping_status"],
+                    }
+                    for member in raw_source_citations
+                ],
+            }
+        recommended_ids = [str(row["object_id"]) for row in recommended]
         return {
             **self._base(resolution),
             "status": "ok" if selected else "no_answer",
@@ -419,6 +487,16 @@ class KnowledgeMCPService:
             if truncated
             else None,
             "deduplication": "shared_canonical_evidence_span_contract",
+            "next_action": {
+                "tool": "get_quant_knowledge" if selected else None,
+                "recommended_object_ids": recommended_ids,
+                "maximum_unique_gets": len(recommended_ids),
+                "repeat_search_only_if_task_context_or_snapshot_changes": True,
+                "citation_rule": (
+                    "cite only canonical source_citations returned by get; "
+                    "never invent citation_ids"
+                ),
+            },
         }
 
     def get_quant_knowledge(
@@ -447,6 +525,19 @@ class KnowledgeMCPService:
         if blocked is not None:
             return blocked
         assert resolution.mirror is not None
+        identity = resolution.mirror.identity
+        self._use_provenance_identity(identity)
+        search_provenance = self._search_provenance.get(object_id)
+        if search_provenance is None:
+            return {
+                **self._base(resolution),
+                "status": "search_provenance_required",
+                "results": [],
+                "requires": ["search_quant_knowledge", "get_quant_knowledge"],
+                "reason": "object_id_was_not_returned_by_search_in_this_snapshot_session",
+            }
+        searched_citations = search_provenance["source_citations"]
+        assert isinstance(searched_citations, list) and searched_citations
         artifact = resolution.mirror.artifact
         matches: list[dict[str, Any]] = []
         for collection, id_key, kind in (
@@ -500,6 +591,33 @@ class KnowledgeMCPService:
                     )
                 )
             ]
+        versions = {
+            str(row["version_id"]): row for row in artifact["versions"]
+        }
+        source_citations: list[dict[str, object]] = []
+        for member in searched_citations:
+            assert isinstance(member, Mapping)
+            version = versions.get(str(member["document_version_id"]))
+            if version is None:
+                return {
+                    **self._base(resolution),
+                    "status": "mirror_identity_or_membership_invalid",
+                    "results": [],
+                }
+            source_citations.append(
+                {
+                    "object_id": object_id,
+                    "logical_path": version["logical_path"],
+                    "document_id": member["document_id"],
+                    "document_version_id": member["document_version_id"],
+                    "source_sha256": member["source_sha256"],
+                    "span_id": member["span_id"],
+                    "byte_start": member["byte_start"],
+                    "byte_end": member["byte_end"],
+                    "citation_ids": list(member["citation_ids"]),
+                    "citation_mapping_status": member["citation_mapping_status"],
+                }
+            )
         return {
             **self._base(resolution),
             "status": "ok",
@@ -508,6 +626,15 @@ class KnowledgeMCPService:
             "relations": relation_rows if include_relations else None,
             "truncated": truncated,
             "source_is_untrusted_data": True,
+            "source_citations": source_citations,
+            "next_action": {
+                "compose_from_expanded_evidence": True,
+                "repeat_search_only_if_task_context_or_snapshot_changes": True,
+                "citation_rule": (
+                    "include logical_path, document_version_id, source_sha256, "
+                    "span_id and byte range from source_citations; never invent citation_ids"
+                ),
+            },
         }
 
     def list_knowledge_updates(
