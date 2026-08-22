@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import heapq
 import hashlib
+import hmac
 import json
 import re
+import secrets
 from typing import Any, Mapping
 
 from quant_hub.knowledge.contracts import canonical_json
@@ -23,7 +26,165 @@ from .mirror import (
 
 
 SERVICE_SCHEMA = "qrh-knowledge-mcp-response/v2"
-CONTINUATION_SCHEMA = "qrh-mcp-continuation/v1"
+CONTINUATION_SCHEMA = "qrh-mcp-continuation/v2-session-mac"
+MAX_QUERY_CHARS = 500
+MAX_ID_CHARS = 200
+MAX_CURSOR_CHARS = 4_096
+MAX_TASK_CONTEXT_BYTES = 16 * 1024
+MAX_TASK_CONTEXT_DEPTH = 32
+MAX_SEARCH_WINDOW = 100
+_TASK_CONTEXT_FACETS = frozenset(
+    {"market", "frequency", "data", "objective", "assumption"}
+)
+_TOOL_ARGUMENT_FIELDS = {
+    "search_quant_knowledge": frozenset(
+        {
+            "query",
+            "task_context",
+            "limit",
+            "budget_chars",
+            "detail",
+            "cursor",
+            "allow_stale",
+            "include_history",
+            "include_conflicts",
+        }
+    ),
+    "get_quant_knowledge": frozenset(
+        {
+            "object_id",
+            "include_history",
+            "include_relations",
+            "budget_chars",
+            "allow_stale",
+        }
+    ),
+    "list_knowledge_updates": frozenset(
+        {
+            "from_snapshot_id",
+            "allow_stale",
+            "limit",
+            "budget_chars",
+            "cursor",
+        }
+    ),
+}
+_TOOL_REQUIRED_FIELDS = {
+    "search_quant_knowledge": frozenset({"query"}),
+    "get_quant_knowledge": frozenset({"object_id"}),
+    "list_knowledge_updates": frozenset({"from_snapshot_id"}),
+}
+
+
+def _closed_json_depth(value: object, *, depth: int = 1) -> int:
+    if depth > MAX_TASK_CONTEXT_DEPTH:
+        raise ValueError("task_context exceeds the supported depth")
+    if value is None or type(value) in {bool, int, float, str}:
+        try:
+            canonical_json(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("task_context must contain canonical JSON values") from error
+        return depth
+    if type(value) is list:
+        return max(
+            (depth, *(_closed_json_depth(member, depth=depth + 1) for member in value))
+        )
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise ValueError("task_context keys must be strings")
+        return max(
+            (depth, *(_closed_json_depth(member, depth=depth + 1) for member in value.values()))
+        )
+    raise ValueError("task_context must contain canonical JSON values")
+
+
+def _validate_task_context(value: object) -> None:
+    if type(value) is not dict:
+        raise ValueError("task_context must be an object")
+    if not set(value).issubset(_TASK_CONTEXT_FACETS):
+        raise ValueError("task_context fields are not closed")
+    _closed_json_depth(value)
+    if len(canonical_json(value).encode("utf-8")) > MAX_TASK_CONTEXT_BYTES:
+        raise ValueError("task_context exceeds the supported size")
+    for facet, member in value.items():
+        values = [member] if isinstance(member, str) else member
+        if type(values) is not list or any(type(item) is not str for item in values):
+            raise ValueError(f"task_context.{facet} must be a string or list of strings")
+
+
+def validate_tool_arguments(tool: str, arguments: Mapping[str, object]) -> None:
+    """Enforce the advertised closed MCP schemas at every runtime boundary."""
+
+    if type(arguments) is not dict or tool not in _TOOL_ARGUMENT_FIELDS:
+        raise ValueError("tool arguments are invalid")
+    fields = set(arguments)
+    if not _TOOL_REQUIRED_FIELDS[tool].issubset(fields):
+        raise ValueError("required tool arguments are missing")
+    if not fields.issubset(_TOOL_ARGUMENT_FIELDS[tool]):
+        raise ValueError("tool argument fields are not closed")
+
+    cursor = arguments.get("cursor")
+    if cursor is not None and (
+        type(cursor) is not str or len(cursor) > MAX_CURSOR_CHARS
+    ):
+        raise ValueError("cursor must be a string of at most 4096 characters or null")
+    for flag in (
+        "allow_stale",
+        "include_history",
+        "include_conflicts",
+        "include_relations",
+    ):
+        if flag in arguments and type(arguments[flag]) is not bool:
+            raise ValueError(f"{flag} must be a boolean")
+    if "budget_chars" in arguments and (
+        type(arguments["budget_chars"]) is not int
+        or not 500 <= arguments["budget_chars"] <= 50_000
+    ):
+        raise ValueError("budget_chars is outside the supported range")
+
+    if tool == "search_quant_knowledge":
+        query = arguments["query"]
+        if (
+            type(query) is not str
+            or not query.strip()
+            or len(query) > MAX_QUERY_CHARS
+        ):
+            raise ValueError("query must contain 1 to 500 characters")
+        if "task_context" in arguments:
+            _validate_task_context(arguments["task_context"])
+        if "limit" in arguments and (
+            type(arguments["limit"]) is not int
+            or not 1 <= arguments["limit"] <= 20
+        ):
+            raise ValueError("limit is outside the supported range")
+        if "detail" in arguments and arguments["detail"] not in {
+            "compact",
+            "evidence",
+        }:
+            raise ValueError("detail must be compact or evidence")
+    elif tool == "get_quant_knowledge":
+        object_id = arguments["object_id"]
+        if (
+            type(object_id) is not str
+            or not object_id
+            or len(object_id) > MAX_ID_CHARS
+        ):
+            raise ValueError("object_id must contain 1 to 200 characters")
+    else:
+        snapshot_id = arguments["from_snapshot_id"]
+        if (
+            type(snapshot_id) is not str
+            or not snapshot_id
+            or len(snapshot_id) > MAX_ID_CHARS
+        ):
+            raise ValueError("from_snapshot_id must contain 1 to 200 characters")
+        if "limit" in arguments and (
+            type(arguments["limit"]) is not int
+            or not 1 <= arguments["limit"] <= 200
+        ):
+            raise ValueError("limit is outside the supported range")
+
+
 def _identity(value: AuthorityIdentity | None) -> dict[str, str] | None:
     return value.to_dict() if value is not None else None
 
@@ -79,6 +240,7 @@ class KnowledgeMCPService:
         # this stdio session and clear it whenever the snapshot changes.
         self._search_provenance_identity: AuthorityIdentity | None = None
         self._search_provenance: dict[str, dict[str, object]] = {}
+        self._cursor_key = secrets.token_bytes(32)
 
     def _use_provenance_identity(self, identity: AuthorityIdentity) -> None:
         if self._search_provenance_identity != identity:
@@ -111,8 +273,7 @@ class KnowledgeMCPService:
 
     def _resolve(self, *, allow_stale: bool) -> Resolution:
         try:
-            local = self.store.current()
-            durable_pending = self.store.pending_transition()
+            local, durable_pending = self.store.current_and_pending()
         except (MirrorError, KeyError, TypeError, ValueError, OSError):
             self._pending_transition = None
             return Resolution(
@@ -150,7 +311,7 @@ class KnowledgeMCPService:
             try:
                 local = self.store.sync_from(observed, self.artifact_release_root)
                 local_identity = local.identity
-                durable_pending = self.store.pending_transition()
+                _current, durable_pending = self.store.current_and_pending()
             except (MirrorError, KeyError, TypeError, ValueError, OSError):
                 return Resolution(
                     availability="stale" if allow_stale and local else "unavailable",
@@ -221,27 +382,74 @@ class KnowledgeMCPService:
             "changed_to": new.to_dict(),
         }
 
-    @staticmethod
-    def _decode_cursor(cursor: str | None) -> Mapping[str, Any] | None:
+    def _decode_cursor(self, cursor: str | None) -> Mapping[str, Any] | None:
         if cursor is None:
             return None
+        if type(cursor) is not str or len(cursor) > MAX_CURSOR_CHARS:
+            raise ValueError("continuation exceeds the supported size")
         try:
             padded = cursor + ("=" * (-len(cursor) % 4))
             value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
         except (ValueError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError("continuation is malformed") from error
-        if not isinstance(value, dict) or value.get("schema_version") != CONTINUATION_SCHEMA:
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {
+                "schema_version",
+                "identity",
+                "tool",
+                "position",
+                "request_hash",
+                "mac",
+            }
+            or value.get("schema_version") != CONTINUATION_SCHEMA
+            or not isinstance(value.get("identity"), dict)
+            or set(value["identity"])
+            != {"release_id", "manifest_sha256", "snapshot_id"}
+            or any(
+                not isinstance(value["identity"].get(field), str)
+                or not value["identity"][field]
+                for field in ("release_id", "manifest_sha256", "snapshot_id")
+            )
+            or not isinstance(value.get("tool"), str)
+            or not isinstance(value.get("request_hash"), str)
+            or not isinstance(value.get("mac"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", value["mac"]) is None
+        ):
             raise ValueError("continuation schema is invalid")
+        unsigned = {key: member for key, member in value.items() if key != "mac"}
+        expected_mac = hmac.new(
+            self._cursor_key,
+            canonical_json(unsigned).encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(value["mac"], expected_mac):
+            raise ValueError("continuation authenticity is invalid")
         return value
 
-    @staticmethod
-    def _cursor(*, identity: AuthorityIdentity, tool: str, offset: int, request_hash: str) -> str:
-        value = {
+    def _cursor(
+        self,
+        *,
+        identity: AuthorityIdentity,
+        tool: str,
+        position: object,
+        request_hash: str,
+    ) -> str:
+        unsigned = {
             "schema_version": CONTINUATION_SCHEMA,
             "identity": identity.to_dict(),
             "tool": tool,
-            "offset": offset,
+            "position": position,
             "request_hash": request_hash,
+        }
+        value = {
+            **unsigned,
+            "mac": hmac.new(
+                self._cursor_key,
+                canonical_json(unsigned).encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest(),
         }
         return base64.urlsafe_b64encode(canonical_json(value).encode()).decode().rstrip("=")
 
@@ -252,6 +460,7 @@ class KnowledgeMCPService:
         identity: AuthorityIdentity,
         tool: str,
         request_hash: str,
+        maximum: int,
     ) -> int:
         value = self._decode_cursor(cursor)
         if value is None:
@@ -262,10 +471,36 @@ class KnowledgeMCPService:
             or value.get("request_hash") != request_hash
         ):
             raise ValueError("continuation_invalidated_by_snapshot_or_request")
-        offset = value.get("offset")
-        if not isinstance(offset, int) or offset < 0:
+        offset = value.get("position")
+        if type(offset) is not int or not 0 <= offset <= maximum:
             raise ValueError("continuation offset is invalid")
         return offset
+
+    def _cursor_update_key(
+        self,
+        cursor: str | None,
+        *,
+        identity: AuthorityIdentity,
+        tool: str,
+        request_hash: str,
+    ) -> tuple[str, str, str] | None:
+        value = self._decode_cursor(cursor)
+        if value is None:
+            return None
+        if (
+            value.get("identity") != identity.to_dict()
+            or value.get("tool") != tool
+            or value.get("request_hash") != request_hash
+        ):
+            raise ValueError("continuation_invalidated_by_snapshot_or_request")
+        position = value.get("position")
+        if (
+            not isinstance(position, list)
+            or len(position) != 3
+            or any(type(member) is not str for member in position)
+        ):
+            raise ValueError("continuation position is invalid")
+        return tuple(position)
 
     def search_quant_knowledge(
         self,
@@ -280,26 +515,20 @@ class KnowledgeMCPService:
         include_history: bool = False,
         include_conflicts: bool = False,
     ) -> dict[str, Any]:
-        if type(query) is not str or not query.strip():
-            raise ValueError("query is required")
-        if (
-            type(limit) is not int
-            or type(budget_chars) is not int
-            or not 1 <= limit <= 20
-            or not 500 <= budget_chars <= 50_000
-        ):
-            raise ValueError("limit or budget_chars is outside the supported range")
-        if detail not in {"compact", "evidence"}:
-            raise ValueError("detail must be compact or evidence")
-        if cursor is not None and not isinstance(cursor, str):
-            raise ValueError("cursor must be a string or null")
-        if task_context is not None and not isinstance(task_context, Mapping):
-            raise ValueError("task_context must be an object")
-        if any(
-            type(value) is not bool
-            for value in (allow_stale, include_history, include_conflicts)
-        ):
-            raise ValueError("boolean search flags must be booleans")
+        arguments: dict[str, object] = {
+            "query": query,
+            "limit": limit,
+            "budget_chars": budget_chars,
+            "detail": detail,
+            "allow_stale": allow_stale,
+            "include_history": include_history,
+            "include_conflicts": include_conflicts,
+        }
+        if task_context is not None:
+            arguments["task_context"] = task_context
+        if cursor is not None:
+            arguments["cursor"] = cursor
+        validate_tool_arguments("search_quant_knowledge", arguments)
         resolution = self._resolve(allow_stale=allow_stale)
         blocked = self._blocked(resolution)
         if blocked is not None:
@@ -319,24 +548,98 @@ class KnowledgeMCPService:
                 )
             }
         )
+        request_hash = hashlib.sha256(
+            canonical_json(
+                {
+                    "query": query,
+                    "task_context": task_context or {},
+                    "detail": detail,
+                    "include_history": include_history,
+                    "include_conflicts": include_conflicts,
+                }
+            ).encode()
+        ).hexdigest()
+        try:
+            record_count = len(artifact["retrieval"]["records"])
+            search_ceiling = min(record_count, MAX_SEARCH_WINDOW)
+            offset = self._cursor_offset(
+                cursor,
+                identity=identity,
+                tool="search_quant_knowledge",
+                request_hash=request_hash,
+                maximum=max(0, search_ceiling - 1),
+            )
+        except ValueError as error:
+            return {
+                **self._base(resolution),
+                "status": "continuation_invalid",
+                "reason": str(error),
+                "results": [],
+                "truncated": False,
+                "requires": ["list_knowledge_updates", "search_quant_knowledge"],
+            }
+        requested_limit = max(1, min(search_ceiling, offset + limit + 1))
         shared = self._index_for(resolution.mirror).search(
             query,
             context=context,
-            limit=max(1, len(artifact["retrieval"]["records"])),
+            limit=requested_limit,
             include_history=include_history,
             include_conflicts=include_conflicts,
         )
-        knowledge_by_id = {
-            str(row["knowledge_item_id"]): row for row in artifact["knowledge"]
+        page_cards = shared.cards[offset : offset + limit + 1]
+        needed_object_ids = {
+            card.evidence_id
+            for card in page_cards
+            if card.source_kind != "chunk"
         }
+        remaining_object_ids = set(needed_object_ids)
+        knowledge_by_id: dict[str, Mapping[str, Any]] = {}
+        for row in artifact["knowledge"]:
+            object_id = str(row["knowledge_item_id"])
+            if object_id in remaining_object_ids:
+                knowledge_by_id[object_id] = row
+                remaining_object_ids.remove(object_id)
+                if not remaining_object_ids:
+                    break
         has_citation_proofs = (
             artifact.get("schema_version") == "qrh-mcp-search-artifact/v3"
         )
-        source_material_by_key = {
-            (str(row["document_version_id"]), str(row["span_id"])): row
-            for row in artifact.get("citation_source_material", [])
-            if isinstance(row, Mapping)
-        }
+        needed_source_material: set[tuple[str, str]] = set()
+        for card in page_cards:
+            knowledge = knowledge_by_id.get(card.evidence_id)
+            if knowledge is None:
+                needed_source_material.add(
+                    (str(card.document_version_id), str(card.locator.span_id))
+                )
+                continue
+            raw_citations = knowledge.get("source_citations")
+            raw_locators = (
+                [member["source_locator"] for member in raw_citations]
+                if isinstance(raw_citations, list)
+                else knowledge.get("source_locators", [])
+            )
+            for locator in raw_locators:
+                if isinstance(locator, Mapping):
+                    needed_source_material.add(
+                        (
+                            str(card.document_version_id),
+                            str(locator.get("span_id") or ""),
+                        )
+                    )
+        remaining_source_material = set(needed_source_material)
+        source_material_by_key: dict[tuple[str, str], Mapping[str, Any]] = {}
+        for row in artifact.get("citation_source_material", []):
+            if not isinstance(row, Mapping):
+                continue
+            material_key = (
+                str(row["document_version_id"]),
+                str(row["span_id"]),
+            )
+            if material_key in remaining_source_material:
+                source_material_by_key[material_key] = row
+                remaining_source_material.remove(material_key)
+                if not remaining_source_material:
+                    break
 
         def service_source_citations(
             *,
@@ -423,7 +726,7 @@ class KnowledgeMCPService:
         snippet_limit = 1_600 if detail == "evidence" else 420
         ordered: list[dict[str, Any]] = []
         source_citations_by_object_id: dict[str, list[dict[str, object]]] = {}
-        for card in shared.cards:
+        for card in page_cards:
             knowledge = knowledge_by_id.get(card.evidence_id)
             legacy_multi_binding = bool(
                 knowledge is not None
@@ -487,36 +790,9 @@ class KnowledgeMCPService:
             if has_citation_proofs:
                 ordered_row["source_citations"] = source_citations
             ordered.append(ordered_row)
-        request_hash = hashlib.sha256(
-            canonical_json(
-                {
-                    "query": query,
-                    "task_context": task_context or {},
-                    "detail": detail,
-                    "include_history": include_history,
-                    "include_conflicts": include_conflicts,
-                }
-            ).encode()
-        ).hexdigest()
-        try:
-            offset = self._cursor_offset(
-                cursor,
-                identity=identity,
-                tool="search_quant_knowledge",
-                request_hash=request_hash,
-            )
-        except ValueError as error:
-            return {
-                **self._base(resolution),
-                "status": "continuation_invalid",
-                "reason": str(error),
-                "results": [],
-                "truncated": False,
-                "requires": ["list_knowledge_updates", "search_quant_knowledge"],
-            }
         selected: list[dict[str, Any]] = []
         used = 0
-        index = offset
+        index = 0
         while index < len(ordered) and len(selected) < limit:
             row_size = len(canonical_json(ordered[index]))
             if selected and used + row_size > budget_chars:
@@ -553,7 +829,7 @@ class KnowledgeMCPService:
             "continuation": self._cursor(
                 identity=identity,
                 tool="search_quant_knowledge",
-                offset=index,
+                position=offset + index,
                 request_hash=request_hash,
             )
             if truncated
@@ -580,18 +856,16 @@ class KnowledgeMCPService:
         budget_chars: int = 12_000,
         allow_stale: bool = False,
     ) -> dict[str, Any]:
-        if (
-            type(object_id) is not str
-            or not object_id
-            or type(budget_chars) is not int
-            or not 500 <= budget_chars <= 50_000
-        ):
-            raise ValueError("object_id or budget_chars is invalid")
-        if any(
-            type(value) is not bool
-            for value in (include_history, include_relations, allow_stale)
-        ):
-            raise ValueError("boolean get flags must be booleans")
+        validate_tool_arguments(
+            "get_quant_knowledge",
+            {
+                "object_id": object_id,
+                "include_history": include_history,
+                "include_relations": include_relations,
+                "budget_chars": budget_chars,
+                "allow_stale": allow_stale,
+            },
+        )
         resolution = self._resolve(allow_stale=allow_stale)
         blocked = self._blocked(resolution)
         if blocked is not None:
@@ -731,19 +1005,15 @@ class KnowledgeMCPService:
         budget_chars: int = 12_000,
         cursor: str | None = None,
     ) -> dict[str, Any]:
-        if type(from_snapshot_id) is not str or not from_snapshot_id:
-            raise ValueError("from_snapshot_id is required")
-        if (
-            type(limit) is not int
-            or type(budget_chars) is not int
-            or not 1 <= limit <= 200
-            or not 500 <= budget_chars <= 50_000
-        ):
-            raise ValueError("limit or budget_chars is outside the supported range")
-        if type(allow_stale) is not bool or (
-            cursor is not None and not isinstance(cursor, str)
-        ):
-            raise ValueError("update flags or cursor are invalid")
+        arguments: dict[str, object] = {
+            "from_snapshot_id": from_snapshot_id,
+            "allow_stale": allow_stale,
+            "limit": limit,
+            "budget_chars": budget_chars,
+        }
+        if cursor is not None:
+            arguments["cursor"] = cursor
+        validate_tool_arguments("list_knowledge_updates", arguments)
         resolution = self._resolve(allow_stale=allow_stale)
         if resolution.mirror is None:
             return {**self._base(resolution), "status": "unavailable", "updates": []}
@@ -761,6 +1031,25 @@ class KnowledgeMCPService:
                 "changed_to": new_identity.to_dict(),
             }
         current = resolution.mirror
+        request_hash = hashlib.sha256(
+            canonical_json({"from_snapshot_id": from_snapshot_id}).encode()
+        ).hexdigest()
+        try:
+            after_key = self._cursor_update_key(
+                cursor,
+                identity=current.identity,
+                tool="list_knowledge_updates",
+                request_hash=request_hash,
+            )
+        except ValueError as error:
+            return {
+                **self._base(resolution),
+                "status": "continuation_invalid",
+                "reason": str(error),
+                "updates": [],
+                "truncated": False,
+                "requires": ["list_knowledge_updates"],
+            }
         previous = self.store.find_snapshot(from_snapshot_id)
         if previous is None:
             if self._pending_transition is not None:
@@ -779,126 +1068,144 @@ class KnowledgeMCPService:
                 "updates": [],
                 "requires": ["search_quant_knowledge", "get_quant_knowledge"],
             }
-        old_documents = {row["document_id"]: row for row in previous.artifact["documents"]}
-        new_documents = {row["document_id"]: row for row in current.artifact["documents"]}
-        updates: list[dict[str, Any]] = []
-        for document_id in sorted(set(old_documents) | set(new_documents)):
-            old = old_documents.get(document_id)
-            new = new_documents.get(document_id)
-            if old is None:
-                updates.append({"change": "added", "document_id": document_id, "to": new})
-            elif new is None:
-                updates.append({"change": "removed", "document_id": document_id, "from": old})
-            elif (
-                old.get("active_version_id") != new.get("active_version_id")
-                or old.get("status") != new.get("status")
-                or old.get("replacement_document_id") != new.get("replacement_document_id")
+        def update_key(row: Mapping[str, object]) -> tuple[str, str, str]:
+            return (
+                str(row.get("document_id") or ""),
+                str(row.get("knowledge_item_id") or ""),
+                str(row.get("change") or ""),
+            )
+
+        def merge_members(
+            old_rows: list[Mapping[str, Any]],
+            new_rows: list[Mapping[str, Any]],
+            identity_key: str,
+        ):
+            old_index = 0
+            new_index = 0
+            while old_index < len(old_rows) or new_index < len(new_rows):
+                old = old_rows[old_index] if old_index < len(old_rows) else None
+                new = new_rows[new_index] if new_index < len(new_rows) else None
+                old_id = str(old[identity_key]) if old is not None else None
+                new_id = str(new[identity_key]) if new is not None else None
+                if new_id is None or old_id is not None and old_id < new_id:
+                    yield old, None
+                    old_index += 1
+                elif old_id is None or new_id < old_id:
+                    yield None, new
+                    new_index += 1
+                else:
+                    yield old, new
+                    old_index += 1
+                    new_index += 1
+
+        def iter_updates():
+            for old, new in merge_members(
+                previous.artifact["documents"],
+                current.artifact["documents"],
+                "document_id",
             ):
-                updates.append(
-                    {
+                document_id = str(
+                    (old if old is not None else new)["document_id"]
+                )
+                if old is None:
+                    yield {"change": "added", "document_id": document_id, "to": new}
+                elif new is None:
+                    yield {"change": "removed", "document_id": document_id, "from": old}
+                elif (
+                    old.get("active_version_id") != new.get("active_version_id")
+                    or old.get("status") != new.get("status")
+                    or old.get("replacement_document_id")
+                    != new.get("replacement_document_id")
+                ):
+                    yield {
                         "change": "replaced_or_status_changed",
                         "document_id": document_id,
                         "from_version_id": old.get("active_version_id"),
                         "to_version_id": new.get("active_version_id"),
                         "from_status": old.get("status"),
                         "to_status": new.get("status"),
-                        "replacement_document_id": new.get("replacement_document_id"),
+                        "replacement_document_id": new.get(
+                            "replacement_document_id"
+                        ),
                     }
-                )
-        old_versions = {
-            row["version_id"]: row for row in previous.artifact["versions"]
-        }
-        new_versions = {row["version_id"]: row for row in current.artifact["versions"]}
-        for document_id in sorted(set(old_documents).intersection(new_documents)):
-            old_version_id = old_documents[document_id].get("active_version_id")
-            new_version_id = new_documents[document_id].get("active_version_id")
-            if old_version_id != new_version_id:
-                continue
-            old_version = old_versions.get(old_version_id)
-            new_version = new_versions.get(new_version_id)
-            if (
-                old_version is not None
-                and new_version is not None
-                and old_version.get("knowledge_enrichment")
-                != new_version.get("knowledge_enrichment")
+            for old_version, new_version in merge_members(
+                previous.artifact["versions"],
+                current.artifact["versions"],
+                "version_id",
             ):
-                updates.append(
-                    {
+                if (
+                    old_version is not None
+                    and new_version is not None
+                    and old_version.get("is_current") is True
+                    and new_version.get("is_current") is True
+                    and old_version.get("document_id")
+                    == new_version.get("document_id")
+                    and old_version.get("knowledge_enrichment")
+                    != new_version.get("knowledge_enrichment")
+                ):
+                    yield {
                         "change": "knowledge_enrichment_changed",
-                        "document_id": document_id,
-                        "document_version_id": new_version_id,
+                        "document_id": new_version.get("document_id"),
+                        "document_version_id": new_version.get("version_id"),
                         "from_status": old_version.get("knowledge_enrichment"),
                         "to_status": new_version.get("knowledge_enrichment"),
                     }
+            for old, new in merge_members(
+                previous.artifact["knowledge"],
+                current.artifact["knowledge"],
+                "knowledge_item_id",
+            ):
+                knowledge_id = str(
+                    (old if old is not None else new)["knowledge_item_id"]
                 )
-        old_knowledge = {
-            row["knowledge_item_id"]: row
-            for row in previous.artifact["knowledge"]
-        }
-        new_knowledge = {
-            row["knowledge_item_id"]: row for row in current.artifact["knowledge"]
-        }
-        for knowledge_id in sorted(set(old_knowledge) | set(new_knowledge)):
-            old = old_knowledge.get(knowledge_id)
-            new = new_knowledge.get(knowledge_id)
-            if old is None:
-                updates.append(
-                    {
+                if old is None:
+                    yield {
                         "change": "knowledge_added",
                         "knowledge_item_id": knowledge_id,
                         "document_id": new.get("document_id") if new else None,
                         "fact_status": new.get("fact_status") if new else None,
                     }
-                )
-            elif new is None:
-                updates.append(
-                    {
+                elif new is None:
+                    yield {
                         "change": "knowledge_removed_or_superseded",
                         "knowledge_item_id": knowledge_id,
                         "document_id": old.get("document_id"),
                     }
-                )
-        updates.sort(
-            key=lambda row: (
-                str(row.get("document_id") or ""),
-                str(row.get("knowledge_item_id") or ""),
-                str(row.get("change") or ""),
-            )
-        )
+
         update_summary: dict[str, int] = {}
-        for row in updates:
-            change = str(row.get("change") or "unknown")
-            update_summary[change] = update_summary.get(change, 0) + 1
-        request_hash = hashlib.sha256(
-            canonical_json({"from_snapshot_id": from_snapshot_id}).encode()
-        ).hexdigest()
-        try:
-            offset = self._cursor_offset(
-                cursor,
-                identity=current.identity,
-                tool="list_knowledge_updates",
-                request_hash=request_hash,
-            )
-        except ValueError as error:
-            return {
-                **self._base(resolution),
-                "status": "continuation_invalid",
-                "reason": str(error),
-                "updates": [],
-                "truncated": False,
-                "requires": ["list_knowledge_updates"],
-            }
+        update_count = 0
+        eligible_count = 0
+
+        def counted_page_candidates():
+            nonlocal update_count, eligible_count
+            for row in iter_updates():
+                update_count += 1
+                change = str(row.get("change") or "unknown")
+                update_summary[change] = update_summary.get(change, 0) + 1
+                if after_key is None or update_key(row) > after_key:
+                    eligible_count += 1
+                    yield row
+
+        # Count/summary cover the complete immutable diff.  Keyset pagination
+        # retains only one bounded look-ahead page, so a valid deep page never
+        # allocates in proportion to its position and a forged position is
+        # impossible without this service instance's MAC key.
+        page = heapq.nsmallest(
+            limit + 1,
+            counted_page_candidates(),
+            key=update_key,
+        )
         selected: list[dict[str, Any]] = []
         used = 0
-        index = offset
-        while index < len(updates) and len(selected) < limit:
-            row_size = len(canonical_json(updates[index]))
+        index = 0
+        while index < len(page) and len(selected) < limit:
+            row_size = len(canonical_json(page[index]))
             if selected and used + row_size > budget_chars:
                 break
-            selected.append(updates[index])
+            selected.append(page[index])
             used += row_size
             index += 1
-        truncated = index < len(updates)
+        truncated = index < eligible_count
         refresh_acknowledged = False
         if self._pending_transition is not None:
             old_identity, new_identity = self._pending_transition
@@ -917,7 +1224,7 @@ class KnowledgeMCPService:
             "status": "ok",
             "from_snapshot_id": from_snapshot_id,
             "to_snapshot_id": current.identity.snapshot_id,
-            "update_count": len(updates),
+            "update_count": update_count,
             "update_summary": update_summary,
             "updates": selected,
             "truncated": truncated,
@@ -925,13 +1232,18 @@ class KnowledgeMCPService:
             "continuation": self._cursor(
                 identity=current.identity,
                 tool="list_knowledge_updates",
-                offset=index,
+                position=list(update_key(selected[-1])),
                 request_hash=request_hash,
             )
-            if truncated
+            if truncated and selected
             else None,
             "requires": ["search_quant_knowledge", "get_quant_knowledge"],
         }
 
 
-__all__ = ["KnowledgeMCPService", "Resolution", "SERVICE_SCHEMA"]
+__all__ = [
+    "KnowledgeMCPService",
+    "Resolution",
+    "SERVICE_SCHEMA",
+    "validate_tool_arguments",
+]

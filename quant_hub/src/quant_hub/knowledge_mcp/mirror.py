@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -14,8 +15,9 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
+import time
 from typing import Any, Mapping, Protocol, Sequence
-from uuid import uuid4
 
 from quant_hub.config import (
     ConfigurationError,
@@ -56,6 +58,13 @@ SEARCH_ARTIFACT_RELATIVE_PATH = "content/mcp_search.json"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_REMOTE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 VM_AUTHORITY_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
+_LOCK_REGISTRY_GUARD = threading.Lock()
+_LOCK_REGISTRY: dict[str, threading.RLock] = {}
+
+if os.name == "nt":
+    import msvcrt
+else:  # pragma: no cover - exercised by non-Windows CI only.
+    import fcntl
 
 
 class MirrorError(RuntimeError):
@@ -64,6 +73,72 @@ class MirrorError(RuntimeError):
 
 class AuthorityUnavailable(MirrorError):
     pass
+
+
+def _retryable_sharing_error(error: OSError) -> bool:
+    return (
+        isinstance(error, PermissionError)
+        or getattr(error, "winerror", None) in {5, 32, 33}
+        or getattr(error, "errno", None) in {13, 16}
+    )
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            if not _retryable_sharing_error(error) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _unlink_with_retry(path: Path) -> None:
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            if not _retryable_sharing_error(error) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _local_lock_for(path: Path) -> threading.RLock:
+    key = str(path.resolve(strict=False))
+    if os.name == "nt":
+        key = key.casefold()
+    with _LOCK_REGISTRY_GUARD:
+        return _LOCK_REGISTRY.setdefault(key, threading.RLock())
+
+
+def _acquire_os_lock(handle: Any, *, timeout_seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - exercised by non-Windows CI only.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            if time.monotonic() >= deadline:
+                raise MirrorError("mirror cross-process lock timed out") from error
+            time.sleep(0.01)
+
+
+def _release_os_lock(handle: Any) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:  # pragma: no cover - exercised by non-Windows CI only.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +248,26 @@ def _regular_file(path: Path) -> None:
         raise MirrorError(
             f"path is not a regular non-reparse non-hard-linked file: {path.name}"
         )
+
+
+def _validate_open_regular_file(path: Path, descriptor: int) -> None:
+    """Bind an already-open handle to the exact safe directory entry."""
+
+    try:
+        handle_info = os.fstat(descriptor)
+        path_info = path.lstat()
+    except OSError as error:
+        raise MirrorError("mirror lock identity is unavailable") from error
+    if (
+        stat_is_reparse_point(path_info)
+        or not stat.S_ISREG(path_info.st_mode)
+        or not stat.S_ISREG(handle_info.st_mode)
+        or path_info.st_nlink != 1
+        or handle_info.st_nlink != 1
+        or (path_info.st_dev, path_info.st_ino)
+        != (handle_info.st_dev, handle_info.st_ino)
+    ):
+        raise MirrorError("mirror lock must be an exact regular single-link file")
 
 
 def _safe_directory(path: Path, *, must_exist: bool) -> Path:
@@ -833,13 +928,17 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
 
     def indexed(rows: list[object], key: str, fields: set[str]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
+        previous_identifier: str | None = None
         for row in rows:
             if not isinstance(row, dict) or set(row) != fields:
                 raise MirrorError(f"search artifact {key} row fields are not closed")
             identifier = row.get(key)
             if not isinstance(identifier, str) or not identifier or identifier in result:
                 raise MirrorError(f"search artifact {key} identity is invalid")
+            if previous_identifier is not None and identifier <= previous_identifier:
+                raise MirrorError(f"search artifact {key} order is not canonical")
             result[identifier] = row
+            previous_identifier = identifier
         return result
 
     documents = indexed(value["documents"], "document_id", document_fields)
@@ -1879,12 +1978,64 @@ class MirrorStore:
         self.current_path = self.root / "current.json"
         self.acknowledged_path = self.root / "acknowledged.json"
         self.pending_transition_path = self.root / "pending_transition.json"
+        self.lock_path = self.root / ".mirror.lock"
+
+    @contextmanager
+    def _locked(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        _safe_directory(self.root, must_exist=True)
+        local_lock = _local_lock_for(self.lock_path)
+        with local_lock:
+            base_flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+            base_flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(
+                    self.lock_path,
+                    base_flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    descriptor = os.open(self.lock_path, base_flags)
+                except OSError as error:
+                    raise MirrorError("mirror lock cannot be opened safely") from error
+            except OSError as error:
+                raise MirrorError("mirror lock cannot be opened safely") from error
+            with os.fdopen(descriptor, "r+b") as handle:
+                _validate_open_regular_file(self.lock_path, handle.fileno())
+                lock_size = os.fstat(handle.fileno()).st_size
+                # New locks are deliberately zero-byte. Windows byte-range
+                # locking works beyond EOF, and an empty file removes the
+                # former create->sentinel crash window and all data writes that
+                # a precisely raced hardlink could observe. The historical
+                # one-byte marker remains read-only compatible for upgrades.
+                if lock_size not in {0, 1}:
+                    raise MirrorError("mirror lock identity is invalid")
+                _validate_open_regular_file(self.lock_path, handle.fileno())
+                _acquire_os_lock(handle)
+                try:
+                    _validate_open_regular_file(self.lock_path, handle.fileno())
+                    if os.fstat(handle.fileno()).st_size != lock_size:
+                        raise MirrorError("mirror lock changed while held")
+                    if lock_size == 1:
+                        handle.seek(0)
+                        if handle.read(2) != b"\0":
+                            raise MirrorError("mirror lock identity is invalid")
+                    yield
+                    if os.fstat(handle.fileno()).st_size != lock_size:
+                        raise MirrorError("mirror lock changed while held")
+                    if lock_size == 1:
+                        handle.seek(0)
+                        if handle.read(2) != b"\0":
+                            raise MirrorError("mirror lock changed while held")
+                finally:
+                    _release_os_lock(handle)
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        _safe_directory(self.root, must_exist=True)
-        self.releases_root.mkdir(exist_ok=True)
-        _safe_directory(self.releases_root, must_exist=True)
+        with self._locked():
+            self.releases_root.mkdir(exist_ok=True)
+            _safe_directory(self.releases_root, must_exist=True)
 
     def _release_path(self, identity: AuthorityIdentity) -> Path:
         if not _SHA256.fullmatch(identity.manifest_sha256):
@@ -1892,9 +2043,21 @@ class MirrorStore:
         return self.releases_root / identity.manifest_sha256
 
     def _atomic_json(self, path: Path, value: Mapping[str, object]) -> None:
-        temporary = self.root / f".{path.name}.partial-{uuid4().hex}"
-        temporary.write_text(canonical_json(value), encoding="utf-8", newline="")
-        os.replace(temporary, path)
+        temporary = self.root / f".{path.name}.partial"
+        if temporary.exists():
+            _regular_file(temporary)
+            _unlink_with_retry(temporary)
+        try:
+            with temporary.open("x", encoding="utf-8", newline="") as handle:
+                handle.write(canonical_json(value))
+                handle.flush()
+                os.fsync(handle.fileno())
+            _regular_file(temporary)
+            _replace_with_retry(temporary, path)
+        finally:
+            if temporary.exists():
+                _regular_file(temporary)
+                _unlink_with_retry(temporary)
 
     @staticmethod
     def _closed_identity(value: object, *, label: str) -> AuthorityIdentity:
@@ -1963,7 +2126,7 @@ class MirrorStore:
     def _transition_state(
         self,
     ) -> tuple[MirrorSnapshot | None, AuthorityIdentity | None, MirrorTransition | None]:
-        current = self.current()
+        current = self._current_unlocked()
         acknowledged = self._acknowledged_identity()
         pending = self._pending_transition_record()
         if current is None:
@@ -1997,8 +2160,22 @@ class MirrorStore:
     def pending_transition(self) -> MirrorTransition | None:
         """Return a validated, durable unacknowledged transition."""
 
-        _current, _acknowledged, pending = self._transition_state()
-        return pending
+        if not self.root.exists():
+            return None
+        with self._locked():
+            _current, _acknowledged, pending = self._transition_state()
+            return pending
+
+    def current_and_pending(
+        self,
+    ) -> tuple[MirrorSnapshot | None, MirrorTransition | None]:
+        """Read the composite mutable state under one cross-process lock."""
+
+        if not self.root.exists():
+            return None, None
+        with self._locked():
+            current, _acknowledged, pending = self._transition_state()
+            return current, pending
 
     def _record_observed_identity(self, identity: AuthorityIdentity) -> None:
         current, acknowledged, pending = self._transition_state()
@@ -2016,12 +2193,12 @@ class MirrorStore:
             and raw_pending.to_identity == acknowledged
             and current.identity == acknowledged
         ):
-            self.pending_transition_path.unlink()
+            _unlink_with_retry(self.pending_transition_path)
             pending = None
         if identity == acknowledged:
             self._write_pointer(identity)
             if pending is not None and self.pending_transition_path.exists():
-                self.pending_transition_path.unlink()
+                _unlink_with_retry(self.pending_transition_path)
             return
         transition = MirrorTransition(acknowledged, identity)
         self._write_pending_transition(transition)
@@ -2051,6 +2228,14 @@ class MirrorStore:
     def acknowledge_transition(
         self, from_identity: AuthorityIdentity, to_identity: AuthorityIdentity
     ) -> None:
+        if not self.root.exists():
+            raise MirrorError("mirror transition acknowledgement has no current state")
+        with self._locked():
+            self._acknowledge_transition_locked(from_identity, to_identity)
+
+    def _acknowledge_transition_locked(
+        self, from_identity: AuthorityIdentity, to_identity: AuthorityIdentity
+    ) -> None:
         current, acknowledged, pending = self._transition_state()
         if current is None or acknowledged is None:
             raise MirrorError("mirror transition acknowledgement has no current state")
@@ -2068,7 +2253,7 @@ class MirrorStore:
         # stale pending record is recognized as already acknowledged.
         self._write_acknowledged(to_identity)
         if self.pending_transition_path.exists():
-            self.pending_transition_path.unlink()
+            _unlink_with_retry(self.pending_transition_path)
 
     def sync_from(
         self, identity: AuthorityIdentity, artifact_source: Path | ArtifactSource
@@ -2076,6 +2261,12 @@ class MirrorStore:
         """Copy one exact release artifact via partial→immutable final."""
 
         self.initialize()
+        with self._locked():
+            return self._sync_from_locked(identity, artifact_source)
+
+    def _sync_from_locked(
+        self, identity: AuthorityIdentity, artifact_source: Path | ArtifactSource
+    ) -> MirrorSnapshot:
         # Any corrupt pointer/ack/pending state fails closed before adopting a
         # newly observed authority identity.
         self._transition_state()
@@ -2084,8 +2275,27 @@ class MirrorStore:
             snapshot = self.load(identity)
             self._record_observed_identity(identity)
             return snapshot
-        partial = self.releases_root / f".{identity.manifest_sha256}.partial-{uuid4().hex}"
+        partial = self.releases_root / f".{identity.manifest_sha256}.partial"
+        existing_partials = self._owned_release_partials()
+        if existing_partials:
+            if existing_partials != (partial,):
+                raise MirrorError(
+                    "another interrupted mirror release must be resolved first"
+                )
+            try:
+                self._load_release_root(identity, partial)
+            except (MirrorError, OSError, TypeError, ValueError, KeyError):
+                self._remove_owned_release_partial(partial)
+            else:
+                # A complete verified stage survives a sharing violation or
+                # response loss and is adopted directly on the same-identity
+                # retry. No source bytes are downloaded twice.
+                _replace_with_retry(partial, final)
+                snapshot = self.load(identity)
+                self._record_observed_identity(identity)
+                return snapshot
         partial.mkdir()
+        staged_complete = False
         try:
             (partial / "content").mkdir()
             source = (
@@ -2134,14 +2344,65 @@ class MirrorStore:
             (partial / "mirror.json").write_text(
                 canonical_json(metadata), encoding="utf-8", newline=""
             )
-            os.replace(partial, final)
-        except BaseException:
-            # Keep a dot-prefixed partial for diagnosis.  It is never scanned or
-            # served, and avoiding recursive cleanup closes a reparse-swap race.
+            self._load_release_root(identity, partial)
+            staged_complete = True
+            _replace_with_retry(partial, final)
+        except BaseException as error:
+            # A complete validated stage is the durable retry point. An
+            # incomplete stage is removed only through the exact owned closure;
+            # unknown entries/reparse points remain fail-closed for inspection.
+            if not staged_complete:
+                try:
+                    self._remove_owned_release_partial(partial)
+                except BaseException as cleanup_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            "incomplete mirror partial cleanup also failed: "
+                            + type(cleanup_error).__name__
+                        )
             raise
         snapshot = self.load(identity)
         self._record_observed_identity(identity)
         return snapshot
+
+    def _owned_release_partials(self) -> tuple[Path, ...]:
+        pattern = re.compile(r"^\.[0-9a-f]{64}\.partial$")
+        partials: list[Path] = []
+        for path in self.releases_root.iterdir():
+            if not path.name.startswith("."):
+                continue
+            if pattern.fullmatch(path.name) is None:
+                raise MirrorError("mirror releases contain an unknown staging entry")
+            _safe_directory(path, must_exist=True)
+            partials.append(path)
+        if len(partials) > 1:
+            raise MirrorError("mirror contains multiple interrupted release stages")
+        return tuple(partials)
+
+    def _remove_owned_release_partial(self, partial: Path) -> None:
+        if partial.parent != self.releases_root:
+            raise MirrorError("mirror partial escaped the release root")
+        _safe_directory(partial, must_exist=True)
+        top = {path.name: path for path in partial.iterdir()}
+        if not set(top).issubset({"content", "release_manifest.json", "mirror.json"}):
+            raise MirrorError("mirror partial contains an unknown entry")
+        content = top.get("content")
+        if content is not None:
+            _safe_directory(content, must_exist=True)
+            content_rows = {path.name: path for path in content.iterdir()}
+            if not set(content_rows).issubset({"mcp_search.json"}):
+                raise MirrorError("mirror partial content is not closed")
+            artifact = content_rows.get("mcp_search.json")
+            if artifact is not None:
+                _regular_file(artifact)
+                artifact.unlink()
+            content.rmdir()
+        for name in ("release_manifest.json", "mirror.json"):
+            path = top.get(name)
+            if path is not None:
+                _regular_file(path)
+                path.unlink()
+        partial.rmdir()
 
     def _write_pointer(self, identity: AuthorityIdentity) -> None:
         pointer = {
@@ -2149,11 +2410,15 @@ class MirrorStore:
             "identity": identity.to_dict(),
             "relative_path": f"releases/{identity.manifest_sha256}",
         }
-        temporary = self.root / f".current.partial-{uuid4().hex}"
-        temporary.write_text(canonical_json(pointer), encoding="utf-8", newline="")
-        os.replace(temporary, self.current_path)
+        self._atomic_json(self.current_path, pointer)
 
     def current(self) -> MirrorSnapshot | None:
+        if not self.root.exists():
+            return None
+        with self._locked():
+            return self._current_unlocked()
+
+    def _current_unlocked(self) -> MirrorSnapshot | None:
         if not self.current_path.exists():
             return None
         _regular_file(self.current_path)
@@ -2179,12 +2444,26 @@ class MirrorStore:
         return self.load(identity)
 
     def load(self, identity: AuthorityIdentity) -> MirrorSnapshot:
-        root = self._release_path(identity)
+        return self._load_release_root(identity, self._release_path(identity))
+
+    def _load_release_root(
+        self, identity: AuthorityIdentity, root: Path
+    ) -> MirrorSnapshot:
         _safe_directory(root, must_exist=True)
+        if {path.name for path in root.iterdir()} != {
+            "content",
+            "mirror.json",
+            "release_manifest.json",
+        }:
+            raise MirrorError("mirror release top-level closure is invalid")
         metadata_path = root / "mirror.json"
         release_path = root / "release_manifest.json"
         artifact_path = root / SEARCH_ARTIFACT_RELATIVE_PATH
         _safe_directory(artifact_path.parent, must_exist=True)
+        if {path.name for path in artifact_path.parent.iterdir()} != {
+            "mcp_search.json"
+        }:
+            raise MirrorError("mirror release content closure is invalid")
         for path in (metadata_path, release_path, artifact_path):
             _regular_file(path)
         metadata = _read_json(metadata_path)
@@ -2244,6 +2523,12 @@ class MirrorStore:
         )
 
     def find_snapshot(self, snapshot_id: str) -> MirrorSnapshot | None:
+        if not self.root.exists():
+            return None
+        with self._locked():
+            return self._find_snapshot_unlocked(snapshot_id)
+
+    def _find_snapshot_unlocked(self, snapshot_id: str) -> MirrorSnapshot | None:
         if not self.releases_root.is_dir():
             return None
         for candidate in sorted(self.releases_root.iterdir()):

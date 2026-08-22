@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -40,6 +41,7 @@ from .semantic_provider import (
 WORKSPACE_DB = "semantic_jobs.sqlite3"
 AUDIT_LOG = "semantic_cli_audit.jsonl"
 CLI_SCHEMA = "qrh-semantic-operator-cli/v1"
+_CHILD_CLAIM_ENV = "QRH_SEMANTIC_CHILD_CLAIM_TOKEN"
 
 
 class SemanticCLIError(RuntimeError):
@@ -332,6 +334,27 @@ def _latest_generation_for_job(store: SemanticJobStore, job: Any) -> Any | None:
     )
 
 
+def _generation_for_claim_attempt(
+    store: SemanticJobStore,
+    job: Any,
+) -> Any | None:
+    if job.claim_token is None or job.claim_started_at is None:
+        return None
+    current = store.job(job.job_key)
+    expected_token_sha256 = hashlib.sha256(
+        job.claim_token.encode("ascii")
+    ).hexdigest()
+    if (
+        current.last_claim_token_sha256 != expected_token_sha256
+        or current.last_claim_started_at != job.claim_started_at
+    ):
+        return None
+    generation = _latest_generation_for_job(store, job)
+    if generation is None:
+        return None
+    return generation if generation.created_at >= job.claim_started_at else None
+
+
 def _reconcile_unverifiable_child(
     workspace: Path,
     store: SemanticJobStore,
@@ -340,7 +363,7 @@ def _reconcile_unverifiable_child(
     failure_code: str,
 ) -> None:
     current = store.job(job.job_key)
-    generation = _latest_generation_for_job(store, job)
+    generation = _generation_for_claim_attempt(store, job)
     if generation is not None and generation.status == "succeeded":
         if generation.generation_id not in store.disqualified_generation_ids():
             store.disqualify_generation(
@@ -348,8 +371,14 @@ def _reconcile_unverifiable_child(
                 actor="semantic-child-contract-watchdog",
                 reason="successful generation has unverifiable child process output",
             )
-    elif current.status == "running":
-        store.set_job_status(job.job_key, "failed_retryable", "worker_failed")
+    elif current.status == "running" and current.claim_token == job.claim_token:
+        store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=job.claim_token,
+            actor="semantic-child-contract-watchdog",
+            reason="child process terminated without verifiable output",
+            error_code="worker_failed",
+        )
     _audit(
         workspace,
         "execute-one-child-reconciliation",
@@ -371,7 +400,8 @@ def _execute_one_parent(
     workspace: Path,
     store: SemanticJobStore,
 ) -> dict[str, object]:
-    job = store.job(arguments.job_key)
+    job = store.claim_job(arguments.job_key)
+    assert job.claim_token is not None
     deadline = _overall_deadline_seconds(job.part_count)
     command = [
         sys.executable,
@@ -400,6 +430,8 @@ def _execute_one_parent(
             command.extend(("--keyring-service", arguments.keyring_service))
         if arguments.keyring_username:
             command.extend(("--keyring-username", arguments.keyring_username))
+    child_environment = os.environ.copy()
+    child_environment[_CHILD_CLAIM_ENV] = job.claim_token
     creationflags = (
         getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     )
@@ -413,20 +445,38 @@ def _execute_one_parent(
             timeout=deadline,
             check=False,
             creationflags=creationflags,
+            env=child_environment,
         )
     except subprocess.TimeoutExpired:
         elapsed = time.monotonic() - started
         current = store.job(job.job_key)
-        generation = _latest_generation_for_job(store, job)
+        generation = _generation_for_claim_attempt(store, job)
         if generation is not None and generation.status == "succeeded":
             store.disqualify_generation(
                 generation.generation_id,
                 actor="semantic-overall-deadline-watchdog",
                 reason="generation committed after the immutable overall deadline",
             )
-        elif current.status in {"queued", "running"}:
-            store.set_job_status(
-                job.job_key, "failed_retryable", "wall_clock_timeout"
+        elif current.status == "running" and current.claim_token == job.claim_token:
+            store.reconcile_terminated_claim(
+                job.job_key,
+                claim_token=job.claim_token,
+                actor="semantic-overall-deadline-watchdog",
+                reason="child process exceeded the immutable overall deadline",
+                error_code="wall_clock_timeout",
+            )
+        else:
+            _audit(
+                workspace,
+                "execute-one-deadline-superseded",
+                {
+                    "job_key": job.job_key,
+                    "job_status": current.status,
+                    "failure_code": "wall_clock_timeout_superseded_claim",
+                },
+            )
+            raise SemanticCLIError(
+                "semantic execution claim changed before deadline reconciliation"
             )
         _audit(
             workspace,
@@ -455,6 +505,14 @@ def _execute_one_parent(
             "overall_deadline_seconds": deadline,
             "source_text_included": False,
         }
+    except OSError as error:
+        _reconcile_unverifiable_child(
+            workspace,
+            store,
+            job,
+            failure_code="worker_launch_failed",
+        )
+        raise SemanticCLIError("semantic execution child could not start") from error
     if completed.returncode != 0:
         _reconcile_unverifiable_child(
             workspace, store, job, failure_code="worker_nonzero_exit"
@@ -467,19 +525,24 @@ def _execute_one_parent(
             workspace, store, job, failure_code="worker_invalid_json"
         )
         raise SemanticCLIError("semantic execution child returned invalid output") from error
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != CLI_SCHEMA
-        or value.get("command") != "execute-one"
-        or value.get("job_key") != job.job_key
-        or value.get("source_text_included") is not False
-    ):
+    generation = _generation_for_claim_attempt(store, job)
+    expected = (
+        _generation_projection(
+            generation,
+            timeout_seconds=arguments.timeout_seconds,
+            overall_deadline_seconds=deadline,
+        )
+        if generation is not None
+        else None
+    )
+    if type(value) is not dict or expected is None or value != expected:
         _reconcile_unverifiable_child(
             workspace, store, job, failure_code="worker_output_contract_invalid"
         )
         raise SemanticCLIError("semantic execution child violated output contract")
-    value["overall_deadline_seconds"] = deadline
-    return value
+    # Return the durable projection reconstructed by the trusted parent, not
+    # bytes supplied by the child process.
+    return expected
 
 
 def _status(store: SemanticJobStore) -> dict[str, object]:
@@ -717,7 +780,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, object]:
         raise SemanticCLIError("semantic job is not attached to the release base")
     if not arguments._child_execution:
         return _execute_one_parent(arguments, workspace, store)
-    generation = compiler.execute(snapshot, job.job_key, _provider(arguments))
+    claim_token = os.environ.pop(_CHILD_CLAIM_ENV, None)
+    if claim_token is None or re.fullmatch(r"[0-9a-f]{64}", claim_token) is None:
+        raise SemanticCLIError("semantic execution child claim is unavailable")
+    generation = compiler.execute(
+        snapshot,
+        job.job_key,
+        _provider(arguments),
+        claim_token=claim_token,
+    )
     _audit(
         workspace,
         "execute-one",

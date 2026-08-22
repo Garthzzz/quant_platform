@@ -384,7 +384,12 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         )
         named_acronym = self.index.search("COMPARE CVA calibration")
         self.assertFalse(named_acronym.answerable)
+        # Request grammar is case- and position-insensitive; the unsupported
+        # active-corpus object remains CVA, not the imperative COMPARE.
         self.assertIn(
+            "named_anchor:cva", named_acronym.no_answer_reason or ""
+        )
+        self.assertNotIn(
             "named_anchor:compare", named_acronym.no_answer_reason or ""
         )
 

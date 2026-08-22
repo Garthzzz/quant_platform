@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import json
 import math
 import re
 import sqlite3
 import time
+import unicodedata
 from typing import Any, Literal, Mapping, Sequence
 
 from .contracts import BaseSnapshot, Chunk, canonical_json
@@ -22,8 +24,13 @@ from .citations import (
 from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
-INDEX_VERSION = "qrh-structured-lexical-index/v1.13-evidence-citation-sidecar"
+INDEX_VERSION = "qrh-structured-lexical-index/v1.15-bounded-query-input"
 RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v3"
+MAX_QUERY_CHARS = 500
+MAX_SEARCH_LIMIT = 100
+MAX_TASK_CONTEXT_BYTES = 16 * 1024
+MAX_TASK_CONTEXT_VALUE_CHARS = 500
+MAX_TASK_CONTEXT_VALUES = 64
 
 # Only relations whose direction adds supporting context may introduce a new
 # evidence card.  Negative edges remain available as structured knowledge, but
@@ -45,6 +52,14 @@ _ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
         "spearman",
         "spearman correlation",
         "rank correlation",
+    ),
+    (
+        "横截面排序稳定性",
+        "cross-sectional ordering stability",
+        "cross sectional ordering stability",
+        "cross-sectional ranking stability",
+        "cross sectional ranking stability",
+        "ranking stability",
     ),
     ("mse", "mean squared error", "均方误差"),
     ("pca", "principal component analysis", "主成分分析"),
@@ -87,7 +102,20 @@ _ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
     ("排序决策", "ranking decision", "rank-based decision", "ordering decision"),
     ("涨跌停", "price limit", "limit-up", "limit-down"),
     ("极值", "outlier", "extreme value", "extreme observation"),
-    ("财报", "earnings report", "financial statement", "accounting report"),
+    (
+        "财报",
+        "earnings",
+        "earnings report",
+        "financial statement",
+        "accounting report",
+    ),
+    (
+        "晚到数据",
+        "late data",
+        "data vintage",
+        "data vintages",
+        "availability vintage",
+    ),
     ("真实 alpha", "真 alpha", "genuine alpha", "true alpha"),
     ("残差 alpha", "residual alpha", "incremental alpha"),
     ("风格暴露", "style exposure"),
@@ -124,7 +152,10 @@ _ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
     ("停牌", "suspension", "suspended"),
     ("处理管线", "processing pipeline", "separate pipeline"),
 )
-_ASCII_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.+-]*|[0-9]+(?:\.[0-9]+)?")
+_ASCII_RE = re.compile(
+    r"[A-Za-z](?:[A-Za-z0-9_+]|[.\-](?=[A-Za-z0-9_+\-]))*"
+    r"|[0-9]+(?:\.[0-9]+)?"
+)
 _CJK_RE = re.compile(r"[\u3400-\u9fff]+")
 _ASCII_QUESTION_WORDS = frozenset(
     {
@@ -173,10 +204,25 @@ _ASCII_LEADING_REQUEST_VERBS = frozenset(
         "estimate",
         "evaluate",
         "explain",
+        "kindly",
         "outline",
+        "please",
         "summarize",
         "test",
         "validate",
+    }
+)
+_ASCII_QUERY_DISCOURSE_WORDS = frozenset(
+    {
+        "evaluation",
+        "handle",
+        "helpful",
+        "long",
+        "natural-language",
+        "question",
+        "researcher",
+        "useful",
+        "very",
     }
 )
 _CJK_QUESTION_PHRASES = tuple(
@@ -201,13 +247,101 @@ _CJK_QUESTION_PHRASES = tuple(
         reverse=True,
     )
 )
+_GENERIC_SIBLING_ANCHORS = frozenset(
+    {
+        "data",
+        "condition",
+        "conditions",
+        "evidence",
+        "factor",
+        "failure",
+        "failures",
+        "limitation",
+        "limitations",
+        "method",
+        "methods",
+        "process",
+        "processing",
+        "research",
+        "summary",
+        "workflow",
+        "因子",
+        "失败",
+        "失败经验",
+        "数据",
+        "方法",
+        "流程",
+        "研究",
+        "局限",
+        "条件",
+        "证据",
+        "适用条件",
+        "限制",
+        "总结",
+    }
+)
+_ASCII_EXACT_IDENTIFIER_KIND_CUES = frozenset(
+    {
+        "algorithm",
+        "assumption",
+        "assumptions",
+        "caveat",
+        "caveats",
+        "conclusion",
+        "conclusions",
+        "constraint",
+        "constraints",
+        "failure",
+        "failures",
+        "finding",
+        "findings",
+        "implementation",
+        "limitation",
+        "limitations",
+        "method",
+        "methods",
+        "overview",
+        "pitfall",
+        "pitfalls",
+        "prerequisite",
+        "prerequisites",
+        "procedure",
+        "result",
+        "results",
+        "risk",
+        "risks",
+        "summary",
+        "workflow",
+    }
+)
+_ASCII_CONTRAST_GRAMMAR = frozenset(
+    {"not", "only", "just", "merely", "but", "also"}
+)
+_ASCII_LOW_FLOOR_GRAMMAR = frozenset(
+    _ASCII_QUESTION_WORDS
+    | _ASCII_LEADING_REQUEST_VERBS
+    | _ASCII_QUERY_DISCOURSE_WORDS
+    | _ASCII_EXACT_IDENTIFIER_KIND_CUES
+    | {value for value in _GENERIC_SIBLING_ANCHORS if value.isascii()}
+    # These words are syntax, not named research objects.  Keeping the closed
+    # set here makes the earlier named-anchor gate agree with the later
+    # case-insensitive contrast parser without granting any evidence anchor.
+    | _ASCII_CONTRAST_GRAMMAR
+)
+_ASCII_SNAKE_IDENTIFIER_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9_]*_[A-Za-z0-9_]*[A-Za-z0-9]"
+)
 _CONTRAST_PATTERNS = (
     re.compile(
         r"不是(?P<negative>[^，,。；;!?]+?)(?:而是|而应|而要|[，,。；;!?]|$)",
         re.IGNORECASE,
     ),
     re.compile(r"而非(?P<negative>[^，。；;!?]+)", re.IGNORECASE),
-    re.compile(r"\bnot\s+(?P<negative>.+?)\s+but\b", re.IGNORECASE),
+    re.compile(
+        r"\bnot\s+(?!(?:only|just|merely)\b)"
+        r"(?P<negative>.+?)\s+but\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -231,6 +365,75 @@ class TaskContext:
             else:
                 normalized[key] = tuple(value)
         return cls(**normalized)
+
+
+def _validate_search_inputs(
+    query: str,
+    context: TaskContext,
+    limit: int,
+    include_history: bool,
+    include_conflicts: bool,
+    minimum_score: float,
+    minimum_weighted_coverage: float,
+) -> None:
+    if type(query) is not str or not query.strip() or len(query) > MAX_QUERY_CHARS:
+        raise ValueError("search query must contain 1 to 500 characters")
+    try:
+        query.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("search query must be valid UTF-8 text") from None
+    if type(limit) is not int or not 1 <= limit <= MAX_SEARCH_LIMIT:
+        raise ValueError("search limit must be an integer between 1 and 100")
+    if type(include_history) is not bool or type(include_conflicts) is not bool:
+        raise ValueError("search history and conflict flags must be booleans")
+    if not isinstance(context, TaskContext):
+        raise ValueError("search context must use the TaskContext contract")
+    context_payload: dict[str, list[str]] = {}
+    for facet in ("market", "frequency", "data", "objective", "assumption"):
+        values = getattr(context, facet)
+        if type(values) is not tuple or any(type(value) is not str for value in values):
+            raise ValueError("search context facets must be tuples of strings")
+        if any(len(value) > MAX_TASK_CONTEXT_VALUE_CHARS for value in values):
+            raise ValueError("search context value exceeds the supported size")
+        context_payload[facet] = list(values)
+    try:
+        context_bytes = json.dumps(
+            context_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("search context must be valid UTF-8 text") from None
+    if len(context_bytes) > MAX_TASK_CONTEXT_BYTES:
+        raise ValueError("search context exceeds the supported size")
+    if sum(len(values) for values in context_payload.values()) > MAX_TASK_CONTEXT_VALUES:
+        raise ValueError("search context contains too many facet values")
+    for values in context_payload.values():
+        normalized_values = [
+            re.sub(r"\s+", " ", value.casefold()).strip()
+            for value in values
+        ]
+        if any(not value for value in normalized_values):
+            raise ValueError("search context contains an empty facet value")
+        if len(normalized_values) != len(set(normalized_values)):
+            raise ValueError("search context contains duplicate facet values")
+
+    def finite_number(value: object) -> bool:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            return False
+
+    if not finite_number(minimum_score) or minimum_score < 0:
+        raise ValueError("minimum score must be a finite non-negative number")
+    if (
+        not finite_number(minimum_weighted_coverage)
+        or not 0 < minimum_weighted_coverage <= 1
+    ):
+        raise ValueError("minimum weighted coverage must be in (0, 1]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +519,16 @@ class _AnchorSurface:
     cjk_text: str
 
 
+def _record_canonical_key(record: _Record) -> str:
+    """Return the exact evidence identity used by deterministic de-duplication."""
+
+    return (
+        f"evidence:{record.source_kind}:{record.document_version_id}:"
+        f"{record.locator.byte_start}:{record.locator.byte_end}:"
+        f"{record.cluster_id or '-'}:{record.knowledge_kind or '-'}"
+    )
+
+
 def _ascii_morphology(token: str) -> tuple[str, ...]:
     """Return a tiny deterministic English morphology closure.
 
@@ -330,6 +543,7 @@ def _ascii_morphology(token: str) -> tuple[str, ...]:
         values.append(token[:-3] + "y")
     elif len(token) > 4 and token.endswith("es"):
         values.append(token[:-2])
+        values.append(token[:-1])
     elif len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
         values.append(token[:-1])
     if len(token) > 6 and token.endswith("ing"):
@@ -362,35 +576,120 @@ def _surface_terms(text: str) -> tuple[str, ...]:
     return tuple(values)
 
 
-def _alias_surface_present(surface: str, text: str) -> bool:
-    folded_surface = surface.casefold()
-    folded_text = text.casefold()
-    compact_surface = re.sub(
-        r"[^a-z0-9\u3400-\u9fff]", "", folded_surface
-    )
-    compact_text = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded_text)
-    if not compact_surface:
-        return False
-    if compact_surface.isascii() and len(compact_surface) <= 4:
-        # Acronyms such as PLE/PLS/PBO must be token matches; substring
-        # matching would incorrectly find PLE inside "complete".
-        return re.search(
-            rf"(?<![a-z0-9_.+-]){re.escape(compact_surface)}(?![a-z0-9_.+-])",
-            folded_text,
-        ) is not None
-    return folded_surface in folded_text or compact_surface in compact_text
+def _low_floor_query_supported(
+    literal_ascii_tokens: frozenset[str],
+    active_corpus_terms: set[str],
+    active_alias_group_indexes: frozenset[int],
+) -> bool:
+    """Allow ranking relaxations only for corpus-known literal grammar."""
+
+    def token_is_supported(token: str) -> bool:
+        if any(
+            variant in active_corpus_terms
+            or variant in _ASCII_LOW_FLOOR_GRAMMAR
+            for variant in _ascii_morphology(token)
+        ):
+            return True
+        return _active_ascii_alias_full_token(
+            token,
+            active_alias_group_indexes,
+        )
+
+    return all(token_is_supported(token) for token in literal_ascii_tokens)
 
 
-def _alias_matcher(surface: str) -> tuple[str, str, bool]:
+def _alias_matcher(
+    surface: str,
+) -> tuple[str, str, re.Pattern[str] | None]:
     folded = surface.casefold()
     compact = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded)
-    return folded, compact, bool(compact.isascii() and len(compact) <= 4)
+    ascii_only = bool(compact and folded.isascii())
+    ascii_tokens = tuple(
+        token
+        for token in re.split(r"[\s\-_.+]+", folded)
+        if token
+    )
+    ascii_pattern = (
+        re.compile(
+            r"[\s\-_.+]+".join(re.escape(token) for token in ascii_tokens)
+        )
+        if ascii_only and ascii_tokens
+        else None
+    )
+    return folded, compact, ascii_pattern
 
 
 _ALIAS_MATCHERS = tuple(
     tuple(_alias_matcher(surface) for surface in group)
     for group in _ALIAS_GROUPS
 )
+
+
+def _active_ascii_alias_full_token(
+    surface: str,
+    active_alias_group_indexes: frozenset[int],
+) -> bool:
+    folded = surface.casefold()
+    return any(
+        group_index in active_alias_group_indexes
+        and any(
+            ascii_pattern is not None
+            and ascii_pattern.fullmatch(folded) is not None
+            for _folded, _compact, ascii_pattern in matchers
+        )
+        for group_index, matchers in enumerate(_ALIAS_MATCHERS)
+    )
+
+
+def _active_ascii_alias_proper_substring(
+    surface: str,
+    active_alias_group_indexes: frozenset[int],
+) -> bool:
+    folded = surface.casefold()
+    full_span = (0, len(folded))
+
+    def is_embedded_alias(
+        match: re.Match[str], alias_surface: str
+    ) -> bool:
+        if match.span() == full_span:
+            return False
+        left = folded[match.start() - 1] if match.start() else None
+        right = folded[match.end()] if match.end() < len(folded) else None
+        touches_controlled_separator = (
+            left in {".", "-", "+", "_"}
+            or right in {".", "-", "+", "_"}
+        )
+        # A very short alias such as ``IC`` occurs naturally at the end of
+        # ordinary words (``harmonic``, ``metric``).  Treat it as embedded
+        # only when an explicit identifier separator proves composition;
+        # longer aliases still reject direct alphabetic prefixes/suffixes.
+        if len(alias_surface) <= 2:
+            # ``IC`` is an attached controlled alias only when it occupies a
+            # complete separator-delimited identifier segment.  The trailing
+            # letters in ordinary corpus terms such as ``economic-value`` and
+            # ``numeric-stability`` are not standalone aliases.
+            return (
+                (left is None or left in {".", "-", "+", "_"})
+                and (right is None or right in {".", "-", "+", "_"})
+            )
+        return (
+            match.start() == 0
+            or match.end() == len(folded)
+            or touches_controlled_separator
+        )
+
+    return any(
+        group_index in active_alias_group_indexes
+        and any(
+            ascii_pattern is not None
+            and any(
+                is_embedded_alias(match, alias_surface)
+                for match in ascii_pattern.finditer(folded)
+            )
+            for alias_surface, _compact, ascii_pattern in matchers
+        )
+        for group_index, matchers in enumerate(_ALIAS_MATCHERS)
+    )
 _ALIAS_EXPANDED_TERMS = tuple(
     tuple(
         term
@@ -400,23 +699,126 @@ _ALIAS_EXPANDED_TERMS = tuple(
     for group in _ALIAS_GROUPS
 )
 
+# Formula notation may decorate a controlled metric identifier with a time or
+# bounded numeric index.  Keep this closure deliberately narrower than the
+# general ASCII tokenizer: unknown identifiers such as ``QZX_t`` must remain
+# unknown, while existing closed aliases such as ``IC`` and ``RankIC`` retain
+# their lexical identity in ``IC_t`` / ``RankIC_{T}``.
+_INDEXED_FORMULA_ALIAS_RE = re.compile(
+    r"(?P<base>rankic|ic)"
+    r"(?:_(?:\{(?:t|[0-9]{1,3})\}|(?:t|[0-9]{1,3}))|(?:ₜ|[₀₁₂₃₄₅₆₇₈₉]{1,3}))",
+    re.IGNORECASE,
+)
+
+
+def _is_cjk_character(value: str) -> bool:
+    codepoint = ord(value)
+    return (
+        0x3400 <= codepoint <= 0x4DBF
+        or 0x4E00 <= codepoint <= 0x9FFF
+        or 0xF900 <= codepoint <= 0xFAFF
+        or 0x20000 <= codepoint <= 0x3134F
+    )
+
+
+def _formula_boundary_allows(value: str | None) -> bool:
+    if value is None or _is_cjk_character(value):
+        return True
+    category = unicodedata.category(value)
+    return category[0] not in {"L", "M", "N"} and category != "Pc"
+
+
+def _ascii_alias_pattern_present(pattern: re.Pattern[str], text: str) -> bool:
+    return any(
+        _formula_boundary_allows(text[match.start() - 1] if match.start() else None)
+        and _formula_boundary_allows(
+            text[match.end()] if match.end() < len(text) else None
+        )
+        for match in pattern.finditer(text)
+    )
+
+
+def _compiled_alias_present(
+    matcher: tuple[str, str, re.Pattern[str] | None],
+    folded_text: str,
+    compact_text: str | None = None,
+) -> bool:
+    folded_surface, compact_surface, ascii_pattern = matcher
+    if not compact_surface:
+        return False
+    if ascii_pattern is not None:
+        return _ascii_alias_pattern_present(ascii_pattern, folded_text)
+    if compact_text is None:
+        compact_text = re.sub(
+            r"[^a-z0-9\u3400-\u9fff]", "", folded_text
+        )
+    return folded_surface in folded_text or compact_surface in compact_text
+
+
+def _indexed_formula_alias_matches(text: str) -> tuple[re.Match[str], ...]:
+    return tuple(
+        match
+        for match in _INDEXED_FORMULA_ALIAS_RE.finditer(text)
+        if _formula_boundary_allows(text[match.start() - 1] if match.start() else None)
+        and _formula_boundary_allows(
+            text[match.end()] if match.end() < len(text) else None
+        )
+    )
+
+
+def _indexed_formula_alias_bases(text: str) -> tuple[str, ...]:
+    """Extract only explicitly indexed members of the controlled alias set."""
+
+    return tuple(
+        dict.fromkeys(
+            match.group("base").casefold()
+            for match in _indexed_formula_alias_matches(text)
+        )
+    )
+
+
+def _normalized_literal_ascii_query_tokens(text: str) -> frozenset[str]:
+    formula_matches = _indexed_formula_alias_matches(text)
+    return frozenset(
+        next(
+            (
+                formula.group("base").casefold()
+                for formula in formula_matches
+                if formula.start() <= match.start()
+                and match.end() <= formula.end()
+            ),
+            match.group(0).casefold(),
+        )
+        for match in _ASCII_RE.finditer(text)
+    )
+
+
+def _matched_alias_group_indexes(text: str) -> tuple[int, ...]:
+    folded = text.casefold()
+    formula_bases = _indexed_formula_alias_bases(folded)
+    alias_search_text = " ".join((folded, *formula_bases))
+    compact_text = re.sub(
+        r"[^a-z0-9\u3400-\u9fff]", "", alias_search_text
+    )
+    return tuple(
+        group_index
+        for group_index, matchers in enumerate(_ALIAS_MATCHERS)
+        if any(
+            _compiled_alias_present(matcher, alias_search_text, compact_text)
+            for matcher in matchers
+        )
+    )
+
 
 def _terms(text: str) -> tuple[str, ...]:
     folded = text.casefold()
     values = list(_surface_terms(text))
+    formula_bases = _indexed_formula_alias_bases(folded)
+    for base in formula_bases:
+        values.extend(_surface_terms(base))
     expanded = list(values)
-    compact_text = re.sub(r"[^a-z0-9\u3400-\u9fff]", "", folded)
-    ascii_terms = frozenset(_ASCII_RE.findall(folded))
-    for matchers, alias_terms in zip(
-        _ALIAS_MATCHERS, _ALIAS_EXPANDED_TERMS, strict=True
-    ):
-        if any(
-            compact in ascii_terms
-            if short_ascii
-            else folded_surface in folded or compact in compact_text
-            for folded_surface, compact, short_ascii in matchers
-        ):
-            expanded.extend(alias_terms)
+    for group_index in _matched_alias_group_indexes(text):
+        expanded.extend(_ALIAS_EXPANDED_TERMS[group_index])
     return tuple(expanded)
 
 
@@ -839,6 +1241,28 @@ class KnowledgeIndex:
             if record.active_status == "active"
             for term in record.terms
         }
+
+        def record_lexical_surface(record: _Record) -> str:
+            if record.source_kind == "chunk":
+                return "\n".join((*record.heading_labels, record.text))
+            return "\n".join(
+                (
+                    record.title,
+                    *record.aliases,
+                    *record.heading_labels,
+                    record.knowledge_kind or "",
+                    record.text,
+                )
+            )
+
+        self._active_alias_group_indexes = frozenset(
+            group_index
+            for record in self.records
+            if record.active_status == "active"
+            for group_index in _matched_alias_group_indexes(
+                record_lexical_surface(record)
+            )
+        )
         self._knowledge_search_surfaces = {
             record.record_id: "\n".join(
                 (
@@ -861,6 +1285,20 @@ class KnowledgeIndex:
                         *record.heading_labels,
                         record.knowledge_kind or "",
                         record.text,
+                        *record.source_evidence_texts,
+                    )
+                )
+            )
+            for record in self.records
+        }
+        self._record_local_terms = {
+            record.record_id: frozenset(
+                _terms(
+                    "\n".join(
+                        (
+                            record.text,
+                            *record.source_evidence_texts,
+                        )
                     )
                 )
             )
@@ -1271,15 +1709,27 @@ class KnowledgeIndex:
 
     @staticmethod
     def _applicability(
-        record: _Record, context: TaskContext
+        record: _Record,
+        context_projection: Mapping[str, tuple[set[str], set[str]]] | TaskContext,
     ) -> tuple[float, list[str], list[str]]:
+        if isinstance(context_projection, TaskContext):
+            context_projection = {
+                facet: _canonical_facet_values(
+                    facet, getattr(context_projection, facet)
+                )
+                for facet in (
+                    "market",
+                    "frequency",
+                    "data",
+                    "objective",
+                    "assumption",
+                )
+            }
         bonus = 0.0
         matches: list[str] = []
         conflicts: list[str] = []
         for facet in ("market", "frequency", "data", "objective", "assumption"):
-            expected_exact, expected_canonical = _canonical_facet_values(
-                facet, getattr(context, facet)
-            )
+            expected_exact, expected_canonical = context_projection[facet]
             available_exact, available_canonical = _canonical_facet_values(
                 facet, record.applicability.get(facet, ())
             )
@@ -1339,17 +1789,105 @@ class KnowledgeIndex:
 
     def _unsupported_named_query_anchors(self, query: str) -> tuple[str, ...]:
         unsupported: list[str] = []
+        original_formula_aliases = tuple(
+            (
+                formula_match.start(),
+                formula_match.end(),
+                formula_match.group("base").casefold(),
+            )
+            for formula_match in _indexed_formula_alias_matches(query)
+        )
+        for position, character in enumerate(query):
+            if any(
+                start <= position < end
+                for start, end, _base in original_formula_aliases
+            ):
+                continue
+            category = unicodedata.category(character)
+            if category == "Cc" and character not in {"\t", "\n", "\r"}:
+                unsupported.append("unicode_cc")
+            if category.startswith("Z") and character != " ":
+                unsupported.append(f"unicode_{category.casefold()}")
+            if ord(character) > 0x7F and (
+                category == "Cf"
+                or category.startswith("M")
+                or category.startswith("S")
+            ):
+                unsupported.append(f"unicode_{category.casefold()}")
+            if (
+                ord(character) > 0x7F
+                and character.isalpha()
+                and not ("\u3400" <= character <= "\u9fff")
+            ):
+                unsupported.append(character.casefold())
+
+        normalized_parts: list[str] = []
+        cursor = 0
+        for start, end, _base in original_formula_aliases:
+            normalized_parts.append(unicodedata.normalize("NFKC", query[cursor:start]))
+            normalized_parts.append(query[start:end])
+            cursor = end
+        normalized_parts.append(unicodedata.normalize("NFKC", query[cursor:]))
+        query = "".join(normalized_parts)
+        indexed_formula_aliases = tuple(
+            (
+                formula_match.start(),
+                formula_match.end(),
+                formula_match.group("base").casefold(),
+            )
+            for formula_match in _indexed_formula_alias_matches(query)
+        )
         matches = tuple(_ASCII_RE.finditer(query))
-        for ordinal, match in enumerate(matches):
+        for match in matches:
             surface = match.group(0)
             folded = surface.casefold()
-            if folded in _ASCII_QUESTION_WORDS or len(folded) < 2:
+            if folded in _ASCII_LOW_FLOOR_GRAMMAR or len(folded) < 2:
                 continue
+            indexed_formula_base = next(
+                (
+                    base
+                    for start, end, base in indexed_formula_aliases
+                    if start <= match.start() and match.end() <= end
+                ),
+                None,
+            )
             if (
-                ordinal == 0
-                and folded in _ASCII_LEADING_REQUEST_VERBS
-                and not surface.isupper()
+                indexed_formula_base is not None
+                and indexed_formula_base in self._active_corpus_terms
             ):
+                continue
+            alias_boundary_allowed = _formula_boundary_allows(
+                query[match.start() - 1] if match.start() else None
+            ) and _formula_boundary_allows(
+                query[match.end()] if match.end() < len(query) else None
+            )
+            if alias_boundary_allowed and _active_ascii_alias_full_token(
+                surface,
+                self._active_alias_group_indexes,
+            ):
+                continue
+            if _active_ascii_alias_proper_substring(
+                surface,
+                self._active_alias_group_indexes,
+            ):
+                unsupported.append(folded)
+                continue
+            malformed_formula_alias = (
+                (folded.startswith("rankic") and folded != "rankic")
+                or folded.startswith("ic_")
+            )
+            if malformed_formula_alias:
+                unsupported.append(folded)
+                continue
+            if folded in {"ic", "rankic"} and (
+                not _formula_boundary_allows(
+                    query[match.start() - 1] if match.start() else None
+                )
+                or not _formula_boundary_allows(
+                    query[match.end()] if match.end() < len(query) else None
+                )
+            ):
+                unsupported.append(folded)
                 continue
             controlled_facet = _controlled_facet_canonical(surface)
             if controlled_facet is not None:
@@ -1373,6 +1911,14 @@ class KnowledgeIndex:
             looks_named = (
                 lower_hyphenated_domain_term
                 or surface.isupper()
+                or (
+                    any(character.isupper() for character in surface)
+                    and any(character.islower() for character in surface)
+                    and not (
+                        surface[0].isupper()
+                        and surface[1:].islower()
+                    )
+                )
                 or (
                     surface[0].isupper()
                     and not surface[1:].isupper()
@@ -1423,11 +1969,20 @@ class KnowledgeIndex:
         minimum_score: float = 0.35,
         minimum_weighted_coverage: float = 0.12,
     ) -> SearchResponse:
-        if not query.strip() or limit < 1:
-            raise ValueError("search query and positive limit are required")
-        if not 0 < minimum_weighted_coverage <= 1:
-            raise ValueError("minimum weighted coverage must be in (0, 1]")
-        context = context or TaskContext()
+        context = TaskContext() if context is None else context
+        _validate_search_inputs(
+            query,
+            context,
+            limit,
+            include_history,
+            include_conflicts,
+            minimum_score,
+            minimum_weighted_coverage,
+        )
+        context_projection = {
+            facet: _canonical_facet_values(facet, getattr(context, facet))
+            for facet in ("market", "frequency", "data", "objective", "assumption")
+        }
         unsupported_context = self._unsupported_concrete_context(context)
         unsupported_named_anchors = self._unsupported_named_query_anchors(query)
         if unsupported_context or unsupported_named_anchors:
@@ -1446,7 +2001,39 @@ class KnowledgeIndex:
             )
         positive_query, contrast_negatives = _contrast_parts(query)
         kind_preferences = _query_kind_preferences(positive_query)
-        query_terms = Counter(_terms(positive_query))
+        positive_literal_ascii_tokens = _normalized_literal_ascii_query_tokens(
+            positive_query
+        )
+        positive_literal_snake_identifiers = frozenset(
+            token
+            for token in positive_literal_ascii_tokens
+            if _ASCII_SNAKE_IDENTIFIER_RE.fullmatch(token) is not None
+        )
+        low_floor_query_supported = _low_floor_query_supported(
+            positive_literal_ascii_tokens,
+            self._active_corpus_terms,
+            self._active_alias_group_indexes,
+        )
+
+        # Contrast operators are query syntax, never source evidence.  They are
+        # accepted by the named-anchor/query-support grammar above, but removing
+        # them from the factual term bag prevents grammar-only boilerplate from
+        # satisfying BM25 or coverage gates.
+        query_terms = Counter(
+            term
+            for term in _terms(positive_query)
+            if term not in _ASCII_CONTRAST_GRAMMAR
+        )
+        if not query_terms:
+            return SearchResponse(
+                query=query,
+                snapshot_id=self.snapshot_id,
+                index_version=INDEX_VERSION,
+                cards=(),
+                answerable=False,
+                no_answer_reason="no_supported_factual_terms",
+                total_candidates=0,
+            )
         fts_candidates = self._fts_candidate_ids(query_terms)
         query_folded = positive_query.casefold().strip()
         positive_anchor_groups = _anchor_groups(positive_query)
@@ -1481,7 +2068,12 @@ class KnowledgeIndex:
             )
             for document_id, anchors in document_anchors_by_id.items()
         }
-        rejected_document_ids: set[str] = set()
+        strong_document_ids = frozenset(
+            document_id
+            for document_id, anchors in strong_document_anchors_by_id.items()
+            if anchors
+        )
+        rejected_record_ids: set[str] = set()
         if contrast_negatives:
             for candidate in self.records:
                 if not include_history and candidate.active_status != "active":
@@ -1493,12 +2085,94 @@ class KnowledgeIndex:
                     )
                     for groups in negative_anchor_groups
                 ):
-                    rejected_document_ids.add(candidate.document_id)
+                    rejected_record_ids.add(candidate.record_id)
+        rejected_cluster_ids: set[str] = set()
+        rejected_canonical_keys: set[str] = set()
+        # Compute a fixed point over formal concept identity, its exact carrier
+        # chunks, and de-duplication identity.  Rejection flows from a formal
+        # record to its own carrier chunks, never backwards from a shared chunk
+        # into every locator it happens to contain.  The formal negative surface
+        # already includes its own exact source evidence, so bilingual negatives
+        # are matched without conflating adjacent spans in one chunk.
+        if rejected_record_ids:
+            while True:
+                previous = (
+                    len(rejected_record_ids),
+                    len(rejected_cluster_ids),
+                    len(rejected_canonical_keys),
+                )
+                for candidate in self._knowledge_records:
+                    if candidate.record_id in rejected_record_ids:
+                        if candidate.cluster_id:
+                            rejected_cluster_ids.add(candidate.cluster_id)
+                        rejected_record_ids.update(
+                            self._source_chunks_by_knowledge.get(
+                                candidate.record_id, ()
+                            )
+                        )
+                for candidate in self._knowledge_records:
+                    if candidate.cluster_id in rejected_cluster_ids:
+                        rejected_record_ids.add(candidate.record_id)
+                        rejected_record_ids.update(
+                            self._source_chunks_by_knowledge.get(
+                                candidate.record_id, ()
+                            )
+                        )
+                rejected_canonical_keys.update(
+                    _record_canonical_key(self._records_by_id[record_id])
+                    for record_id in rejected_record_ids
+                )
+                rejected_record_ids.update(
+                    record.record_id
+                    for record in self.records
+                    if _record_canonical_key(record) in rejected_canonical_keys
+                )
+                current = (
+                    len(rejected_record_ids),
+                    len(rejected_cluster_ids),
+                    len(rejected_canonical_keys),
+                )
+                if current == previous:
+                    break
+
+        def record_is_rejected(record: _Record) -> bool:
+            if not rejected_record_ids:
+                return False
+            return (
+                record.record_id in rejected_record_ids
+                or _record_canonical_key(record) in rejected_canonical_keys
+            )
+
+        specific_anchor_cache: dict[str, tuple[str, ...]] = {}
+
+        def specific_record_anchors(record: _Record) -> tuple[str, ...]:
+            cached = specific_anchor_cache.get(record.record_id)
+            if cached is not None:
+                return cached
+            specific = tuple(
+                match
+                for match in query_terms
+                if match in self._record_local_terms[record.record_id]
+                if match not in _ASCII_QUESTION_WORDS
+                and match not in _GENERIC_SIBLING_ANCHORS
+                and (
+                    (match.isascii() and (len(match) >= 3 or match == "ic"))
+                    or (not match.isascii() and len(match) >= 3)
+                )
+            )
+            specific_anchor_cache[record.record_id] = specific
+            return specific
+
         scored: list[tuple[_Record, float, list[str], list[str], list[str]]] = []
         for record in self.records:
             if not include_history and record.active_status != "active":
                 continue
-            if record.document_id in rejected_document_ids:
+            if strong_document_ids and record.document_id not in strong_document_ids:
+                continue
+            if record_is_rejected(record):
+                continue
+            record_specific_anchors = specific_record_anchors(record)
+            if contrast_negatives and not record_specific_anchors:
                 continue
             record_search_text = self._knowledge_search_surfaces.get(
                 record.record_id, ""
@@ -1570,6 +2244,16 @@ class KnowledgeIndex:
                 for reason in reasons
                 if reason.startswith("lexical:")
             }
+            exact_ascii_identifier_route = False
+            if low_floor_query_supported and positive_literal_snake_identifiers:
+                record_literal_ascii_terms = frozenset(
+                    match.group(0).casefold()
+                    for match in _ASCII_RE.finditer(record.text)
+                )
+                exact_ascii_identifier_route = bool(
+                    positive_literal_snake_identifiers
+                    & record_literal_ascii_terms
+                )
             if exact_match:
                 score += 12.0
                 reasons.append("exact:id-alias-title")
@@ -1585,7 +2269,9 @@ class KnowledgeIndex:
                 elif record.knowledge_kind not in {None, "evidence"}:
                     score -= 0.5
                     reasons.append("intent_kind:nonpreferred")
-            applicability_bonus, matches, conflicts = self._applicability(record, context)
+            applicability_bonus, matches, conflicts = self._applicability(
+                record, context_projection
+            )
             score += applicability_bonus
             if conflicts:
                 score -= 6.0 * len(conflicts)
@@ -1624,7 +2310,9 @@ class KnowledgeIndex:
             # winsorisation).  It may relax, but never remove, lexical
             # coverage; unmatched context provides no such benefit.
             formal_anchors = (
-                positive_anchors if record.source_kind == "knowledge" else ()
+                record_specific_anchors
+                if record.source_kind == "knowledge"
+                else ()
             )
             preferred_kind_route = (
                 record.source_kind == "knowledge"
@@ -1635,11 +2323,16 @@ class KnowledgeIndex:
                 record.source_kind == "knowledge"
                 and record.fact_status
                 in {"source_explicit", "machine_verified", "human_reviewed"}
+                and low_floor_query_supported
                 and (len(formal_anchors) >= 2 or preferred_kind_route)
             )
             effective_weighted_floor = minimum_weighted_coverage
             effective_term_floor = 0.10
-            if matches and not conflicts:
+            if (
+                matches
+                and not conflicts
+                and low_floor_query_supported
+            ):
                 effective_weighted_floor = min(effective_weighted_floor, 0.065)
                 effective_term_floor = 0.05
             if formal_evidence_route:
@@ -1653,7 +2346,17 @@ class KnowledgeIndex:
                 reasons.append("route:formal-grounded-evidence")
                 if preferred_kind_route:
                     reasons.append("route:explicit-kind-intent")
-            if strong_document_anchors:
+            if exact_ascii_identifier_route:
+                # A complete snake_case identifier token such as
+                # ``bounded_outlier_policy`` is immutable local source
+                # evidence, not an alias-expanded match.  The query-level gate
+                # also requires every literal ASCII token to be corpus-active
+                # or closed grammar, so an unknown companion object cannot
+                # borrow this relaxation.
+                effective_weighted_floor = min(effective_weighted_floor, 0.05)
+                effective_term_floor = min(effective_term_floor, 0.05)
+                reasons.append("route:exact-ascii-identifier")
+            if strong_document_anchors and low_floor_query_supported:
                 # A closed-world exact alias or bounded acronym (for example
                 # PBO) is itself grounded document identity. It may route a
                 # long natural-language question to passages in that document,
@@ -1680,10 +2383,12 @@ class KnowledgeIndex:
             }
             for record in self._knowledge_records:
                 if (
-                    record.record_id in scored_ids
+                    not low_floor_query_supported
+                    or record.record_id in scored_ids
                     or record.knowledge_kind not in kind_preferences
+                    or not specific_record_anchors(record)
                     or (not include_history and record.active_status != "active")
-                    or record.document_id in rejected_document_ids
+                    or record_is_rejected(record)
                 ):
                     continue
                 # The containing chunk is only a carrier for the immutable
@@ -1722,7 +2427,7 @@ class KnowledgeIndex:
                 if negative_anchors:
                     continue
                 applicability_bonus, matches, conflicts = self._applicability(
-                    record, context
+                    record, context_projection
                 )
                 if conflicts and not include_conflicts:
                     continue
@@ -1770,7 +2475,9 @@ class KnowledgeIndex:
             ) or self._records_by_cluster.get(record.relation["target_id"])
             if target is None or (not include_history and target.active_status != "active"):
                 continue
-            if target.document_id in rejected_document_ids:
+            if record_is_rejected(target):
+                continue
+            if contrast_negatives and not specific_record_anchors(target):
                 continue
             target_surface = self._knowledge_search_surfaces.get(
                 target.record_id,
@@ -1793,7 +2500,7 @@ class KnowledgeIndex:
             if rejected_anchors:
                 continue
             relation_bonus, relation_matches, relation_conflicts = self._applicability(
-                target, context
+                target, context_projection
             )
             if relation_conflicts and not include_conflicts:
                 continue
@@ -1813,12 +2520,10 @@ class KnowledgeIndex:
 
         grouped: dict[str, tuple[_Record, float, set[str], set[str], set[str], set[str]]] = {}
         for record, score, reasons, matches, conflicts in scored:
+            if record_is_rejected(record):
+                continue
             record_spans = set(record.evidence_span_ids)
-            canonical_key = (
-                f"evidence:{record.source_kind}:{record.document_version_id}:"
-                f"{record.locator.byte_start}:{record.locator.byte_end}:"
-                f"{record.cluster_id or '-'}:{record.knowledge_kind or '-'}"
-            )
+            canonical_key = _record_canonical_key(record)
             current = grouped.get(canonical_key)
             if current is None:
                 grouped[canonical_key] = (

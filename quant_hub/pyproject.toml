@@ -42,6 +42,7 @@ qrh-semantic-authority = "quant_hub.ops.semantic_authority:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -63,13 +64,16 @@ where = ["src"]
   "static/*.css",
   "static/*.js",
 ]
-"quant_hub.presentation" = ["*.json", "supplements/**/*.md"]
-
 [tool.setuptools.exclude-package-data]
 # Reviewed citation mappings are sealed production business data.  They may be
 # present in a developer or release-materialization tree, but a Public wheel
 # must never inherit them through the broad presentation JSON pattern above.
-"quant_hub.presentation" = ["citation_projection_overrides.json"]
+"quant_hub.presentation" = [
+  "archive_presentation.json",
+  "citation_projection_overrides.json",
+  "evidence_zh_overlays.json",
+  "research_supplements.json",
+]
 
 [tool.setuptools.data-files]
 "migrations/platform" = ["migrations/platform/*.sql"]

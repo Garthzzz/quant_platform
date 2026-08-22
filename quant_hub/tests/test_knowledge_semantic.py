@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
+import multiprocessing
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 
 from quant_hub.knowledge import ReferenceCompiler
+from quant_hub.knowledge.contracts import canonical_json
 from quant_hub.knowledge.semantic import (
     OUTPUT_SCHEMA_VERSION,
     ModelIdentityContract,
@@ -38,6 +42,16 @@ class RecordingProvider:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+def _claim_process_worker(database, job_key, start_event, result_queue) -> None:
+    start_event.wait(15)
+    try:
+        claimed = SemanticJobStore(Path(database)).claim_job(job_key)
+    except Exception as error:  # pragma: no cover - asserted in the parent
+        result_queue.put(("rejected", type(error).__name__, str(error)))
+    else:
+        result_queue.put(("claimed", claimed.claim_token, claimed.status))
 
 
 def _contract(*, fingerprint: str = "fp-0813") -> ModelIdentityContract:
@@ -200,6 +214,244 @@ class SemanticCompilerTests(unittest.TestCase):
         serialized = self.store.path.read_bytes().lower()
         self.assertNotIn(b"authorization", serialized)
         self.assertNotIn(b"api_key", serialized)
+
+    def test_atomic_claim_fences_sixteen_concurrent_workers(self) -> None:
+        compiler = SemanticCompiler(self.store, _contract())
+        job = next(
+            row
+            for row in compiler.plan(self.base).jobs
+            if row.document_version_id == self._version_for_path("factor.md")
+        )
+        provider = RecordingProvider(_valid_response)
+        barrier = threading.Barrier(16)
+
+        def execute_worker():
+            barrier.wait(timeout=10)
+            try:
+                return compiler.execute(self.base, job.job_key, provider)
+            except ValueError as error:
+                return error
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            outcomes = tuple(pool.submit(execute_worker) for _ in range(16))
+            values = tuple(future.result(timeout=20) for future in outcomes)
+
+        generations = tuple(
+            value for value in values if not isinstance(value, ValueError)
+        )
+        rejected = tuple(value for value in values if isinstance(value, ValueError))
+        self.assertEqual(1, len(generations), values)
+        self.assertEqual(15, len(rejected), values)
+        self.assertEqual(1, len(provider.envelopes))
+        self.assertTrue(
+            all("not executable" in str(error) for error in rejected),
+            rejected,
+        )
+        committed = generations[0]
+        persisted = self.store.job(job.job_key)
+        self.assertEqual("succeeded", persisted.status)
+        self.assertIsNone(persisted.claim_token)
+        self.assertIsNone(persisted.claim_started_at)
+        with self.assertRaisesRegex(ValueError, "lost its job claim"):
+            self.store.commit_generation(
+                committed,
+                claim_token="0" * 64,
+            )
+
+    def test_generation_identity_collision_rolls_back_the_whole_commit(self) -> None:
+        compiler = SemanticCompiler(self.store, _contract())
+        jobs = compiler.plan(self.base).jobs
+        first_job = next(
+            row
+            for row in jobs
+            if row.document_version_id == self._version_for_path("factor.md")
+        )
+        second_job = next(row for row in jobs if row.job_key != first_job.job_key)
+        committed = compiler.execute(
+            self.base,
+            first_job.job_key,
+            RecordingProvider(_valid_response),
+        )
+        second_claim = self.store.claim_job(second_job.job_key)
+        assert second_claim.claim_token is not None
+        colliding = replace(
+            committed,
+            job_key=second_job.job_key,
+            document_version_id=second_job.document_version_id,
+            source_sha256=second_job.source_sha256,
+            ir_hash=second_job.ir_hash,
+            partition_manifest_hash=second_job.partition_manifest_hash,
+        )
+        with self.assertRaisesRegex(ValueError, "generation identity conflicts"):
+            self.store.commit_generation(
+                colliding,
+                claim_token=second_claim.claim_token,
+            )
+        persisted = self.store.job(second_job.job_key)
+        self.assertEqual("running", persisted.status)
+        self.assertEqual(second_claim.claim_token, persisted.claim_token)
+        self.assertEqual(1, len(self.store.generations()))
+        self.store.reconcile_terminated_claim(
+            second_job.job_key,
+            claim_token=second_claim.claim_token,
+            actor="public-collision-watchdog",
+            reason="the synthetic collision attempt has terminated",
+            error_code="identity_collision",
+        )
+
+    def test_generation_write_apis_reject_nonterminal_status_without_consuming_claim(self) -> None:
+        compiler = SemanticCompiler(self.store, _contract())
+        jobs = compiler.plan(self.base).jobs
+        first_job, second_job = jobs
+        committed = compiler.execute(
+            self.base,
+            first_job.job_key,
+            RecordingProvider(_valid_response),
+        )
+        invalid_standalone = replace(
+            committed,
+            generation_id="generation-running-standalone",
+            status="running",
+            error_code=None,
+        )
+        with self.assertRaisesRegex(ValueError, "terminal status"):
+            self.store.add_generation(invalid_standalone)
+
+        second_claim = self.store.claim_job(second_job.job_key)
+        assert second_claim.claim_token is not None
+        invalid_commit = replace(
+            committed,
+            generation_id="generation-running-commit",
+            job_key=second_job.job_key,
+            document_version_id=second_job.document_version_id,
+            source_sha256=second_job.source_sha256,
+            ir_hash=second_job.ir_hash,
+            partition_manifest_hash=second_job.partition_manifest_hash,
+            status="running",
+            error_code=None,
+        )
+        with self.assertRaisesRegex(ValueError, "terminal status"):
+            self.store.commit_generation(
+                invalid_commit,
+                claim_token=second_claim.claim_token,
+            )
+        persisted = self.store.job(second_job.job_key)
+        self.assertEqual("running", persisted.status)
+        self.assertEqual(second_claim.claim_token, persisted.claim_token)
+        self.assertNotIn(
+            invalid_commit.generation_id,
+            {row.generation_id for row in self.store.generations()},
+        )
+        self.store.reconcile_terminated_claim(
+            second_job.job_key,
+            claim_token=second_claim.claim_token,
+            actor="public-nonterminal-watchdog",
+            reason="the rejected synthetic commit left the active claim intact",
+            error_code="invalid_generation_status",
+        )
+
+    def test_terminated_worker_reconciliation_is_fenced_and_audited(self) -> None:
+        compiler = SemanticCompiler(self.store, _contract())
+        job = compiler.plan(self.base).jobs[0]
+        first = self.store.claim_job(job.job_key)
+        self.assertEqual("running", first.status)
+        self.assertIsNotNone(first.claim_token)
+        with self.assertRaisesRegex(ValueError, "fenced reconciliation"):
+            self.store.set_job_status(
+                job.job_key,
+                "failed_retryable",
+                "unsafe_unfenced_requeue",
+            )
+
+        recovered = self.store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=first.claim_token,
+            actor="public-concurrency-watchdog",
+            reason="the synthetic worker was joined before reconciliation",
+            error_code="worker_terminated",
+        )
+        self.assertEqual("failed_retryable", recovered.status)
+        self.assertIsNone(recovered.claim_token)
+        self.assertIsNone(recovered.claim_started_at)
+        second = self.store.claim_job(job.job_key)
+        self.assertNotEqual(first.claim_token, second.claim_token)
+        with closing(self.store.connect()) as connection:
+            rows = connection.execute(
+                "SELECT decision,actor,reason FROM knowledge_decision "
+                "WHERE subject_id=?",
+                (job.job_key,),
+            ).fetchall()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("reconciled_terminated_claim", rows[0]["decision"])
+        self.assertEqual("public-concurrency-watchdog", rows[0]["actor"])
+        self.assertNotIn(first.claim_token or "", rows[0]["reason"])
+
+        legacy_payload = asdict(second)
+        legacy_payload.pop("claim_token")
+        legacy_payload.pop("claim_started_at")
+        with closing(self.store.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE semantic_job SET payload_json=?,status='running',error_code=NULL "
+                "WHERE job_key=?",
+                (canonical_json(legacy_payload), job.job_key),
+            )
+        legacy = self.store.job(job.job_key)
+        self.assertEqual("running", legacy.status)
+        self.assertIsNone(legacy.claim_token)
+        recovered_legacy = self.store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=None,
+            allow_legacy_unfenced=True,
+            actor="public-legacy-watchdog",
+            reason="a pre-fencing synthetic worker was already terminated",
+            error_code="legacy_worker_terminated",
+        )
+        self.assertEqual("failed_retryable", recovered_legacy.status)
+
+    def test_atomic_claim_is_cross_process_on_windows_spawn_boundary(self) -> None:
+        compiler = SemanticCompiler(self.store, _contract())
+        job = compiler.plan(self.base).jobs[0]
+        context = multiprocessing.get_context("spawn")
+        start_event = context.Event()
+        result_queue = context.Queue()
+        processes = tuple(
+            context.Process(
+                target=_claim_process_worker,
+                args=(str(self.store.path), job.job_key, start_event, result_queue),
+            )
+            for _ in range(8)
+        )
+        for process in processes:
+            process.start()
+        start_event.set()
+        results = tuple(result_queue.get(timeout=30) for _ in processes)
+        for process in processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            self.assertEqual(0, process.exitcode)
+
+        claimed = tuple(row for row in results if row[0] == "claimed")
+        rejected = tuple(row for row in results if row[0] == "rejected")
+        self.assertEqual(1, len(claimed), results)
+        self.assertEqual(7, len(rejected), results)
+        self.assertTrue(
+            all(
+                row[1] == "ValueError" and "not executable" in row[2]
+                for row in rejected
+            ),
+            rejected,
+        )
+        persisted = self.store.job(job.job_key)
+        self.assertEqual(claimed[0][1], persisted.claim_token)
+        self.store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=persisted.claim_token,
+            actor="public-process-watchdog",
+            reason="all eight synthetic child processes were joined",
+            error_code="worker_terminated",
+        )
 
     def test_strong_author_headings_form_exact_source_knowledge_idempotently(self) -> None:
         source_root = self.root / "structured-source"
@@ -369,6 +621,42 @@ class SemanticCompilerTests(unittest.TestCase):
         self.assertEqual("deprecated", deprecated.fact_status)
         revised = build_enriched_snapshot(self.base, self.store)
         self.assertNotIn(accepted.knowledge_item_id, revised.knowledge_items)
+
+    def test_nonformal_item_state_is_rejected_at_mutation_and_snapshot_boundaries(self) -> None:
+        items = extract_source_explicit(self.base, self.store)
+        item = items[0]
+        with self.assertRaisesRegex(ValueError, "status transition is not supported"):
+            self.store.set_item_status(
+                item.knowledge_item_id,
+                "model_candidate",  # type: ignore[arg-type]
+                actor="public-state-adversary",
+                reason="exercise the runtime status boundary",
+            )
+        self.assertEqual(
+            item.fact_status,
+            self.store.items_for_versions((item.document_version_id,))[0].fact_status,
+        )
+
+        with closing(self.store.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE knowledge_item_state SET fact_status='model_candidate' "
+                "WHERE knowledge_item_id=?",
+                (item.knowledge_item_id,),
+            )
+        with self.assertRaisesRegex(ValueError, "effective state is invalid"):
+            self.store.items_for_versions((item.document_version_id,))
+        with self.assertRaisesRegex(ValueError, "effective state is invalid"):
+            build_enriched_snapshot(self.base, self.store)
+
+        with closing(self.store.connect()) as connection, connection:
+            connection.execute(
+                "DELETE FROM knowledge_item_state WHERE knowledge_item_id=?",
+                (item.knowledge_item_id,),
+            )
+        with self.assertRaisesRegex(ValueError, "effective state is invalid"):
+            self.store.items_for_versions((item.document_version_id,))
+        with self.assertRaisesRegex(ValueError, "effective state is invalid"):
+            build_enriched_snapshot(self.base, self.store)
 
     def test_timeout_invalid_evidence_and_identity_drift_do_not_create_formal_knowledge(self) -> None:
         compiler = SemanticCompiler(self.store, _contract())

@@ -14,6 +14,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 from typing import Any, Callable, Literal, Protocol, Sequence
 from urllib.parse import quote
@@ -52,6 +53,12 @@ JobStatus = Literal[
 
 _ALLOWED_KINDS = frozenset(
     {"summary", "method", "condition", "limitation", "failure", "evidence"}
+)
+_TERMINAL_GENERATION_STATUSES = frozenset(
+    {"succeeded", "failed_retryable", "invalid_evidence", "provider_identity_drift"}
+)
+_FORMAL_ITEM_STATUSES = frozenset(
+    {"source_explicit", "machine_verified", "human_reviewed"}
 )
 _INJECTION_RE = re.compile(
     r"(?:ignore\s+(?:all\s+)?(?:previous|system)|忽略(?:以上|之前|系统)|"
@@ -239,6 +246,14 @@ class SemanticJob:
     created_at: str
     updated_at: str
     error_code: str | None = None
+    claim_token: str | None = None
+    claim_started_at: str | None = None
+    # Terminal attribution retains only a one-way digest, never the bearer
+    # token itself.  A late parent can therefore prove whether a durable
+    # generation belongs to its own terminated child attempt without gaining
+    # authority over a newer worker's result.
+    last_claim_token_sha256: str | None = None
+    last_claim_started_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -972,6 +987,10 @@ class SemanticJobStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        had_item_state_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='knowledge_item_state'"
+        ).fetchone() is not None
         connection.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -1012,11 +1031,6 @@ class SemanticJobStore:
               actor TEXT, reason TEXT, updated_at TEXT NOT NULL,
               FOREIGN KEY(knowledge_item_id) REFERENCES knowledge_item(knowledge_item_id)
             );
-            INSERT OR IGNORE INTO knowledge_item_state(
-              knowledge_item_id,fact_status,actor,reason,updated_at
-            )
-            SELECT knowledge_item_id,fact_status,NULL,NULL,created_at
-            FROM knowledge_item;
             CREATE TABLE IF NOT EXISTS knowledge_decision(
               decision_id TEXT PRIMARY KEY, subject_id TEXT NOT NULL,
               decision TEXT NOT NULL, actor TEXT NOT NULL,
@@ -1028,6 +1042,14 @@ class SemanticJobStore:
             );
             """
         )
+        if not had_item_state_table:
+            connection.execute(
+                "INSERT OR IGNORE INTO knowledge_item_state("
+                "knowledge_item_id,fact_status,actor,reason,updated_at) "
+                "SELECT knowledge_item_id,fact_status,NULL,NULL,created_at "
+                "FROM knowledge_item"
+            )
+            connection.commit()
         return connection
 
     def add_campaign(self, campaign: RecompileCampaign) -> None:
@@ -1092,12 +1114,195 @@ class SemanticJobStore:
         return tuple(self.job(str(row["job_key"])) for row in rows)
 
     def set_job_status(self, job_key: str, status: JobStatus, error_code: str | None = None) -> SemanticJob:
-        job = self.job(job_key)
-        updated = replace(job, status=status, error_code=error_code, updated_at=utc_now())
+        if status == "running":
+            raise ValueError("running status requires an atomic semantic job claim")
         with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json,status,error_code,updated_at FROM semantic_job WHERE job_key=?",
+                (job_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_key)
+            payload = json.loads(row["payload_json"])
+            payload.update(
+                status=row["status"],
+                error_code=row["error_code"],
+                updated_at=row["updated_at"],
+            )
+            payload["part_request_hashes"] = tuple(payload["part_request_hashes"])
+            job = SemanticJob(**payload)
+            if job.status == "running" and job.claim_token is not None:
+                raise ValueError("active semantic job claim requires fenced reconciliation")
+            updated = replace(
+                job,
+                status=status,
+                error_code=error_code,
+                updated_at=utc_now(),
+                claim_token=None,
+                claim_started_at=None,
+            )
+            cursor = connection.execute(
+                "UPDATE semantic_job SET payload_json=?,status=?,error_code=?,updated_at=? "
+                "WHERE job_key=? AND status=? AND payload_json=?",
+                (
+                    canonical_json(asdict(updated)),
+                    status,
+                    error_code,
+                    updated.updated_at,
+                    job_key,
+                    job.status,
+                    row["payload_json"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("semantic job changed during status update")
+        return updated
+
+    def claim_job(self, job_key: str) -> SemanticJob:
+        """Atomically fence one executable job before any provider call."""
+
+        token = secrets.token_hex(32)
+        claimed_at = utc_now()
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json,status,error_code,updated_at FROM semantic_job WHERE job_key=?",
+                (job_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_key)
+            payload = json.loads(row["payload_json"])
+            payload.update(
+                status=row["status"],
+                error_code=row["error_code"],
+                updated_at=row["updated_at"],
+            )
+            payload["part_request_hashes"] = tuple(payload["part_request_hashes"])
+            job = SemanticJob(**payload)
+            if job.status not in {"queued", "failed_retryable"}:
+                raise ValueError("semantic job is not executable")
+            claimed = replace(
+                job,
+                status="running",
+                error_code=None,
+                updated_at=claimed_at,
+                claim_token=token,
+                claim_started_at=claimed_at,
+            )
+            cursor = connection.execute(
+                "UPDATE semantic_job SET payload_json=?,status='running',error_code=NULL,updated_at=? "
+                "WHERE job_key=? AND status=? AND payload_json=?",
+                (
+                    canonical_json(asdict(claimed)),
+                    claimed.updated_at,
+                    job_key,
+                    job.status,
+                    row["payload_json"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("semantic job claim was lost to another worker")
+        return claimed
+
+    def reconcile_terminated_claim(
+        self,
+        job_key: str,
+        *,
+        claim_token: str | None,
+        allow_legacy_unfenced: bool = False,
+        actor: str,
+        reason: str,
+        error_code: str,
+    ) -> SemanticJob:
+        """Requeue a fenced job only after its worker is known to be terminated."""
+
+        if (
+            not isinstance(actor, str)
+            or not actor.strip()
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or not isinstance(error_code, str)
+            or not error_code.strip()
+        ):
+            raise ValueError("claim reconciliation requires actor, reason, and error code")
+        changed_at = utc_now()
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload_json,status,error_code,updated_at FROM semantic_job WHERE job_key=?",
+                (job_key,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_key)
+            payload = json.loads(row["payload_json"])
+            payload.update(
+                status=row["status"],
+                error_code=row["error_code"],
+                updated_at=row["updated_at"],
+            )
+            payload["part_request_hashes"] = tuple(payload["part_request_hashes"])
+            job = SemanticJob(**payload)
+            if job.status != "running":
+                raise ValueError("semantic job has no active running claim")
+            if job.claim_token is None:
+                if claim_token is not None or not allow_legacy_unfenced:
+                    raise ValueError("legacy semantic claim requires explicit recovery")
+            elif not isinstance(claim_token, str) or job.claim_token != claim_token:
+                raise ValueError("semantic job claim changed before reconciliation")
+            updated = replace(
+                job,
+                status="failed_retryable",
+                error_code=error_code,
+                updated_at=changed_at,
+                claim_token=None,
+                claim_started_at=None,
+                last_claim_token_sha256=(
+                    hashlib.sha256(job.claim_token.encode("ascii")).hexdigest()
+                    if job.claim_token
+                    else None
+                ),
+                last_claim_started_at=job.claim_started_at,
+            )
+            cursor = connection.execute(
+                "UPDATE semantic_job SET payload_json=?,status=?,error_code=?,updated_at=? "
+                "WHERE job_key=? AND status='running' AND payload_json=?",
+                (
+                    canonical_json(asdict(updated)),
+                    updated.status,
+                    updated.error_code,
+                    updated.updated_at,
+                    job_key,
+                    row["payload_json"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("semantic job claim changed during reconciliation")
+            decision_id = "kdec_" + content_hash(
+                "qrh-knowledge-decision/v1",
+                {
+                    "subject": job_key,
+                    "decision": "reconciled_terminated_claim",
+                    "actor": actor.strip(),
+                    "reason": reason.strip(),
+                    "at": changed_at,
+                    "claim_token_sha256": (
+                        hashlib.sha256(job.claim_token.encode("ascii")).hexdigest()
+                        if job.claim_token
+                        else "legacy_unfenced_running_job"
+                    ),
+                },
+            )[:32]
             connection.execute(
-                "UPDATE semantic_job SET payload_json=?,status=?,error_code=?,updated_at=? WHERE job_key=?",
-                (canonical_json(asdict(updated)), status, error_code, updated.updated_at, job_key),
+                "INSERT INTO knowledge_decision VALUES(?,?,?,?,?,?)",
+                (
+                    decision_id,
+                    job_key,
+                    "reconciled_terminated_claim",
+                    actor.strip(),
+                    reason.strip(),
+                    changed_at,
+                ),
             )
         return updated
 
@@ -1169,9 +1374,11 @@ class SemanticJobStore:
         return updated
 
     def add_generation(self, generation: KnowledgeGeneration) -> None:
+        if generation.status not in _TERMINAL_GENERATION_STATUSES:
+            raise ValueError("knowledge generation must have a terminal status")
         with closing(self.connect()) as connection, connection:
             connection.execute(
-                "INSERT OR IGNORE INTO knowledge_generation VALUES(?,?,?,?,?,?)",
+                "INSERT INTO knowledge_generation VALUES(?,?,?,?,?,?)",
                 (
                     generation.generation_id,
                     generation.job_key,
@@ -1186,18 +1393,29 @@ class SemanticJobStore:
         self,
         generation: KnowledgeGeneration,
         *,
+        claim_token: str,
         candidates: Sequence[KnowledgeCandidate] = (),
         items: Sequence[KnowledgeItem] = (),
     ) -> None:
         """Atomically record one document-generation outcome and formal rows."""
 
+        if generation.status not in _TERMINAL_GENERATION_STATUSES:
+            raise ValueError("knowledge generation must have a terminal status")
         if generation.status != "succeeded" and (candidates or items):
             raise ValueError("failed generation cannot publish candidate or knowledge rows")
         if any(row.generation_id != generation.generation_id for row in candidates):
             raise ValueError("candidate belongs to another generation")
         if any(row.generation_id != generation.generation_id for row in items):
             raise ValueError("knowledge item belongs to another generation")
+        if any(
+            row.document_version_id != generation.document_version_id
+            for row in (*candidates, *items)
+        ):
+            raise ValueError("generation member belongs to another document version")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("generation commit requires a semantic job claim token")
         with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
             job_row = connection.execute(
                 "SELECT payload_json,status,error_code,updated_at FROM semantic_job "
                 "WHERE job_key=?",
@@ -1214,14 +1432,56 @@ class SemanticJobStore:
             job_payload["part_request_hashes"] = tuple(
                 job_payload["part_request_hashes"]
             )
+            claimed_job = SemanticJob(**job_payload)
+            if (
+                claimed_job.status != "running"
+                or claimed_job.claim_token != claim_token
+            ):
+                raise ValueError("semantic generation commit lost its job claim")
+            if (
+                generation.document_version_id != claimed_job.document_version_id
+                or generation.source_sha256 != claimed_job.source_sha256
+                or generation.ir_hash != claimed_job.ir_hash
+                or generation.requested_model_alias
+                != claimed_job.requested_model_alias
+                or generation.provider_revision
+                != claimed_job.expected_provider_revision
+                or generation.model_identity_contract_hash
+                != claimed_job.model_identity_contract_hash
+                or generation.prompt_version != claimed_job.prompt_version
+                or generation.output_schema_version
+                != claimed_job.output_schema_version
+                or generation.partition_manifest_hash
+                != claimed_job.partition_manifest_hash
+            ):
+                raise ValueError("semantic generation does not match its claimed job")
             updated = replace(
-                SemanticJob(**job_payload),
+                claimed_job,
                 status=generation.status,
                 error_code=generation.error_code,
                 updated_at=utc_now(),
+                claim_token=None,
+                claim_started_at=None,
+                last_claim_token_sha256=hashlib.sha256(
+                    claim_token.encode("ascii")
+                ).hexdigest(),
+                last_claim_started_at=claimed_job.claim_started_at,
             )
-            connection.execute(
-                "INSERT OR IGNORE INTO knowledge_generation VALUES(?,?,?,?,?,?)",
+            def insert_unique(
+                statement: str,
+                values: tuple[Any, ...],
+                *,
+                label: str,
+            ) -> None:
+                try:
+                    connection.execute(statement, values)
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(
+                        f"{label} identity conflicts with an existing row"
+                    ) from error
+
+            insert_unique(
+                "INSERT INTO knowledge_generation VALUES(?,?,?,?,?,?)",
                 (
                     generation.generation_id,
                     generation.job_key,
@@ -1230,10 +1490,11 @@ class SemanticJobStore:
                     generation.status,
                     generation.created_at,
                 ),
+                label="semantic generation",
             )
             for candidate in candidates:
-                connection.execute(
-                    "INSERT OR IGNORE INTO knowledge_candidate VALUES(?,?,?,?,?,?)",
+                insert_unique(
+                    "INSERT INTO knowledge_candidate VALUES(?,?,?,?,?,?)",
                     (
                         candidate.candidate_id,
                         candidate.generation_id,
@@ -1242,16 +1503,13 @@ class SemanticJobStore:
                         candidate.fact_status,
                         generation.created_at,
                     ),
+                    label="semantic candidate",
                 )
             for item in items:
-                if item.fact_status not in {
-                    "source_explicit",
-                    "machine_verified",
-                    "human_reviewed",
-                }:
+                if item.fact_status not in _FORMAL_ITEM_STATUSES:
                     raise ValueError("only formally accepted knowledge may enter bundle")
-                connection.execute(
-                    "INSERT OR IGNORE INTO knowledge_item VALUES(?,?,?,?,?)",
+                insert_unique(
+                    "INSERT INTO knowledge_item VALUES(?,?,?,?,?)",
                     (
                         item.knowledge_item_id,
                         item.document_version_id,
@@ -1259,9 +1517,10 @@ class SemanticJobStore:
                         item.fact_status,
                         item.accepted_at,
                     ),
+                    label="knowledge item",
                 )
-                connection.execute(
-                    "INSERT OR IGNORE INTO knowledge_item_state VALUES(?,?,?,?,?)",
+                insert_unique(
+                    "INSERT INTO knowledge_item_state VALUES(?,?,?,?,?)",
                     (
                         item.knowledge_item_id,
                         item.fact_status,
@@ -1269,18 +1528,22 @@ class SemanticJobStore:
                         None,
                         item.accepted_at,
                     ),
+                    label="knowledge item state",
                 )
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE semantic_job SET payload_json=?,status=?,error_code=?,updated_at=? "
-                "WHERE job_key=?",
+                "WHERE job_key=? AND status='running' AND payload_json=?",
                 (
                     canonical_json(asdict(updated)),
                     updated.status,
                     updated.error_code,
                     updated.updated_at,
                     generation.job_key,
+                    job_row["payload_json"],
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("semantic generation commit lost its job claim")
 
     def generations_for_version(self, version_id: str) -> tuple[KnowledgeGeneration, ...]:
         with closing(self.connect()) as connection, connection:
@@ -1451,7 +1714,7 @@ class SemanticJobStore:
             )
 
     def add_item(self, item: KnowledgeItem) -> None:
-        if item.fact_status not in {"source_explicit", "machine_verified", "human_reviewed"}:
+        if item.fact_status not in _FORMAL_ITEM_STATUSES:
             raise ValueError("only formally accepted knowledge may enter knowledge_item")
         with closing(self.connect()) as connection, connection:
             connection.execute(
@@ -1477,6 +1740,8 @@ class SemanticJobStore:
         actor: str,
         reason: str,
     ) -> None:
+        if type(status) is not str or status != "deprecated":
+            raise ValueError("knowledge item status transition is not supported")
         if not actor.strip() or not reason.strip():
             raise ValueError("knowledge deprecation requires actor and reason")
         now = utc_now()
@@ -1497,7 +1762,7 @@ class SemanticJobStore:
                 f"""
                 SELECT item.payload_json,state.fact_status
                 FROM knowledge_item AS item
-                JOIN knowledge_item_state AS state USING(knowledge_item_id)
+                LEFT JOIN knowledge_item_state AS state USING(knowledge_item_id)
                 WHERE item.document_version_id IN ({placeholders})
                 ORDER BY item.knowledge_item_id
                 """,
@@ -1506,6 +1771,18 @@ class SemanticJobStore:
         values = []
         for row in rows:
             payload = json.loads(row["payload_json"])
+            immutable_status = payload.get("fact_status")
+            effective_status = row["fact_status"]
+            if (
+                immutable_status not in _FORMAL_ITEM_STATUSES
+                or effective_status
+                not in (_FORMAL_ITEM_STATUSES | {"deprecated"})
+                or (
+                    effective_status != "deprecated"
+                    and effective_status != immutable_status
+                )
+            ):
+                raise ValueError("knowledge item effective state is invalid")
             payload["fact_status"] = row["fact_status"]
             payload["evidence"] = tuple(EvidenceBinding(**item) for item in payload["evidence"])
             payload["applicability"] = {
@@ -1711,10 +1988,15 @@ class SemanticCompiler:
         snapshot: BaseSnapshot,
         job_key: str,
         provider: SemanticProvider,
+        *,
+        claim_token: str | None = None,
     ) -> KnowledgeGeneration:
         job = self.store.job(job_key)
-        if job.status not in {"queued", "failed_retryable"}:
-            raise ValueError("semantic job is not executable")
+        if claim_token is None:
+            if job.status not in {"queued", "failed_retryable"}:
+                raise ValueError("semantic job is not executable")
+        elif job.status != "running" or job.claim_token != claim_token:
+            raise ValueError("semantic job pre-claim is no longer active")
         ir = snapshot.ir_documents.get(job.document_version_id)
         if ir is None or ir.ir_hash != job.ir_hash or ir.source_sha256 != job.source_sha256:
             raise ValueError("semantic job source identity is stale")
@@ -1741,7 +2023,12 @@ class SemanticCompiler:
             or aggregate_request_hash != job.request_hash
         ):
             raise ValueError("semantic request does not reproduce job identity")
-        self.store.set_job_status(job_key, "running")
+        if claim_token is None:
+            job = self.store.claim_job(job_key)
+        else:
+            job = self.store.job(job_key)
+        assert job.claim_token is not None
+        active_claim_token = job.claim_token
         now = utc_now()
         receipts: list[GenerationPartReceipt] = []
         responses: list[ProviderResponse] = []
@@ -1794,7 +2081,10 @@ class SemanticCompiler:
                 aggregate_hash=aggregate_hash,
             )
             if persist:
-                self.store.commit_generation(generation)
+                self.store.commit_generation(
+                    generation,
+                    claim_token=active_claim_token,
+                )
             return generation
 
         expected_pair: tuple[str, str] | None = None
@@ -1883,6 +2173,7 @@ class SemanticCompiler:
                 )
         self.store.commit_generation(
             provisional,
+            claim_token=active_claim_token,
             candidates=verified_candidates,
             items=formal_items,
         )

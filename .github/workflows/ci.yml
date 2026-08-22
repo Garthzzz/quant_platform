@@ -77,6 +77,8 @@ jobs:
           tests.test_knowledge_release_build
           tests.test_knowledge_citation_projection
           tests.test_knowledge_mcp
+          tests.test_knowledge_mcp_stress_public
+          tests.test_ds_review_harness
           tests.test_generic_research_renderer
           -v
       - name: Build and exercise installable operational wheel
@@ -84,27 +86,61 @@ jobs:
         run: |
           $wheelRoot = Join-Path $env:RUNNER_TEMP "qrh-wheel"
           New-Item -ItemType Directory -Path $wheelRoot -Force | Out-Null
-          $privateOverlay = Join-Path $PWD "quant_hub\src\quant_hub\presentation\citation_projection_overrides.json"
-          if (Test-Path -LiteralPath $privateOverlay) {
-            throw "Public checkout unexpectedly contains private citation business data"
+          $privateNames = @(
+            "archive_presentation.json",
+            "citation_projection_overrides.json",
+            "evidence_zh_overlays.json",
+            "research_supplements.json"
+          )
+          $privatePaths = @(
+            $privateNames | ForEach-Object {
+              Join-Path $PWD ("quant_hub\src\quant_hub\presentation\" + $_)
+            }
+          )
+          $privateSupplementRoot = Join-Path $PWD "quant_hub\src\quant_hub\presentation\supplements"
+          $privateSupplement = Join-Path $privateSupplementRoot "ci-private-presentation-sentinel.md"
+          if (Test-Path -LiteralPath $privateSupplementRoot) {
+            throw "Public checkout unexpectedly contains private presentation supplements"
+          }
+          foreach ($privatePath in $privatePaths) {
+            if (Test-Path -LiteralPath $privatePath) {
+              throw "Public checkout unexpectedly contains private presentation business data"
+            }
           }
           $sentinel = [System.Text.UTF8Encoding]::new($false).GetBytes(
             '{"schema_version":"qrh-private-citation-ci-sentinel/v1"}'
           )
           try {
-            [System.IO.File]::WriteAllBytes($privateOverlay, $sentinel)
+            New-Item -ItemType Directory -Path $privateSupplementRoot | Out-Null
+            foreach ($privatePath in $privatePaths) {
+              [System.IO.File]::WriteAllBytes($privatePath, $sentinel)
+            }
+            [System.IO.File]::WriteAllBytes($privateSupplement, $sentinel)
             python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir $wheelRoot ./quant_hub
             if ($LASTEXITCODE -ne 0) {
               throw "wheel build failed"
             }
           }
           finally {
-            if (Test-Path -LiteralPath $privateOverlay) {
-              Remove-Item -LiteralPath $privateOverlay -Force
+            if (Test-Path -LiteralPath $privateSupplement) {
+              Remove-Item -LiteralPath $privateSupplement -Force
+            }
+            if (Test-Path -LiteralPath $privateSupplementRoot) {
+              Remove-Item -LiteralPath $privateSupplementRoot -Force
+            }
+            foreach ($privatePath in $privatePaths) {
+              if (Test-Path -LiteralPath $privatePath) {
+                Remove-Item -LiteralPath $privatePath -Force
+              }
             }
           }
-          if (Test-Path -LiteralPath $privateOverlay) {
-            throw "private citation CI sentinel cleanup failed"
+          foreach ($privatePath in $privatePaths) {
+            if (Test-Path -LiteralPath $privatePath) {
+              throw "private presentation CI sentinel cleanup failed"
+            }
+          }
+          if (Test-Path -LiteralPath $privateSupplementRoot) {
+            throw "private presentation supplement CI sentinel cleanup failed"
           }
           $wheels = @(Get-ChildItem -LiteralPath $wheelRoot -Filter *.whl)
           if ($wheels.Count -ne 1) {
@@ -121,11 +157,19 @@ jobs:
           if ($entries -notcontains "quant_hub/knowledge/semantic_cli.py") {
             throw "wheel is missing the semantic operator CLI"
           }
+          if ($entries -notcontains "quant_hub/knowledge/ds_review.py") {
+            throw "wheel is missing the zero-network DS review harness"
+          }
           if ($entries -notcontains "quant_hub/knowledge/citations.py") {
             throw "wheel is missing the Evidence citation projection module"
           }
-          if ($entries -contains "quant_hub/presentation/citation_projection_overrides.json") {
-            throw "public wheel must not contain ignored citation business data"
+          foreach ($privateName in $privateNames) {
+            if ($entries -contains ("quant_hub/presentation/" + $privateName)) {
+              throw "public wheel must not contain ignored presentation business data"
+            }
+          }
+          if ($entries -contains "quant_hub/presentation/supplements/ci-private-presentation-sentinel.md") {
+            throw "public wheel must not contain ignored presentation supplements"
           }
           if ($entries -notcontains "quant_hub/generic_research/release.py") {
             throw "wheel is missing the finalized generic release loader"

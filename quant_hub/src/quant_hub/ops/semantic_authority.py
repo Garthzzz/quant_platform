@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import struct
@@ -60,6 +61,10 @@ KNOWN_FACT_STATUSES = frozenset(
 FORMAL_ITEM_STATUSES = frozenset(
     {"source_explicit", "machine_verified", "human_reviewed"}
 )
+TERMINAL_GENERATION_STATUSES = frozenset(
+    {"succeeded", "failed_retryable", "invalid_evidence", "provider_identity_drift"}
+)
+ITEM_STATE_STATUSES = FORMAL_ITEM_STATUSES | {"deprecated"}
 
 # This is the storage contract implemented by knowledge.semantic.SemanticJobStore.
 # Keeping it here avoids opening/initialising the campaign store during promotion.
@@ -129,6 +134,46 @@ _EXPECTED_COLUMNS: Mapping[str, tuple[tuple[str, str, int, int], ...]] = {
 
 class SemanticAuthorityError(RuntimeError):
     """A fail-closed authority promotion or verification failure."""
+
+
+_PROMOTION_LOCK_MARKER = b"qrh-semantic-authority-promotion-lock/v2-os-advisory\n"
+
+
+def _lock_descriptor(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(
+                descriptor,
+                msvcrt.LK_NBLCK,
+                len(_PROMOTION_LOCK_MARKER),
+            )
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise SemanticAuthorityError(
+            "another semantic authority promotion is active"
+        ) from error
+
+
+def _unlock_descriptor(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(
+            descriptor,
+            msvcrt.LK_UNLCK,
+            len(_PROMOTION_LOCK_MARKER),
+        )
+    else:
+        import fcntl
+
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,10 +350,11 @@ def _validate_database(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if unknown_status is not None:
         raise SemanticAuthorityError("semantic_job contains an unknown status")
+    generation_placeholders = ",".join("?" for _ in TERMINAL_GENERATION_STATUSES)
     unknown_generation_status = connection.execute(
         "SELECT status FROM knowledge_generation "
-        "WHERE status NOT IN (?,?,?,?,?,?,?,?) LIMIT 1",
-        tuple(sorted(KNOWN_JOB_STATUSES)),
+        f"WHERE status NOT IN ({generation_placeholders}) LIMIT 1",
+        tuple(sorted(TERMINAL_GENERATION_STATUSES)),
     ).fetchone()
     if unknown_generation_status is not None:
         raise SemanticAuthorityError("knowledge_generation contains an unknown status")
@@ -328,13 +374,139 @@ def _validate_database(connection: sqlite3.Connection) -> None:
     ).fetchone()
     if unknown_item_status is not None:
         raise SemanticAuthorityError("knowledge_item contains a non-formal fact status")
+    state_placeholders = ",".join("?" for _ in ITEM_STATE_STATUSES)
     unknown_item_state = connection.execute(
         "SELECT fact_status FROM knowledge_item_state "
-        f"WHERE fact_status NOT IN ({fact_placeholders}) LIMIT 1",
-        tuple(sorted(KNOWN_FACT_STATUSES)),
+        f"WHERE fact_status NOT IN ({state_placeholders}) LIMIT 1",
+        tuple(sorted(ITEM_STATE_STATUSES)),
     ).fetchone()
     if unknown_item_state is not None:
         raise SemanticAuthorityError("knowledge_item_state contains an unknown fact status")
+
+    jobs = {
+        str(row["job_key"]): str(row["document_version_id"])
+        for row in connection.execute(
+            "SELECT job_key,document_version_id FROM semantic_job"
+        )
+    }
+    generations: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT generation_id,job_key,document_version_id,payload_json,status,created_at "
+        "FROM knowledge_generation"
+    ):
+        generation_id = str(row["generation_id"])
+        job_key = str(row["job_key"])
+        document_version_id = str(row["document_version_id"])
+        if jobs.get(job_key) != document_version_id:
+            raise SemanticAuthorityError(
+                "knowledge_generation is not bound to its semantic job version"
+            )
+        payload = _validated_payload(row["payload_json"], "knowledge_generation")
+        if (
+            payload.get("generation_id") != generation_id
+            or payload.get("job_key") != job_key
+            or payload.get("document_version_id") != document_version_id
+            or payload.get("status") != str(row["status"])
+            or payload.get("created_at") != str(row["created_at"])
+        ):
+            raise SemanticAuthorityError(
+                "knowledge_generation payload identity is inconsistent"
+            )
+        generations[generation_id] = document_version_id
+
+    for row in connection.execute(
+        "SELECT candidate_id,generation_id,document_version_id,payload_json,fact_status "
+        "FROM knowledge_candidate"
+    ):
+        generation_id = str(row["generation_id"])
+        document_version_id = str(row["document_version_id"])
+        if generations.get(generation_id) != document_version_id:
+            raise SemanticAuthorityError(
+                "knowledge_candidate is not bound to its generation version"
+            )
+        payload = _validated_payload(row["payload_json"], "knowledge_candidate")
+        if (
+            payload.get("candidate_id") != str(row["candidate_id"])
+            or payload.get("generation_id") != generation_id
+            or payload.get("document_version_id") != document_version_id
+            or payload.get("fact_status") != str(row["fact_status"])
+        ):
+            raise SemanticAuthorityError(
+                "knowledge_candidate payload identity is inconsistent"
+            )
+
+    item_statuses: dict[str, str] = {}
+    for row in connection.execute(
+        "SELECT knowledge_item_id,document_version_id,payload_json,fact_status "
+        "FROM knowledge_item"
+    ):
+        item_id = str(row["knowledge_item_id"])
+        document_version_id = str(row["document_version_id"])
+        payload = _validated_payload(row["payload_json"], "knowledge_item")
+        if (
+            payload.get("knowledge_item_id") != item_id
+            or payload.get("document_version_id") != document_version_id
+            or payload.get("fact_status") != str(row["fact_status"])
+        ):
+            raise SemanticAuthorityError("knowledge_item payload identity is inconsistent")
+        generation_id = payload.get("generation_id")
+        if generation_id is not None and generations.get(generation_id) != document_version_id:
+            raise SemanticAuthorityError(
+                "knowledge_item is not bound to its generation version"
+            )
+        item_statuses[item_id] = str(row["fact_status"])
+
+    state_item_ids: set[str] = set()
+    for row in connection.execute(
+        "SELECT knowledge_item_id,fact_status FROM knowledge_item_state"
+    ):
+        item_id = str(row["knowledge_item_id"])
+        state_item_ids.add(item_id)
+        effective_status = str(row["fact_status"])
+        immutable_status = item_statuses.get(item_id)
+        if immutable_status is None:
+            raise SemanticAuthorityError(
+                "knowledge_item_state has no immutable item"
+            )
+        if effective_status != "deprecated" and effective_status != immutable_status:
+            raise SemanticAuthorityError(
+                "knowledge_item_state conflicts with immutable item status"
+            )
+    if state_item_ids != set(item_statuses):
+        raise SemanticAuthorityError(
+            "knowledge_item is missing its effective state"
+        )
+    if any(
+        str(row[0]) not in generations
+        for row in connection.execute(
+            "SELECT generation_id FROM generation_eligibility"
+        )
+    ):
+        raise SemanticAuthorityError("generation_eligibility has no generation")
+
+
+def _validated_payload(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, str):
+        raise SemanticAuthorityError(f"{label} payload is not JSON text")
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError, RecursionError) as error:
+        raise SemanticAuthorityError(f"{label} payload is invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise SemanticAuthorityError(f"{label} payload is not an object")
+    try:
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, RecursionError) as error:
+        raise SemanticAuthorityError(f"{label} payload is not canonicalisable") from error
+    if value != canonical:
+        raise SemanticAuthorityError(f"{label} payload is not canonical JSON")
+    return payload
 
 
 def _active_job_count(connection: sqlite3.Connection) -> int:
@@ -557,24 +729,48 @@ def _load_receipt(path: Path) -> SemanticPromotionReceipt:
 def _promotion_lock(state_root: Path) -> Iterator[None]:
     path = state_root / ".semantic_authority_promotion.lock"
     _ensure_safe_path(path, label="semantic promotion lock")
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise SemanticAuthorityError("another semantic authority promotion is active") from error
-    try:
-        os.write(descriptor, b"qrh-semantic-authority-promotion-lock/v1\n")
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
+    if path.exists():
         _validate_regular_file(path, label="semantic promotion lock")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+    except OSError as error:
+        raise SemanticAuthorityError("semantic promotion lock cannot be opened") from error
+    locked = False
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SemanticAuthorityError(
+                "semantic promotion lock must be a regular single-link file"
+            )
+        if info.st_size == 0:
+            os.write(descriptor, _PROMOTION_LOCK_MARKER)
+            os.fsync(descriptor)
+        _lock_descriptor(descriptor)
+        locked = True
+        _validate_regular_file(path, label="semantic promotion lock")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = os.read(descriptor, len(_PROMOTION_LOCK_MARKER) + 1)
+        if observed != _PROMOTION_LOCK_MARKER:
+            raise SemanticAuthorityError(
+                "semantic promotion lock identity is invalid"
+            )
         yield
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.read(descriptor, len(_PROMOTION_LOCK_MARKER) + 1) != _PROMOTION_LOCK_MARKER:
+            raise SemanticAuthorityError(
+                "semantic promotion lock changed while held"
+            )
     finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        if locked:
+            try:
+                _unlock_descriptor(descriptor)
+            except OSError:
+                pass
+        os.close(descriptor)
 
 
 def _write_receipt_immutable(path: Path, receipt: SemanticPromotionReceipt) -> None:
@@ -602,6 +798,43 @@ def _write_receipt_immutable(path: Path, receipt: SemanticPromotionReceipt) -> N
             partial.unlink()
         except FileNotFoundError:
             pass
+
+
+_TARGET_PARTIAL_RE = re.compile(
+    rf"^{re.escape(TARGET_FILE_NAME)}\.[0-9a-f]{{32}}\.partial$"
+)
+_RECEIPT_PARTIAL_RE = re.compile(
+    r"^semprom_[0-9a-f]{40}\.json\.[0-9a-f]{32}\.partial$"
+)
+
+
+def _cleanup_interrupted_partials(
+    state: Path,
+    receipts: Path,
+) -> None:
+    """Remove only this protocol's bounded crash residues while locked."""
+
+    candidates = tuple(
+        path
+        for path in state.iterdir()
+        if path.name.startswith(TARGET_FILE_NAME + ".")
+        and path.name.endswith(".partial")
+    ) + tuple(path for path in receipts.iterdir() if path.name.endswith(".partial"))
+    for path in candidates:
+        expected = (
+            _TARGET_PARTIAL_RE.fullmatch(path.name)
+            if path.parent == state
+            else _RECEIPT_PARTIAL_RE.fullmatch(path.name)
+        )
+        if expected is None:
+            raise SemanticAuthorityError("unknown semantic promotion partial residue")
+        _validate_regular_file(path, label="semantic promotion partial residue")
+        try:
+            path.unlink()
+        except OSError as error:
+            raise SemanticAuthorityError(
+                "semantic promotion partial residue cannot be removed"
+            ) from error
 
 
 def _matching_receipt(
@@ -655,14 +888,18 @@ def promote_semantic_authority(
     receipts = state / RECEIPT_DIRECTORY
     _ensure_safe_path(target, label="semantic authority target")
     _ensure_safe_path(receipts, label="promotion receipt root")
-    if receipts.exists():
-        if not receipts.is_dir() or stat_is_reparse_point(receipts.lstat()):
-            raise SemanticAuthorityError("promotion receipt root is unsafe")
-    else:
-        receipts.mkdir(mode=0o700)
-        _ensure_safe_path(receipts, label="promotion receipt root")
 
     with _promotion_lock(state):
+        try:
+            receipts.mkdir(mode=0o700, exist_ok=True)
+        except OSError as error:
+            raise SemanticAuthorityError(
+                "promotion receipt root cannot be initialized"
+            ) from error
+        _ensure_safe_path(receipts, label="promotion receipt root")
+        if not receipts.is_dir() or stat_is_reparse_point(receipts.lstat()):
+            raise SemanticAuthorityError("promotion receipt root is unsafe")
+        _cleanup_interrupted_partials(state, receipts)
         guard = sqlite3.connect(source, timeout=0, isolation_level=None)
         try:
             guard.execute("PRAGMA busy_timeout=0")
@@ -700,13 +937,19 @@ def promote_semantic_authority(
                         # receipt remains valid.  No timestamp or attempt is
                         # guessed and no second target replacement is needed.
                         prior_path = receipts / f"{expected_current_promotion_id}.json"
-                        if not (
+                        rotation_recovery = (
                             same_logical_identity
                             and expected_current_promotion_id is not None
                             and prior_path.is_file()
                             and _load_receipt(prior_path).promotion_id
                             == expected_current_promotion_id
-                        ):
+                        )
+                        first_install_recovery = (
+                            same_logical_identity
+                            and expected_current_promotion_id is None
+                            and not tuple(receipts.glob("semprom_*.json"))
+                        )
+                        if not (rotation_recovery or first_install_recovery):
                             raise
                         current = None
                     if current is not None and expected_current_promotion_id is not None and (

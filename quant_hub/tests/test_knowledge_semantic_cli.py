@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -21,11 +22,14 @@ from quant_hub.knowledge.semantic import (
     SemanticJobStore,
 )
 from quant_hub.knowledge.semantic_cli import (
+    _CHILD_CLAIM_ENV,
+    CLI_SCHEMA,
     SemanticCLIError,
     _execute_one_parent,
     _identity_contract,
     _overall_deadline_seconds,
     _provider,
+    _reconcile_unverifiable_child,
     main,
 )
 
@@ -188,6 +192,14 @@ class SemanticCLITests(unittest.TestCase):
 
             with patch(
                 "quant_hub.knowledge.semantic_cli._provider", return_value=_Provider()
+            ), patch.dict(
+                os.environ,
+                {
+                    _CHILD_CLAIM_ENV: SemanticJobStore(
+                        self.workspace / "semantic_jobs.sqlite3"
+                    ).claim_job(job_key).claim_token
+                },
+                clear=False,
             ):
                 code, executed = self._call(
                     "execute-one",
@@ -318,7 +330,10 @@ class SemanticCLITests(unittest.TestCase):
         )
 
         def fake_trickle(*_args, **kwargs):
-            store.set_job_status(job.job_key, "running")
+            self.assertEqual(
+                store.job(job.job_key).claim_token,
+                kwargs["env"][_CHILD_CLAIM_ENV],
+            )
             raise subprocess.TimeoutExpired(
                 cmd="protected-child", timeout=kwargs["timeout"]
             )
@@ -355,7 +370,6 @@ class SemanticCLITests(unittest.TestCase):
         )
 
         def failed_child(*_args, **_kwargs):
-            store.set_job_status(job.job_key, "running")
             return subprocess.CompletedProcess("protected-child", 2, "", "")
 
         with patch(
@@ -366,6 +380,118 @@ class SemanticCLITests(unittest.TestCase):
                 _execute_one_parent(arguments, self.workspace, store)
         self.assertEqual("failed_retryable", store.job(job.job_key).status)
         self.assertEqual("worker_failed", store.job(job.job_key).error_code)
+
+    def test_old_parent_cannot_reconcile_a_new_worker_claim(self) -> None:
+        store = SemanticJobStore(self.workspace / "semantic_jobs.sqlite3")
+        job = SemanticCompiler(store, _contract()).plan(self.snapshot).jobs[0]
+        old_claim = store.claim_job(job.job_key)
+        store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=old_claim.claim_token,
+            actor="public-old-parent",
+            reason="the first synthetic child has terminated",
+            error_code="first_child_stopped",
+        )
+        new_claim = store.claim_job(job.job_key)
+
+        _reconcile_unverifiable_child(
+            self.workspace,
+            store,
+            old_claim,
+            failure_code="late_old_parent_output",
+        )
+
+        persisted = store.job(job.job_key)
+        self.assertEqual("running", persisted.status)
+        self.assertEqual(new_claim.claim_token, persisted.claim_token)
+        store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=new_claim.claim_token,
+            actor="public-new-parent",
+            reason="the replacement synthetic child has terminated",
+            error_code="replacement_child_stopped",
+        )
+
+    def test_old_parent_cannot_disqualify_a_new_worker_success(self) -> None:
+        store = SemanticJobStore(self.workspace / "semantic_jobs.sqlite3")
+        compiler = SemanticCompiler(store, _contract())
+        job = compiler.plan(self.snapshot).jobs[0]
+        old_claim = store.claim_job(job.job_key)
+        store.reconcile_terminated_claim(
+            job.job_key,
+            claim_token=old_claim.claim_token,
+            actor="public-old-parent",
+            reason="the first synthetic child has terminated",
+            error_code="first_child_stopped",
+        )
+        new_claim = store.claim_job(job.job_key)
+        generation = compiler.execute(
+            self.snapshot,
+            job.job_key,
+            _Provider(),
+            claim_token=new_claim.claim_token,
+        )
+
+        _reconcile_unverifiable_child(
+            self.workspace,
+            store,
+            old_claim,
+            failure_code="late_old_parent_after_new_success",
+        )
+
+        self.assertEqual("succeeded", store.job(job.job_key).status)
+        self.assertNotIn(
+            generation.generation_id, store.disqualified_generation_ids()
+        )
+
+    def test_parent_rejects_open_child_projection_without_token_echo(self) -> None:
+        store = SemanticJobStore(self.workspace / "semantic_jobs.sqlite3")
+        job = SemanticCompiler(store, _contract()).plan(self.snapshot).jobs[0]
+        arguments = SimpleNamespace(
+            job_key=job.job_key,
+            workspace_root=self.workspace,
+            release_root=self.release,
+            identity_evidence=self.identity,
+            credential_source="env",
+            env_variable="QRH_TEST_DEEPSEEK_API_KEY",
+            keyring_service=None,
+            keyring_username=None,
+            timeout_seconds=180.0,
+        )
+        observed_token = ""
+
+        def forged_output(*_args, **kwargs):
+            nonlocal observed_token
+            observed_token = kwargs["env"][_CHILD_CLAIM_ENV]
+            return subprocess.CompletedProcess(
+                "protected-child",
+                0,
+                json.dumps(
+                    {
+                        "schema_version": CLI_SCHEMA,
+                        "command": "execute-one",
+                        "job_key": job.job_key,
+                        "source_text_included": False,
+                        "claim_token": observed_token,
+                    }
+                ),
+                "",
+            )
+
+        with patch(
+            "quant_hub.knowledge.semantic_cli.subprocess.run",
+            side_effect=forged_output,
+        ):
+            with self.assertRaisesRegex(
+                SemanticCLIError, "violated output contract"
+            ) as raised:
+                _execute_one_parent(arguments, self.workspace, store)
+        self.assertEqual("failed_retryable", store.job(job.job_key).status)
+        self.assertNotIn(observed_token, str(raised.exception))
+        self.assertNotIn(
+            observed_token,
+            (self.workspace / "semantic_cli_audit.jsonl").read_text("utf-8"),
+        )
 
     def test_parent_disqualifies_success_with_invalid_child_output(self) -> None:
         store = SemanticJobStore(self.workspace / "semantic_jobs.sqlite3")
@@ -384,9 +510,14 @@ class SemanticCLITests(unittest.TestCase):
         )
         generation = None
 
-        def invalid_output(*_args, **_kwargs):
+        def invalid_output(*_args, **kwargs):
             nonlocal generation
-            generation = compiler.execute(self.snapshot, job.job_key, _Provider())
+            generation = compiler.execute(
+                self.snapshot,
+                job.job_key,
+                _Provider(),
+                claim_token=kwargs["env"][_CHILD_CLAIM_ENV],
+            )
             return subprocess.CompletedProcess(
                 "protected-child", 0, "not-json", ""
             )

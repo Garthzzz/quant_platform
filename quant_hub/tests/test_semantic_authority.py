@@ -4,9 +4,11 @@ from contextlib import closing, redirect_stdout
 import hashlib
 from io import StringIO
 import json
+import multiprocessing
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,38 @@ from quant_hub.ops.semantic_authority import (
     resolve_semantic_authority,
     verify_semantic_authority,
 )
+
+
+def _hold_semantic_promotion_lock(state_root, ready_event) -> None:
+    with semantic_authority._promotion_lock(Path(state_root)):
+        ready_event.set()
+        time.sleep(60)
+
+
+def _compete_for_semantic_promotion_lock(
+    state_root, start_event, release_event, result_queue
+) -> None:
+    start_event.wait(15)
+    try:
+        with semantic_authority._promotion_lock(Path(state_root)):
+            result_queue.put(("claimed",))
+            release_event.wait(15)
+    except SemanticAuthorityError as error:
+        result_queue.put(("rejected", str(error)))
+
+
+def _promote_worker(project_root, state_root, source_path, start_event, result_queue) -> None:
+    start_event.wait(15)
+    try:
+        receipt = promote_semantic_authority(
+            project_root=Path(project_root),
+            state_root=Path(state_root),
+            source_path=Path(source_path),
+            promoted_at="2026-08-21T12:00:00Z",
+        )
+        result_queue.put(("ok", receipt.promotion_id))
+    except Exception as error:
+        result_queue.put((type(error).__name__, str(error)))
 
 
 class SemanticAuthorityPromotionTests(unittest.TestCase):
@@ -53,6 +87,125 @@ class SemanticAuthorityPromotionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.live.close()
         self.temporary.cleanup()
+
+    def test_promotion_lock_is_process_owned_and_recovers_after_kill(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        ready = context.Event()
+        process = context.Process(
+            target=_hold_semantic_promotion_lock,
+            args=(str(self.state), ready),
+        )
+        process.start()
+        self.assertTrue(ready.wait(timeout=20))
+        with self.assertRaisesRegex(
+            SemanticAuthorityError,
+            "another semantic authority promotion is active",
+        ):
+            with semantic_authority._promotion_lock(self.state):
+                self.fail("a competing process acquired the promotion lock")
+
+        process.terminate()
+        process.join(timeout=20)
+        self.assertFalse(process.is_alive())
+        with semantic_authority._promotion_lock(self.state):
+            pass
+        lock_path = self.state / ".semantic_authority_promotion.lock"
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(
+            semantic_authority._PROMOTION_LOCK_MARKER,
+            lock_path.read_bytes(),
+        )
+
+    def test_promotion_lock_rejects_unknown_persistent_identity(self) -> None:
+        lock_path = self.state / ".semantic_authority_promotion.lock"
+        lock_path.write_bytes(b"legacy-or-tampered-lock\n")
+        with self.assertRaisesRegex(
+            SemanticAuthorityError,
+            "promotion lock identity is invalid",
+        ):
+            with semantic_authority._promotion_lock(self.state):
+                self.fail("a tampered persistent lock was accepted")
+
+    def test_promotion_lock_initialization_is_atomic_across_eight_processes(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        release = context.Event()
+        results = context.Queue()
+        processes = tuple(
+            context.Process(
+                target=_compete_for_semantic_promotion_lock,
+                args=(str(self.state), start, release, results),
+            )
+            for _ in range(8)
+        )
+        for process in processes:
+            process.start()
+        start.set()
+        observed = tuple(results.get(timeout=30) for _ in processes)
+        release.set()
+        for process in processes:
+            process.join(timeout=30)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            self.assertEqual(0, process.exitcode)
+        self.assertEqual(1, sum(row[0] == "claimed" for row in observed), observed)
+        self.assertEqual(7, sum(row[0] == "rejected" for row in observed), observed)
+        self.assertTrue(
+            all(
+                row[0] == "claimed"
+                or "another semantic authority promotion is active" in row[1]
+                for row in observed
+            ),
+            observed,
+        )
+
+    def test_first_promotion_receipt_root_is_initialized_under_process_lock(self) -> None:
+        self.live.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        self.live.close()
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        results = context.Queue()
+        processes = tuple(
+            context.Process(
+                target=_promote_worker,
+                args=(
+                    str(self.project),
+                    str(self.state),
+                    str(self.source),
+                    start,
+                    results,
+                ),
+            )
+            for _ in range(8)
+        )
+        for process in processes:
+            process.start()
+        start.set()
+        observed = tuple(results.get(timeout=60) for _ in processes)
+        for process in processes:
+            process.join(timeout=60)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            self.assertEqual(0, process.exitcode)
+        self.assertGreaterEqual(sum(row[0] == "ok" for row in observed), 1)
+        self.assertTrue(
+            all(
+                row[0] == "ok"
+                or (
+                    row[0] == "SemanticAuthorityError"
+                    and "another semantic authority promotion is active" in row[1]
+                )
+                for row in observed
+            ),
+            observed,
+        )
+        self.assertEqual(1, len({row[1] for row in observed if row[0] == "ok"}))
+        receipts = tuple(
+            (self.state / "semantic_promotion_receipts").glob("semprom_*.json")
+        )
+        self.assertEqual(1, len(receipts))
 
     def _insert_job(
         self,
@@ -291,6 +444,201 @@ class SemanticAuthorityPromotionTests(unittest.TestCase):
                 state_root=self.state,
             ),
         )
+
+    def test_first_promotion_replays_replace_before_receipt_crash(self) -> None:
+        with patch.object(
+            semantic_authority,
+            "_write_receipt_immutable",
+            side_effect=OSError("first-receipt-cut"),
+        ):
+            with self.assertRaises(OSError):
+                self._promote()
+        self.assertTrue((self.state / "semantic_jobs.sqlite3").is_file())
+        self.assertEqual(
+            (),
+            tuple((self.state / "semantic_promotion_receipts").glob("*.json")),
+        )
+
+        recovered = self._promote()
+
+        self.assertEqual(
+            recovered,
+            resolve_semantic_authority(
+                project_root=self.project,
+                state_root=self.state,
+            ),
+        )
+
+    def test_retry_cleans_only_canonical_promotion_partials(self) -> None:
+        receipts = self.state / "semantic_promotion_receipts"
+        receipts.mkdir()
+        target_partial = self.state / (
+            "semantic_jobs.sqlite3." + "a" * 32 + ".partial"
+        )
+        receipt_partial = receipts / (
+            "semprom_" + "b" * 40 + ".json." + "c" * 32 + ".partial"
+        )
+        target_partial.write_bytes(b"discardable target partial")
+        receipt_partial.write_bytes(b"discardable receipt partial")
+
+        self._promote()
+
+        self.assertFalse(target_partial.exists())
+        self.assertFalse(receipt_partial.exists())
+
+        unknown = receipts / "unexpected.partial"
+        unknown.write_bytes(b"must not be guessed")
+        with self.assertRaisesRegex(
+            SemanticAuthorityError,
+            "unknown semantic promotion partial",
+        ):
+            self._promote()
+        self.assertTrue(unknown.is_file())
+
+    def test_cross_table_generation_version_mismatch_is_rejected(self) -> None:
+        self._insert_job("job-second", status="succeeded")
+        generation_payload = {
+            "generation_id": "generation-cross-version",
+            "job_key": "job-terminal",
+            "document_version_id": "docv-1",
+            "status": "succeeded",
+            "created_at": "2026-08-21T00:02:00Z",
+        }
+        candidate_payload = {
+            "candidate_id": "candidate-cross-version",
+            "generation_id": "generation-cross-version",
+            "document_version_id": "docv-other",
+            "fact_status": "model_candidate",
+        }
+        encode = lambda value: json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.live.execute(
+            "INSERT INTO knowledge_generation VALUES(?,?,?,?,?,?)",
+            (
+                "generation-cross-version",
+                "job-terminal",
+                "docv-1",
+                encode(generation_payload),
+                "succeeded",
+                "2026-08-21T00:02:00Z",
+            ),
+        )
+        self.live.execute(
+            "INSERT INTO knowledge_candidate VALUES(?,?,?,?,?,?)",
+            (
+                "candidate-cross-version",
+                "generation-cross-version",
+                "docv-other",
+                encode(candidate_payload),
+                "model_candidate",
+                "2026-08-21T00:02:00Z",
+            ),
+        )
+        self.live.commit()
+
+        with self.assertRaisesRegex(
+            SemanticAuthorityError,
+            "candidate.*generation version",
+        ):
+            self._promote()
+        self.assertFalse((self.state / "semantic_jobs.sqlite3").exists())
+
+    def test_nonterminal_generation_and_nonformal_effective_state_are_rejected(self) -> None:
+        encode = lambda value: json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        running_generation = {
+            "generation_id": "generation-running",
+            "job_key": "job-terminal",
+            "document_version_id": "docv-1",
+            "status": "running",
+            "created_at": "2026-08-21T00:02:00Z",
+        }
+        self.live.execute(
+            "INSERT INTO knowledge_generation VALUES(?,?,?,?,?,?)",
+            (
+                "generation-running",
+                "job-terminal",
+                "docv-1",
+                encode(running_generation),
+                "running",
+                "2026-08-21T00:02:00Z",
+            ),
+        )
+        self.live.commit()
+        with self.assertRaisesRegex(
+            SemanticAuthorityError, "generation.*unknown"
+        ):
+            self._promote()
+
+        self.live.execute(
+            "DELETE FROM knowledge_generation WHERE generation_id='generation-running'"
+        )
+        item_payload = {
+            "knowledge_item_id": "formal-item-invalid-state",
+            "document_version_id": "docv-1",
+            "fact_status": "source_explicit",
+        }
+        self.live.execute(
+            "INSERT INTO knowledge_item VALUES(?,?,?,?,?)",
+            (
+                "formal-item-invalid-state",
+                "docv-1",
+                encode(item_payload),
+                "source_explicit",
+                "2026-08-21T00:03:00Z",
+            ),
+        )
+        self.live.execute(
+            "INSERT INTO knowledge_item_state VALUES(?,?,?,?,?)",
+            (
+                "formal-item-invalid-state",
+                "model_candidate",
+                None,
+                None,
+                "2026-08-21T00:03:00Z",
+            ),
+        )
+        self.live.commit()
+        with self.assertRaisesRegex(
+            SemanticAuthorityError, "item_state.*unknown"
+        ):
+            self._promote()
+
+    def test_formal_item_missing_effective_state_is_rejected(self) -> None:
+        payload = json.dumps(
+            {
+                "knowledge_item_id": "formal-item-missing-state",
+                "document_version_id": "docv-1",
+                "fact_status": "source_explicit",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self.live.execute(
+            "INSERT INTO knowledge_item VALUES(?,?,?,?,?)",
+            (
+                "formal-item-missing-state",
+                "docv-1",
+                payload,
+                "source_explicit",
+                "2026-08-21T00:03:00Z",
+            ),
+        )
+        self.live.commit()
+        with self.assertRaisesRegex(
+            SemanticAuthorityError, "missing its effective state"
+        ):
+            self._promote()
+        self.assertFalse((self.state / "semantic_jobs.sqlite3").exists())
 
     def test_target_or_receipt_tamper_is_detected(self) -> None:
         receipt = self._promote()
