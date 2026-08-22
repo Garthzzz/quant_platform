@@ -65,6 +65,12 @@ where = ["src"]
 ]
 "quant_hub.presentation" = ["*.json", "supplements/**/*.md"]
 
+[tool.setuptools.exclude-package-data]
+# Reviewed citation mappings are sealed production business data.  They may be
+# present in a developer or release-materialization tree, but a Public wheel
+# must never inherit them through the broad presentation JSON pattern above.
+"quant_hub.presentation" = ["citation_projection_overrides.json"]
+
 [tool.setuptools.data-files]
 "migrations/platform" = ["migrations/platform/*.sql"]
 "migrations/archive" = ["migrations/archive/*.sql"]

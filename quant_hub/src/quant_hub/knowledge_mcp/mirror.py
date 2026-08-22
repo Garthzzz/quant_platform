@@ -23,12 +23,21 @@ from quant_hub.config import (
     stat_is_reparse_point,
 )
 from quant_hub.knowledge.contracts import BaseSnapshot, canonical_json, content_hash
+from quant_hub.knowledge.citations import (
+    CITATION_PROJECTION_SCHEMA,
+    CitationAttribution,
+    CitationProjection,
+    citation_attributions_for_binding as projected_citation_attributions_for_binding,
+    citation_ids_for_chunk as projected_citation_ids_for_chunk,
+    is_valid_citation_gap,
+)
 from quant_hub.knowledge.retrieval import (
     ArtifactKnowledgeIndex,
     KnowledgeIndex,
-    citation_ids_for_evidence_bindings,
+    citation_attributions_for_evidence_binding,
 )
 from quant_hub.knowledge.semantic import EnrichedSnapshot, KnowledgeGeneration
+from quant_hub.evidence.ids import citation_id_for_marker, validate_citation_id
 from quant_hub.ops.release_identity import (
     manifest_sha256,
     validate_active_release,
@@ -37,6 +46,7 @@ from quant_hub.ops.release_identity import (
 
 
 SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v2"
+CITATION_SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v3"
 LEGACY_SEARCH_ARTIFACT_SCHEMA = "qrh-mcp-search-artifact/v1"
 MIRROR_METADATA_SCHEMA = "qrh-user-knowledge-mirror/v1"
 MIRROR_POINTER_SCHEMA = "qrh-user-mirror-pointer/v1"
@@ -205,11 +215,78 @@ def _heading_labels(ir: object, heading_path: Sequence[str]) -> list[str]:
     ]
 
 
+def _native_citation_references(snapshot: BaseSnapshot) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for version_id, ir in sorted(snapshot.ir_documents.items()):
+        for block in ir.blocks:
+            for span in block.spans:
+                if span.kind != "citation" or "citation_id" not in span.attributes:
+                    continue
+                citation_id = str(span.attributes["citation_id"])
+                try:
+                    validate_citation_id(citation_id)
+                except ValueError as error:
+                    raise MirrorError("native citation reference ID is not canonical") from error
+                marker_bytes = span.text.encode("utf-8")
+                expected_marker = f"^src:{{{citation_id}}}"
+                if (
+                    span.text != expected_marker
+                    or span.attributes.get("locator_precision") != "exact"
+                    or hashlib.sha256(marker_bytes).hexdigest() != span.text_sha256
+                    or span.source_sha256 != snapshot.versions[version_id].source_sha256
+                ):
+                    raise MirrorError("native citation reference locator is invalid")
+                rows.append(
+                    {
+                        "citation_id": citation_id,
+                        "document_version_id": version_id,
+                        "source_sha256": span.source_sha256,
+                        "containing_span_id": block.source_span.span_id,
+                        "line_start": span.line_start,
+                        "line_end": span.line_end,
+                        "byte_start": span.byte_start,
+                        "byte_end": span.byte_end,
+                        "raw_marker_text": span.text,
+                        "raw_marker_sha256": span.text_sha256,
+                    }
+                )
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row["source_sha256"]),
+            str(row["document_version_id"]),
+            int(row["byte_start"]),
+            int(row["byte_end"]),
+            str(row["citation_id"]),
+        ),
+    )
+
+
+def _merge_attributions(
+    *groups: Sequence[CitationAttribution],
+) -> list[dict[str, object]]:
+    selected: dict[str, CitationAttribution] = {}
+    candidates = sorted(
+        (row for group in groups for row in group),
+        key=lambda row: (
+            row.citation_id,
+            0 if row.relation == "contained" else 1,
+            len(row.gap_text.encode("utf-8")),
+            row.anchor_byte_end,
+            row.gap_text,
+        ),
+    )
+    for row in candidates:
+        selected.setdefault(row.citation_id, row)
+    return [selected[citation_id].to_dict() for citation_id in sorted(selected)]
+
+
 def build_search_artifact(
     snapshot: BaseSnapshot,
     *,
     enriched: EnrichedSnapshot | None = None,
     generations: Sequence[KnowledgeGeneration] = (),
+    citation_projection: CitationProjection | None = None,
 ) -> bytes:
     """Serialize rebuildable current/history evidence without release identity.
 
@@ -220,6 +297,11 @@ def build_search_artifact(
 
     if enriched is not None and enriched.base_snapshot_id != snapshot.snapshot_id:
         raise MirrorError("enriched knowledge belongs to another deterministic snapshot")
+    if (
+        citation_projection is not None
+        and citation_projection.base_snapshot_id != snapshot.snapshot_id
+    ):
+        raise MirrorError("citation projection belongs to another deterministic snapshot")
     artifact_snapshot_id = enriched.snapshot_id if enriched is not None else snapshot.snapshot_id
     knowledge_status = (
         enriched.knowledge_status_membership
@@ -263,14 +345,27 @@ def build_search_artifact(
     chunks = []
     for chunk_id, chunk in sorted(snapshot.chunks.items()):
         ir = snapshot.ir_documents[chunk.document_version_id]
+        native_citation_ids = {
+            str(span.attributes["citation_id"])
+            for block in ir.blocks
+            if block.source_span.span_id in chunk.ordered_span_ids
+            for span in block.spans
+            if span.kind == "citation"
+            and "citation_id" in span.attributes
+            and chunk.byte_start <= span.byte_start
+            and span.byte_end <= chunk.byte_end
+        }
         citation_ids = sorted(
-            {
-                str(span.attributes["citation_id"])
-                for block in ir.blocks
-                if block.source_span.span_id in chunk.ordered_span_ids
-                for span in block.spans
-                if span.kind == "citation" and "citation_id" in span.attributes
-            }
+            native_citation_ids
+            | (
+                set(
+                    projected_citation_ids_for_chunk(
+                        citation_projection, chunk.document_version_id, chunk
+                    )
+                )
+                if citation_projection is not None
+                else set()
+            )
         )
         chunks.append(
             {
@@ -413,15 +508,30 @@ def build_search_artifact(
                 ),
                 [],
             )
-            source_citations = [
-                {
+            source_citations = []
+            for binding, locator in zip(item.evidence, locators, strict=True):
+                native_attributions = citation_attributions_for_evidence_binding(
+                    ir, binding
+                )
+                projected_attributions = (
+                    projected_citation_attributions_for_binding(
+                        citation_projection, version_id, binding
+                    )
+                    if citation_projection is not None
+                    else ()
+                )
+                attributions = _merge_attributions(
+                    native_attributions, projected_attributions
+                )
+                member = {
                     "source_locator": locator,
-                    "citation_ids": list(
-                        citation_ids_for_evidence_bindings(ir, (binding,))
-                    ),
+                    "citation_ids": [
+                        row["citation_id"] for row in attributions
+                    ],
                 }
-                for binding, locator in zip(item.evidence, locators, strict=True)
-            ]
+                if citation_projection is not None:
+                    member["citation_attributions"] = attributions
+                source_citations.append(member)
             citation_ids = sorted(
                 {
                     citation_id
@@ -454,23 +564,88 @@ def build_search_artifact(
                     "accepted_by": item.accepted_by,
                 }
             )
-    with KnowledgeIndex(snapshot, enriched) as retrieval_index:
+    with KnowledgeIndex(
+        snapshot, enriched, citation_projection=citation_projection
+    ) as retrieval_index:
         retrieval = retrieval_index.export_artifact_records()
+    citations = (
+        [row.to_dict() for row in citation_projection.occurrences]
+        if citation_projection is not None
+        else []
+    )
+    citation_identity = (
+        citation_projection.identity_dict()
+        if citation_projection is not None
+        else None
+    )
+    native_citation_references = (
+        _native_citation_references(snapshot)
+        if citation_projection is not None
+        else []
+    )
+    citation_source_material: list[dict[str, object]] = []
+    if citation_projection is not None:
+        relevant_spans: dict[str, set[str]] = {}
+        for row in native_citation_references:
+            relevant_spans.setdefault(
+                str(row["document_version_id"]), set()
+            ).add(str(row["containing_span_id"]))
+        for version_id, version in sorted(snapshot.versions.items()):
+            for row in citation_projection.for_version(version_id):
+                if row.source_sha256 == version.source_sha256:
+                    relevant_spans.setdefault(version_id, set()).update(
+                        row.containing_span_ids
+                    )
+        for version_id, span_ids in sorted(relevant_spans.items()):
+            for block in snapshot.ir_documents[version_id].blocks:
+                span = block.source_span
+                if span.span_id not in span_ids:
+                    continue
+                citation_source_material.append(
+                    {
+                        "document_version_id": version_id,
+                        "source_sha256": span.source_sha256,
+                        "span_id": span.span_id,
+                        "kind": span.kind,
+                        "byte_start": span.byte_start,
+                        "byte_end": span.byte_end,
+                        "source_text": span.text,
+                        "source_text_sha256": span.text_sha256,
+                        "attributes": json.loads(canonical_json(span.attributes)),
+                    }
+                )
+        citation_source_material.sort(
+            key=lambda row: (
+                str(row["source_sha256"]),
+                str(row["document_version_id"]),
+                int(row["byte_start"]),
+                int(row["byte_end"]),
+                str(row["span_id"]),
+            )
+        )
+    canonical_members: dict[str, object] = {
+        "documents": documents,
+        "versions": versions,
+        "chunks": chunks,
+        "knowledge": sorted(
+            knowledge_rows,
+            key=lambda row: str(row.get("knowledge_item_id") or ""),
+        ),
+    }
+    if citation_projection is not None:
+        canonical_members["citation_projection"] = citation_identity
+        canonical_members["citations"] = citations
+        canonical_members["native_citation_references"] = native_citation_references
+        canonical_members["citation_source_material"] = citation_source_material
     retrieval["canonical_membership_sha256"] = hashlib.sha256(
-        canonical_json(
-            {
-                "documents": documents,
-                "versions": versions,
-                "chunks": chunks,
-                "knowledge": sorted(
-                    knowledge_rows,
-                    key=lambda row: str(row.get("knowledge_item_id") or ""),
-                ),
-            }
-        ).encode("utf-8")
+        canonical_json(canonical_members).encode("utf-8")
     ).hexdigest()
     payload = {
-        "schema_version": SEARCH_ARTIFACT_SCHEMA,
+        "schema_version": (
+            CITATION_SEARCH_ARTIFACT_SCHEMA
+            if citation_projection is not None
+            else SEARCH_ARTIFACT_SCHEMA
+        ),
         "snapshot_id": artifact_snapshot_id,
         "knowledge_identity": (
             {
@@ -492,29 +667,57 @@ def build_search_artifact(
             knowledge_rows, key=lambda row: str(row.get("knowledge_item_id") or "")
         ),
     }
+    if citation_projection is not None:
+        payload["citation_projection"] = citation_identity
+        payload["citations"] = citations
+        payload["native_citation_references"] = native_citation_references
+        payload["citation_source_material"] = citation_source_material
     return canonical_json(payload).encode("utf-8")
 
 
 def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Mapping[str, Any]:
     if not isinstance(value, dict):
         raise MirrorError("search artifact must be an object")
-    if set(value) != {
+    schema_version = value.get("schema_version")
+    current_fields = {
         "schema_version",
         "snapshot_id",
+        "citation_projection",
+        "citations",
+        "native_citation_references",
+        "citation_source_material",
         "knowledge_identity",
         "retrieval",
         "documents",
         "versions",
         "chunks",
         "knowledge",
-    }:
+    }
+    legacy_fields = current_fields - {
+        "citation_projection",
+        "citations",
+        "native_citation_references",
+        "citation_source_material",
+    }
+    if (
+        schema_version == CITATION_SEARCH_ARTIFACT_SCHEMA
+        and set(value) != current_fields
+    ) or (
+        schema_version in {
+            LEGACY_SEARCH_ARTIFACT_SCHEMA,
+            SEARCH_ARTIFACT_SCHEMA,
+        }
+        and set(value) != legacy_fields
+    ):
         raise MirrorError("search artifact fields are not closed")
-    if value["schema_version"] not in {
+    if schema_version not in {
         LEGACY_SEARCH_ARTIFACT_SCHEMA,
         SEARCH_ARTIFACT_SCHEMA,
+        CITATION_SEARCH_ARTIFACT_SCHEMA,
     }:
         raise MirrorError("unsupported search artifact schema")
-    legacy_v1 = value["schema_version"] == LEGACY_SEARCH_ARTIFACT_SCHEMA
+    legacy_v1 = schema_version == LEGACY_SEARCH_ARTIFACT_SCHEMA
+    has_projection_contract = schema_version == CITATION_SEARCH_ARTIFACT_SCHEMA
     if value["snapshot_id"] != expected_snapshot_id:
         raise MirrorError("search artifact snapshot identity mismatch")
     identity = value["knowledge_identity"]
@@ -546,6 +749,20 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
     for key in ("documents", "versions", "chunks", "knowledge"):
         if not isinstance(value[key], list):
             raise MirrorError(f"search artifact {key} must be a list")
+    raw_citations = value["citations"] if has_projection_contract else []
+    raw_native_citations = (
+        value["native_citation_references"] if has_projection_contract else []
+    )
+    raw_citation_source_material = (
+        value["citation_source_material"] if has_projection_contract else []
+    )
+    citation_projection = value["citation_projection"] if has_projection_contract else None
+    if not isinstance(raw_citations, list):
+        raise MirrorError("search artifact citations must be a list")
+    if not isinstance(raw_native_citations, list):
+        raise MirrorError("search artifact native citations must be a list")
+    if not isinstance(raw_citation_source_material, list):
+        raise MirrorError("search artifact citation source material must be a list")
     document_fields = {
         "document_id",
         "research_id",
@@ -635,14 +852,462 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
             raise MirrorError("search artifact version/document membership is invalid")
         if version.get("is_current") is True and document.get("active_version_id") != version_id:
             raise MirrorError("search artifact current version membership is invalid")
+    citation_fields = {
+        "citation_id",
+        "source_sha256",
+        "containing_span_ids",
+        "line_start",
+        "line_end",
+        "byte_start",
+        "byte_end",
+        "raw_marker_text",
+        "raw_marker_sha256",
+        "occurrence_kind",
+        "resolution_state",
+        "authority_kind",
+    }
+    citations: dict[str, dict[str, Any]] = {}
+    for raw in raw_citations:
+        if not isinstance(raw, dict) or set(raw) != citation_fields:
+            raise MirrorError("search artifact citation row fields are not closed")
+        citation_id = raw.get("citation_id")
+        source_sha256 = raw.get("source_sha256")
+        marker = raw.get("raw_marker_text")
+        byte_start = raw.get("byte_start")
+        byte_end = raw.get("byte_end")
+        if (
+            not isinstance(citation_id, str)
+            or citation_id in citations
+            or not isinstance(source_sha256, str)
+            or not _SHA256.fullmatch(source_sha256)
+            or not isinstance(marker, str)
+            or type(byte_start) is not int
+            or type(byte_end) is not int
+            or not 0 <= byte_start < byte_end
+            or type(raw.get("line_start")) is not int
+            or type(raw.get("line_end")) is not int
+            or not 1 <= raw["line_start"] <= raw["line_end"]
+            or not isinstance(raw.get("containing_span_ids"), list)
+            or not raw["containing_span_ids"]
+            or any(
+                not isinstance(span_id, str) or not span_id
+                for span_id in raw["containing_span_ids"]
+            )
+            or raw["containing_span_ids"]
+            != sorted(set(raw["containing_span_ids"]))
+            or not isinstance(raw.get("occurrence_kind"), str)
+            or not raw["occurrence_kind"]
+            or raw.get("resolution_state") != "valid"
+            or raw.get("authority_kind")
+            not in {"evidence_binding", "reviewed_overlay"}
+        ):
+            raise MirrorError("search artifact citation identity is invalid")
+        marker_bytes = marker.encode("utf-8")
+        try:
+            validate_citation_id(citation_id)
+        except ValueError as error:
+            raise MirrorError("search artifact citation ID is not canonical") from error
+        if (
+            raw.get("raw_marker_sha256")
+            != hashlib.sha256(marker_bytes).hexdigest()
+            or citation_id
+            != citation_id_for_marker(
+                source_sha256, byte_start, byte_end, marker_bytes
+            )
+        ):
+            raise MirrorError("search artifact citation marker identity is invalid")
+        if not any(
+            version["source_sha256"] == source_sha256
+            and byte_end <= version["source_bytes"]
+            for version in versions.values()
+        ):
+            raise MirrorError("search artifact citation escapes source identity")
+        citations[citation_id] = raw
+    native_fields = {
+        "citation_id",
+        "document_version_id",
+        "source_sha256",
+        "containing_span_id",
+        "line_start",
+        "line_end",
+        "byte_start",
+        "byte_end",
+        "raw_marker_text",
+        "raw_marker_sha256",
+    }
+    native_citations: list[dict[str, Any]] = []
+    native_keys: set[tuple[str, str, int, int]] = set()
+    for raw in raw_native_citations:
+        if not isinstance(raw, dict) or set(raw) != native_fields:
+            raise MirrorError("native citation reference fields are not closed")
+        citation_id = raw.get("citation_id")
+        version_id = raw.get("document_version_id")
+        version = versions.get(str(version_id))
+        marker = raw.get("raw_marker_text")
+        byte_start = raw.get("byte_start")
+        byte_end = raw.get("byte_end")
+        key = (str(citation_id), str(version_id), int(byte_start or -1), int(byte_end or -1))
+        expected_marker = (
+            f"^src:{{{citation_id}}}" if isinstance(citation_id, str) else None
+        )
+        if (
+            not isinstance(citation_id, str)
+            or not isinstance(version_id, str)
+            or version is None
+            or not isinstance(marker, str)
+            or marker != expected_marker
+            or type(byte_start) is not int
+            or type(byte_end) is not int
+            or not 0 <= byte_start < byte_end <= version["source_bytes"]
+            or raw.get("source_sha256") != version["source_sha256"]
+            or not isinstance(raw.get("containing_span_id"), str)
+            or not raw["containing_span_id"]
+            or type(raw.get("line_start")) is not int
+            or type(raw.get("line_end")) is not int
+            or not 1 <= raw["line_start"] <= raw["line_end"]
+            or raw.get("raw_marker_sha256")
+            != hashlib.sha256(marker.encode("utf-8")).hexdigest()
+            or key in native_keys
+        ):
+            raise MirrorError("native citation reference identity is invalid")
+        try:
+            validate_citation_id(citation_id)
+        except ValueError as error:
+            raise MirrorError("native citation reference ID is not canonical") from error
+        native_keys.add(key)
+        native_citations.append(raw)
+    expected_native_order = sorted(
+        native_citations,
+        key=lambda row: (
+            row["source_sha256"],
+            row["document_version_id"],
+            row["byte_start"],
+            row["byte_end"],
+            row["citation_id"],
+        ),
+    )
+    if raw_native_citations != expected_native_order:
+        raise MirrorError("native citation reference order is not canonical")
+    source_material_fields = {
+        "document_version_id",
+        "source_sha256",
+        "span_id",
+        "kind",
+        "byte_start",
+        "byte_end",
+        "source_text",
+        "source_text_sha256",
+        "attributes",
+    }
+
+    def is_closed_json(value: object) -> bool:
+        if value is None or type(value) in {bool, int, float, str}:
+            try:
+                canonical_json(value)
+            except (TypeError, ValueError):
+                return False
+            return True
+        if type(value) is list:
+            return all(is_closed_json(member) for member in value)
+        if type(value) is dict:
+            return all(
+                type(key) is str and is_closed_json(member)
+                for key, member in value.items()
+            )
+        return False
+
+    source_material_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in raw_citation_source_material:
+        if not isinstance(raw, dict) or set(raw) != source_material_fields:
+            raise MirrorError("citation source material fields are not closed")
+        version_id = raw.get("document_version_id")
+        span_id = raw.get("span_id")
+        version = versions.get(str(version_id))
+        source_text = raw.get("source_text")
+        source_text_sha256 = raw.get("source_text_sha256")
+        kind = raw.get("kind")
+        attributes = raw.get("attributes")
+        byte_start = raw.get("byte_start")
+        byte_end = raw.get("byte_end")
+        key = (str(version_id), str(span_id))
+        expected_span_id = (
+            "spn_"
+            + content_hash(
+                "qrh-source-span/v1",
+                {
+                    "document_version_id": version_id,
+                    "kind": kind,
+                    "byte_start": byte_start,
+                    "byte_end": byte_end,
+                    "text_sha256": source_text_sha256,
+                    "attributes": attributes,
+                },
+            )[:32]
+            if isinstance(version_id, str)
+            and isinstance(kind, str)
+            and kind
+            and type(byte_start) is int
+            and type(byte_end) is int
+            and isinstance(source_text_sha256, str)
+            and _SHA256.fullmatch(source_text_sha256)
+            and type(attributes) is dict
+            and is_closed_json(attributes)
+            else None
+        )
+        if (
+            not isinstance(version_id, str)
+            or version is None
+            or not isinstance(span_id, str)
+            or not span_id
+            or span_id != expected_span_id
+            or raw.get("source_sha256") != version["source_sha256"]
+            or type(byte_start) is not int
+            or type(byte_end) is not int
+            or not 0 <= byte_start < byte_end <= version["source_bytes"]
+            or not isinstance(source_text, str)
+            or len(source_text.encode("utf-8")) != byte_end - byte_start
+            or source_text_sha256
+            != hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            or key in source_material_by_key
+        ):
+            raise MirrorError("citation source material identity is invalid")
+        source_material_by_key[key] = raw
+    expected_source_material_order = sorted(
+        raw_citation_source_material,
+        key=lambda row: (
+            row["source_sha256"],
+            row["document_version_id"],
+            row["byte_start"],
+            row["byte_end"],
+            row["span_id"],
+        ),
+    )
+    if raw_citation_source_material != expected_source_material_order:
+        raise MirrorError("citation source material order is not canonical")
+    required_source_material: set[tuple[str, str]] = {
+        (str(row["document_version_id"]), str(row["containing_span_id"]))
+        for row in native_citations
+    }
+    for citation in citations.values():
+        for version_id, version in versions.items():
+            if (
+                version.get("is_current") is True
+                and version["source_sha256"] == citation["source_sha256"]
+            ):
+                required_source_material.update(
+                    (version_id, str(span_id))
+                    for span_id in citation["containing_span_ids"]
+                )
+    if set(source_material_by_key) != required_source_material:
+        raise MirrorError("citation source material membership is invalid")
+    structurally_referenced_material: set[tuple[str, str]] = {
+        (str(row["document_version_id"]), str(span_id))
+        for row in chunks.values()
+        if isinstance(row.get("document_version_id"), str)
+        and isinstance(row.get("ordered_span_ids"), list)
+        for span_id in row["ordered_span_ids"]
+        if isinstance(span_id, str)
+    }
+    structurally_referenced_material.update(
+        (str(row["document_version_id"]), str(row["containing_span_id"]))
+        for row in native_citations
+    )
+    for row in knowledge.values():
+        version_id = row.get("document_version_id")
+        locators = row.get("source_locators")
+        if not isinstance(version_id, str) or not isinstance(locators, list):
+            continue
+        for locator in locators:
+            if not isinstance(locator, dict):
+                continue
+            locator_span_ids = locator.get("span_ids")
+            if isinstance(locator_span_ids, list):
+                structurally_referenced_material.update(
+                    (version_id, span_id)
+                    for span_id in locator_span_ids
+                    if isinstance(span_id, str)
+                )
+            locator_span_id = locator.get("span_id")
+            if isinstance(locator_span_id, str):
+                structurally_referenced_material.add((version_id, locator_span_id))
+    if not set(source_material_by_key).issubset(structurally_referenced_material):
+        raise MirrorError("citation source material is structurally orphaned")
+
+    def marker_matches_source_material(
+        *,
+        version_id: str,
+        span_id: str,
+        byte_start: int,
+        byte_end: int,
+        marker: str,
+    ) -> bool:
+        material = source_material_by_key.get((version_id, span_id))
+        if (
+            material is None
+            or not material["byte_start"]
+            <= byte_start
+            < byte_end
+            <= material["byte_end"]
+        ):
+            return False
+        raw = material["source_text"].encode("utf-8")
+        relative_start = byte_start - material["byte_start"]
+        relative_end = byte_end - material["byte_start"]
+        return raw[relative_start:relative_end] == marker.encode("utf-8")
+
+    for row in native_citations:
+        if not marker_matches_source_material(
+            version_id=str(row["document_version_id"]),
+            span_id=str(row["containing_span_id"]),
+            byte_start=int(row["byte_start"]),
+            byte_end=int(row["byte_end"]),
+            marker=str(row["raw_marker_text"]),
+        ):
+            raise MirrorError("native citation differs from canonical source material")
+    for citation in citations.values():
+        if not any(
+            marker_matches_source_material(
+                version_id=version_id,
+                span_id=str(span_id),
+                byte_start=int(citation["byte_start"]),
+                byte_end=int(citation["byte_end"]),
+                marker=str(citation["raw_marker_text"]),
+            )
+            for version_id, version in versions.items()
+            if version.get("is_current") is True
+            and version["source_sha256"] == citation["source_sha256"]
+            for span_id in citation["containing_span_ids"]
+        ):
+            raise MirrorError("projected citation differs from canonical source material")
+    ordered_citations = sorted(
+        citations.values(),
+        key=lambda row: (
+            row["source_sha256"],
+            row["byte_start"],
+            row["byte_end"],
+            row["citation_id"],
+        ),
+    )
+    if raw_citations != ordered_citations:
+        raise MirrorError("search artifact citation order is not canonical")
+    previous_by_source: dict[str, tuple[int, int]] = {}
+    for row in ordered_citations:
+        previous = previous_by_source.get(str(row["source_sha256"]))
+        if previous is not None and int(row["byte_start"]) < previous[1]:
+            raise MirrorError("search artifact citation projection overlaps")
+        previous_by_source[str(row["source_sha256"])] = (
+            int(row["byte_start"]),
+            int(row["byte_end"]),
+        )
+    if has_projection_contract:
+        if citation_projection is None:
+            raise MirrorError("search artifact citations lack projection identity")
+        else:
+            projection_fields = {
+                "schema_version",
+                "base_snapshot_id",
+                "evidence_database_sha256",
+                "evidence_migration_authority_sha256",
+                "reviewed_overlay_manifest_sha256",
+                "active_source_membership",
+                "occurrence_count",
+                "rejected_overlap_count",
+                "membership_sha256",
+            }
+            if (
+                not isinstance(citation_projection, dict)
+                or set(citation_projection) != projection_fields
+                or citation_projection.get("schema_version")
+                != CITATION_PROJECTION_SCHEMA
+                or not _SHA256.fullmatch(
+                    str(citation_projection.get("evidence_database_sha256") or "")
+                )
+                or not _SHA256.fullmatch(
+                    str(
+                        citation_projection.get(
+                            "evidence_migration_authority_sha256"
+                        )
+                        or ""
+                    )
+                )
+                or not _SHA256.fullmatch(
+                    str(
+                        citation_projection.get("reviewed_overlay_manifest_sha256")
+                        or ""
+                    )
+                )
+                or not _SHA256.fullmatch(
+                    str(citation_projection.get("membership_sha256") or "")
+                )
+                or type(citation_projection.get("occurrence_count")) is not int
+                or citation_projection["occurrence_count"] != len(citations)
+                or type(citation_projection.get("rejected_overlap_count")) is not int
+                or citation_projection["rejected_overlap_count"] < 0
+                or not isinstance(
+                    citation_projection.get("active_source_membership"), dict
+                )
+            ):
+                raise MirrorError("search artifact citation projection identity is invalid")
+            expected_base = (
+                identity["base_snapshot_id"] if identity is not None else expected_snapshot_id
+            )
+            active_membership = {
+                version_id: str(version["source_sha256"])
+                for version_id, version in sorted(versions.items())
+                if version.get("is_current") is True
+            }
+            if (
+                citation_projection["base_snapshot_id"] != expected_base
+                or citation_projection["active_source_membership"] != active_membership
+            ):
+                raise MirrorError("search artifact citation active membership is invalid")
+            expected_projection_hash = content_hash(
+                CITATION_PROJECTION_SCHEMA,
+                {
+                    "schema_version": CITATION_PROJECTION_SCHEMA,
+                    "base_snapshot_id": expected_base,
+                    "evidence_database_sha256": citation_projection[
+                        "evidence_database_sha256"
+                    ],
+                    "evidence_migration_authority_sha256": citation_projection[
+                        "evidence_migration_authority_sha256"
+                    ],
+                    "reviewed_overlay_manifest_sha256": citation_projection[
+                        "reviewed_overlay_manifest_sha256"
+                    ],
+                    "active_source_membership": active_membership,
+                    "occurrences": ordered_citations,
+                    "rejected_overlap_count": citation_projection[
+                        "rejected_overlap_count"
+                    ],
+                },
+            )
+            if citation_projection["membership_sha256"] != expected_projection_hash:
+                raise MirrorError("search artifact citation membership hash is invalid")
     for chunk in chunks.values():
         version = versions.get(str(chunk["document_version_id"]))
         if version is None or version["document_id"] != chunk["document_id"]:
             raise MirrorError("search artifact chunk membership is invalid")
+        chunk_text = chunk.get("text")
+        chunk_text_bytes = (
+            chunk_text.encode("utf-8") if isinstance(chunk_text, str) else None
+        )
         if (
             not isinstance(chunk["byte_start"], int)
             or not isinstance(chunk["byte_end"], int)
             or not 0 <= chunk["byte_start"] <= chunk["byte_end"] <= version["source_bytes"]
+            or chunk_text_bytes is None
+            or len(chunk_text_bytes) > chunk["byte_end"] - chunk["byte_start"]
+            or chunk.get("content_sha256")
+            != hashlib.sha256(chunk_text_bytes).hexdigest()
+            or not isinstance(chunk.get("ordered_span_ids"), list)
+            or not chunk["ordered_span_ids"]
+            or any(
+                not isinstance(span_id, str) or not span_id
+                for span_id in chunk["ordered_span_ids"]
+            )
+            or chunk["ordered_span_ids"]
+            != list(dict.fromkeys(chunk["ordered_span_ids"]))
             or any(
                 not isinstance(chunk[field], list)
                 or any(not isinstance(value, str) or not value for value in chunk[field])
@@ -650,6 +1315,70 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
             )
         ):
             raise MirrorError("search artifact chunk byte range is invalid")
+        if has_projection_contract and citation_projection is not None:
+            expected_chunk_citations = sorted(
+                {
+                    citation_id
+                    for citation_id, citation in citations.items()
+                    if citation["source_sha256"] == version["source_sha256"]
+                    and chunk["byte_start"] <= citation["byte_start"]
+                    and citation["byte_end"] <= chunk["byte_end"]
+                }
+                | {
+                    str(citation["citation_id"])
+                    for citation in native_citations
+                    if citation["document_version_id"]
+                    == chunk["document_version_id"]
+                    and citation["containing_span_id"] in chunk["ordered_span_ids"]
+                    and chunk["byte_start"] <= citation["byte_start"]
+                    and citation["byte_end"] <= chunk["byte_end"]
+                }
+            )
+            if chunk["citation_ids"] != expected_chunk_citations:
+                raise MirrorError("search artifact chunk citation membership is invalid")
+
+    def canonical_chunk_source_slice(
+        *,
+        version_id: str,
+        span_id: str,
+        byte_start: int,
+        byte_end: int,
+    ) -> bytes:
+        matching_chunks = [
+            chunk
+            for chunk in chunks.values()
+            if chunk["document_version_id"] == version_id
+            and chunk.get("retrievable") is True
+            and span_id in chunk["ordered_span_ids"]
+            and chunk["byte_start"] <= byte_start <= byte_end <= chunk["byte_end"]
+        ]
+        if matching_chunks:
+            narrowest = min(
+                chunk["byte_end"] - chunk["byte_start"]
+                for chunk in matching_chunks
+            )
+            matching_chunks = [
+                chunk
+                for chunk in matching_chunks
+                if chunk["byte_end"] - chunk["byte_start"] == narrowest
+            ]
+        material = source_material_by_key.get((version_id, span_id))
+        if (
+            len(matching_chunks) > 1
+            or material is None
+            or not material["byte_start"]
+            <= byte_start
+            <= byte_end
+            <= material["byte_end"]
+        ):
+            raise MirrorError(
+                "formal knowledge citation lacks unique canonical source material"
+            )
+        raw = material["source_text"].encode("utf-8")
+        relative_start = byte_start - material["byte_start"]
+        relative_end = byte_end - material["byte_start"]
+        return raw[relative_start:relative_end]
+
     if identity is None and knowledge:
         raise MirrorError("deterministic-only artifact cannot contain formal knowledge")
     status_membership = identity["knowledge_status_membership"] if identity else {}
@@ -707,9 +1436,12 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
                 raise MirrorError("formal knowledge source citation membership is invalid")
             citation_union: set[str] = set()
             for locator, member in zip(locators, source_citations, strict=True):
+                expected_member_fields = {"source_locator", "citation_ids"}
+                if has_projection_contract:
+                    expected_member_fields.add("citation_attributions")
                 if (
                     not isinstance(member, dict)
-                    or set(member) != {"source_locator", "citation_ids"}
+                    or set(member) != expected_member_fields
                     or member["source_locator"] != locator
                     or not isinstance(member["citation_ids"], list)
                     or any(
@@ -720,6 +1452,136 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
                     != sorted(set(member["citation_ids"]))
                 ):
                     raise MirrorError("formal knowledge source citation is invalid")
+                if has_projection_contract and citation_projection is not None:
+                    raw_attributions = member["citation_attributions"]
+                    if (
+                        not isinstance(raw_attributions, list)
+                        or len(raw_attributions) != len(member["citation_ids"])
+                    ):
+                        raise MirrorError(
+                            "formal knowledge citation attribution proof is invalid"
+                        )
+                    attribution_ids: list[str] = []
+                    for attribution in raw_attributions:
+                        if (
+                            not isinstance(attribution, dict)
+                            or set(attribution)
+                            != {
+                                "citation_id",
+                                "relation",
+                                "anchor_byte_end",
+                                "gap_text",
+                                "gap_sha256",
+                            }
+                            or not isinstance(attribution.get("citation_id"), str)
+                            or attribution.get("relation")
+                            not in {"contained", "adjacent"}
+                            or type(attribution.get("anchor_byte_end")) is not int
+                            or not isinstance(attribution.get("gap_text"), str)
+                            or not _SHA256.fullmatch(
+                                str(attribution.get("gap_sha256") or "")
+                            )
+                        ):
+                            raise MirrorError(
+                                "formal knowledge citation attribution proof is invalid"
+                            )
+                        citation_id = attribution["citation_id"]
+                        anchor_byte_end = attribution["anchor_byte_end"]
+                        gap_bytes = attribution["gap_text"].encode("utf-8")
+                        if (
+                            hashlib.sha256(gap_bytes).hexdigest()
+                            != attribution["gap_sha256"]
+                            or attribution["relation"] == "contained"
+                            and gap_bytes != b""
+                            or attribution["relation"] == "adjacent"
+                            and not is_valid_citation_gap(gap_bytes)
+                        ):
+                            raise MirrorError(
+                                "formal knowledge citation attribution gap is invalid"
+                            )
+                        citation = citations.get(citation_id)
+                        candidates = (
+                            [citation] if citation is not None else []
+                        ) + [
+                            native
+                            for native in native_citations
+                            if native["citation_id"] == citation_id
+                            and native["document_version_id"] == version_id
+                        ]
+                        member_candidates = [
+                            candidate
+                            for member_citation_id in member["citation_ids"]
+                            for candidate in (
+                                ([citations[member_citation_id]]
+                                 if member_citation_id in citations else [])
+                                + [
+                                    native
+                                    for native in native_citations
+                                    if native["citation_id"] == member_citation_id
+                                    and native["document_version_id"] == version_id
+                                ]
+                            )
+                            if candidate["source_sha256"] == locator["source_sha256"]
+                            and locator["span_id"] in candidate.get(
+                                "containing_span_ids",
+                                [candidate.get("containing_span_id")],
+                            )
+                        ]
+                        allowed_anchors = {locator["byte_end"]} | {
+                            candidate["byte_end"] for candidate in member_candidates
+                        }
+
+                        def matches_canonical_source(candidate: Mapping[str, Any]) -> bool:
+                            marker_bytes = str(candidate["raw_marker_text"]).encode(
+                                "utf-8"
+                            )
+                            material_start = (
+                                int(candidate["byte_start"])
+                                if attribution["relation"] == "contained"
+                                else anchor_byte_end
+                            )
+                            actual = canonical_chunk_source_slice(
+                                version_id=version_id,
+                                span_id=str(locator["span_id"]),
+                                byte_start=material_start,
+                                byte_end=int(candidate["byte_end"]),
+                            )
+                            expected = (
+                                marker_bytes
+                                if attribution["relation"] == "contained"
+                                else gap_bytes + marker_bytes
+                            )
+                            return actual == expected
+
+                        if not any(
+                            candidate["source_sha256"] == locator["source_sha256"]
+                            and locator["span_id"] in candidate.get(
+                                "containing_span_ids",
+                                [candidate.get("containing_span_id")],
+                            )
+                            and (
+                                attribution["relation"] == "contained"
+                                and anchor_byte_end == locator["byte_end"]
+                                and gap_bytes == b""
+                                and locator["byte_start"] <= candidate["byte_start"]
+                                and candidate["byte_end"] <= locator["byte_end"]
+                                or attribution["relation"] == "adjacent"
+                                and anchor_byte_end in allowed_anchors
+                                and anchor_byte_end <= candidate["byte_start"]
+                                and candidate["byte_start"] - anchor_byte_end
+                                == len(gap_bytes)
+                            )
+                            and matches_canonical_source(candidate)
+                            for candidate in candidates
+                        ):
+                            raise MirrorError(
+                                "formal knowledge citation does not cover its locator"
+                            )
+                        attribution_ids.append(citation_id)
+                    if attribution_ids != member["citation_ids"]:
+                        raise MirrorError(
+                            "formal knowledge citation attribution membership is invalid"
+                        )
                 citation_union.update(member["citation_ids"])
             if row["citation_ids"] != sorted(citation_union):
                 raise MirrorError("formal knowledge citation union is invalid")
@@ -775,6 +1637,44 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
             )
         ):
             raise MirrorError("formal knowledge generation identity is invalid")
+    retrieval = value["retrieval"]
+    if not isinstance(retrieval, dict) or not isinstance(retrieval.get("records"), list):
+        raise MirrorError("search artifact retrieval projection is invalid")
+    retrieval_by_id = {
+        str(row.get("record_id")): row
+        for row in retrieval["records"]
+        if isinstance(row, dict)
+    }
+    expected_record_ids = {
+        str(chunk_id)
+        for chunk_id, chunk in chunks.items()
+        if chunk.get("retrievable") is True
+    } | set(knowledge)
+    if set(retrieval_by_id) != expected_record_ids:
+        raise MirrorError("search artifact retrieval membership differs from canonical rows")
+    for record_id in sorted(expected_record_ids):
+        canonical = chunks.get(record_id) or knowledge.get(record_id)
+        record = retrieval_by_id[record_id]
+        if canonical is None or record.get("citation_ids") != canonical.get("citation_ids"):
+            raise MirrorError("search artifact retrieval citation membership differs")
+    membership_material = {
+        "documents": value["documents"],
+        "versions": value["versions"],
+        "chunks": value["chunks"],
+        "knowledge": value["knowledge"],
+    }
+    if has_projection_contract:
+        membership_material["citation_projection"] = citation_projection
+        membership_material["citations"] = raw_citations
+        membership_material["native_citation_references"] = raw_native_citations
+        membership_material["citation_source_material"] = (
+            raw_citation_source_material
+        )
+    expected_membership = hashlib.sha256(
+        canonical_json(membership_material).encode("utf-8")
+    ).hexdigest()
+    if retrieval.get("canonical_membership_sha256") != expected_membership:
+        raise MirrorError("search artifact canonical membership hash is invalid")
     try:
         ArtifactKnowledgeIndex(value, _build_runtime=False).close()
     except (KeyError, TypeError, ValueError) as error:

@@ -47,7 +47,14 @@ from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_builder import seal_release
 from quant_hub.ops.semantic_authority import promote_semantic_authority
 from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
+from quant_hub.platform.db import connect_database
+from quant_hub.platform.migrations import migrate_up
 from quant_hub.generic_research.release import deserialize_snapshot
+
+
+RESEARCH_PAPERS_MIGRATIONS = (
+    Path(__file__).resolve().parents[1] / "migrations" / "research_papers"
+)
 
 
 class MemoryBackend:
@@ -170,11 +177,18 @@ class PublishRuntimeTests(unittest.TestCase):
         base_files = {
             "runtime_contract/start.py": b"print('v39-launcher-ok')\n",
             "runtime_contract/code/old.py": b"print('old')\n",
+            "runtime_contract/code/src/quant_hub/presentation/citation_projection_overrides.json": canonical_json(
+                {
+                    "schema_version": "qrh-reviewed-citation-projection/v1",
+                    "review_scope": "public-test-fixture",
+                    "reviewed_at": "2026-08-22T00:00:00Z",
+                    "documents": [],
+                }
+            ).encode("utf-8"),
             "runtime/templates/index.html": b"<main>V39 legacy</main>\n",
             "runtime/static/app.css": b"body{color:#111}\n",
             "runtime/db/archive.sqlite3": b"archive-db",
             "runtime/db/platform.sqlite3": b"platform-db",
-            "runtime/db/research_papers.sqlite3": b"papers-db",
             "runtime/db/paper_lab.sqlite3": b"paper-lab-db",
             "runtime/research_papers/paper.pdf": b"%PDF-fixture",
             "runtime/objects/legacy-object.bin": b"legacy-object",
@@ -185,6 +199,19 @@ class PublishRuntimeTests(unittest.TestCase):
             path = self.runtime_base / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(payload)
+        research_papers_database = (
+            self.runtime_base / "runtime" / "db" / "research_papers.sqlite3"
+        )
+        research_papers_connection = connect_database(research_papers_database)
+        migrate_up(research_papers_connection, RESEARCH_PAPERS_MIGRATIONS)
+        research_papers_connection.close()
+        staged_migrations = (
+            self.runtime_base / "runtime_contract" / "migrations"
+            / "research_papers"
+        )
+        staged_migrations.mkdir(parents=True)
+        for migration in RESEARCH_PAPERS_MIGRATIONS.iterdir():
+            (staged_migrations / migration.name).write_bytes(migration.read_bytes())
         base_manifest = {
             "schema_version": "qrh-release-manifest/v1",
             "release_id": "v39-like-base",
@@ -402,6 +429,12 @@ class PublishRuntimeTests(unittest.TestCase):
         return deps, backend, invoker, process_calls
 
     def test_candidate_only_assembles_full_fixed_pipeline_without_recovery(self) -> None:
+        local_ignored_overlay = (
+            self.project / "quant_hub" / "src" / "quant_hub" / "presentation"
+            / "citation_projection_overrides.json"
+        )
+        local_ignored_overlay.parent.mkdir(parents=True)
+        local_ignored_overlay.write_text("development-machine-only", encoding="utf-8")
         deps, backend, invoker, process_calls = self.dependencies()
         semantic_path = self.protected / "publish-state" / "semantic_jobs.sqlite3"
         semantic_hash_before = hashlib.sha256(semantic_path.read_bytes()).hexdigest()
@@ -441,6 +474,16 @@ class PublishRuntimeTests(unittest.TestCase):
             (releases[0] / "runtime" / "templates" / "index.html").read_text(encoding="utf-8"),
         )
         self.assertFalse((releases[0] / "runtime_contract" / "code" / "old.py").exists())
+        staged_overlay = (
+            releases[0] / "runtime_contract" / "code" / "src" / "quant_hub"
+            / "presentation" / "citation_projection_overrides.json"
+        )
+        base_overlay = (
+            self.runtime_base / "runtime_contract" / "code" / "src" / "quant_hub"
+            / "presentation" / "citation_projection_overrides.json"
+        )
+        self.assertEqual(base_overlay.read_bytes(), staged_overlay.read_bytes())
+        self.assertNotEqual(local_ignored_overlay.read_bytes(), staged_overlay.read_bytes())
         self.assertFalse((releases[0] / "external" / "reference").exists())
         launched = subprocess.run(
             [sys.executable, str(launcher)], capture_output=True, text=True,

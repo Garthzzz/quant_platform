@@ -75,6 +75,7 @@ jobs:
           tests.test_knowledge_retrieval_eval
           tests.test_knowledge_public_quality
           tests.test_knowledge_release_build
+          tests.test_knowledge_citation_projection
           tests.test_knowledge_mcp
           tests.test_generic_research_renderer
           -v
@@ -83,7 +84,28 @@ jobs:
         run: |
           $wheelRoot = Join-Path $env:RUNNER_TEMP "qrh-wheel"
           New-Item -ItemType Directory -Path $wheelRoot -Force | Out-Null
-          python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir $wheelRoot ./quant_hub
+          $privateOverlay = Join-Path $PWD "quant_hub\src\quant_hub\presentation\citation_projection_overrides.json"
+          if (Test-Path -LiteralPath $privateOverlay) {
+            throw "Public checkout unexpectedly contains private citation business data"
+          }
+          $sentinel = [System.Text.UTF8Encoding]::new($false).GetBytes(
+            '{"schema_version":"qrh-private-citation-ci-sentinel/v1"}'
+          )
+          try {
+            [System.IO.File]::WriteAllBytes($privateOverlay, $sentinel)
+            python -m pip wheel --disable-pip-version-check --no-deps --wheel-dir $wheelRoot ./quant_hub
+            if ($LASTEXITCODE -ne 0) {
+              throw "wheel build failed"
+            }
+          }
+          finally {
+            if (Test-Path -LiteralPath $privateOverlay) {
+              Remove-Item -LiteralPath $privateOverlay -Force
+            }
+          }
+          if (Test-Path -LiteralPath $privateOverlay) {
+            throw "private citation CI sentinel cleanup failed"
+          }
           $wheels = @(Get-ChildItem -LiteralPath $wheelRoot -Filter *.whl)
           if ($wheels.Count -ne 1) {
             throw "wheel build must produce exactly one artifact"
@@ -98,6 +120,12 @@ jobs:
           }
           if ($entries -notcontains "quant_hub/knowledge/semantic_cli.py") {
             throw "wheel is missing the semantic operator CLI"
+          }
+          if ($entries -notcontains "quant_hub/knowledge/citations.py") {
+            throw "wheel is missing the Evidence citation projection module"
+          }
+          if ($entries -contains "quant_hub/presentation/citation_projection_overrides.json") {
+            throw "public wheel must not contain ignored citation business data"
           }
           if ($entries -notcontains "quant_hub/generic_research/release.py") {
             throw "wheel is missing the finalized generic release loader"
@@ -175,6 +203,10 @@ jobs:
           & $venvPip install --disable-pip-version-check --no-deps $wheel
           if ($LASTEXITCODE -ne 0) {
             throw "exact wheel installation failed"
+          }
+          & $venvPython -I -B -c "import quant_hub.knowledge.citations"
+          if ($LASTEXITCODE -ne 0) {
+            throw "wheel citation projection import smoke failed"
           }
           foreach ($module in @(
             "quant_hub.ops.writer_handoff",

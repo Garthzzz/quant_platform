@@ -8,6 +8,7 @@
     "quant_hub/README.md",
     "quant_hub/pyproject.toml",
     "openspec/config.yaml",
+    "docs/verification/STAGE4_CITATION_PROJECTION_20260822.md",
     "docs/verification/STAGE4_PUBLIC_RAG_REPAIR_20260822.md",
     "project_state/architecture/quant_platform_VM知识MCP总体设计_20260820.md"
   ],

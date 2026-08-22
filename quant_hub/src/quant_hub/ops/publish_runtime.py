@@ -820,9 +820,19 @@ class ProductionSourceFreezer:
         if actual != expected:
             raise PublishRuntimeError("runtime base closure differs from its immutable R")
         overlay = PurePosixPath(self.config.code_overlay_relative_path)
+        citation_overlay = overlay.joinpath(
+            "src",
+            "quant_hub",
+            "presentation",
+            "citation_projection_overrides.json",
+        )
         for relative_text in sorted(actual):
             relative = PurePosixPath(relative_text)
-            if relative == overlay or overlay in relative.parents:
+            if (
+                relative == overlay
+                or overlay in relative.parents
+                and relative != citation_overlay
+            ):
                 continue
             self._copy_file(base.joinpath(*relative.parts), staging.joinpath(*relative.parts))
         prior_path = base / SNAPSHOT_ARTIFACT_PATH
@@ -1157,6 +1167,25 @@ class ProductionSourceFreezer:
                 enriched=enriched,
                 generations=selected_generations,
                 source_objects=source_objects,
+                evidence_database_path=staging.joinpath(
+                    *PurePosixPath(
+                        self.config.required_runtime_paths[
+                            "research_papers_database"
+                        ]
+                    ).parts
+                ),
+                citation_overlay_manifest_path=staging.joinpath(
+                    *PurePosixPath(self.config.code_overlay_relative_path).parts,
+                    "src",
+                    "quant_hub",
+                    "presentation",
+                    "citation_projection_overrides.json",
+                ),
+                evidence_migration_root=staging.joinpath(
+                    "runtime_contract",
+                    "migrations",
+                    "research_papers",
+                ),
             )
             final = candidate_parent / sealed.release_id
             if final.exists():

@@ -329,8 +329,100 @@ class KnowledgeMCPService:
         knowledge_by_id = {
             str(row["knowledge_item_id"]): row for row in artifact["knowledge"]
         }
+        has_citation_proofs = (
+            artifact.get("schema_version") == "qrh-mcp-search-artifact/v3"
+        )
+        source_material_by_key = {
+            (str(row["document_version_id"]), str(row["span_id"])): row
+            for row in artifact.get("citation_source_material", [])
+            if isinstance(row, Mapping)
+        }
+
+        def service_source_citations(
+            *,
+            card: Any,
+            knowledge: Mapping[str, Any] | None,
+            mapping_status: str,
+        ) -> list[dict[str, object]]:
+            raw_members = (
+                knowledge["source_citations"]
+                if knowledge is not None and "source_citations" in knowledge
+                else [
+                    {
+                        "source_locator": locator,
+                        "citation_ids": (
+                            list(card.citation_ids)
+                            if len(knowledge["source_locators"]) == 1
+                            else []
+                        ),
+                    }
+                    for locator in knowledge["source_locators"]
+                ]
+                if knowledge is not None
+                else [
+                    {
+                        "source_locator": {
+                            "document_id": card.document_id,
+                            "document_version_id": card.document_version_id,
+                            "span_id": card.locator.span_id,
+                            "span_ids": list(card.covered_span_ids),
+                            "source_sha256": card.locator.source_sha256,
+                            "line_start": card.locator.line_start,
+                            "line_end": card.locator.line_end,
+                            "byte_start": card.locator.byte_start,
+                            "byte_end": card.locator.byte_end,
+                        },
+                        "citation_ids": list(card.citation_ids),
+                    }
+                ]
+            )
+            result: list[dict[str, object]] = []
+            for member in raw_members:
+                locator = member["source_locator"]
+                projected: dict[str, object] = {
+                    "document_id": card.document_id,
+                    "document_version_id": card.document_version_id,
+                    **json.loads(canonical_json(locator)),
+                    "citation_ids": list(member["citation_ids"]),
+                    "citation_mapping_status": mapping_status,
+                }
+                if has_citation_proofs:
+                    material = source_material_by_key.get(
+                        (
+                            str(card.document_version_id),
+                            str(locator["span_id"]),
+                        )
+                    )
+                    projected["citation_attributions"] = json.loads(
+                        canonical_json(member.get("citation_attributions", []))
+                    )
+                    projected["source_material_identity"] = (
+                        {
+                            **{
+                                key: material[key]
+                                for key in (
+                                    "document_version_id",
+                                    "source_sha256",
+                                    "span_id",
+                                    "kind",
+                                    "byte_start",
+                                    "byte_end",
+                                    "source_text_sha256",
+                                )
+                            },
+                            "attributes_sha256": hashlib.sha256(
+                                canonical_json(material["attributes"]).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        if material is not None
+                        else None
+                    )
+                result.append(projected)
+            return result
+
         snippet_limit = 1_600 if detail == "evidence" else 420
         ordered: list[dict[str, Any]] = []
+        source_citations_by_object_id: dict[str, list[dict[str, object]]] = {}
         for card in shared.cards:
             knowledge = knowledge_by_id.get(card.evidence_id)
             legacy_multi_binding = bool(
@@ -338,55 +430,63 @@ class KnowledgeMCPService:
                 and "source_citations" not in knowledge
                 and len(knowledge.get("source_locators", [])) > 1
             )
-            ordered.append(
-                {
-                    "object_id": card.evidence_id,
-                    "object_kind": (
-                        "evidence_chunk"
-                        if card.source_kind == "chunk"
-                        else card.knowledge_kind or "accepted_knowledge"
-                    ),
-                    "canonical_key": card.canonical_key,
+            mapping_status = (
+                "unavailable_legacy_v1"
+                if legacy_multi_binding
+                else "exact_per_locator"
+            )
+            source_citations = service_source_citations(
+                card=card,
+                knowledge=knowledge,
+                mapping_status=mapping_status,
+            )
+            source_citations_by_object_id[card.evidence_id] = source_citations
+            ordered_row: dict[str, Any] = {
+                "object_id": card.evidence_id,
+                "object_kind": (
+                    "evidence_chunk"
+                    if card.source_kind == "chunk"
+                    else card.knowledge_kind or "accepted_knowledge"
+                ),
+                "canonical_key": card.canonical_key,
+                "document_id": card.document_id,
+                "document_version_id": card.document_version_id,
+                "research_id": card.research_id,
+                "title": card.title,
+                "heading_path": list(card.heading_path),
+                "snippet": card.text[:snippet_limit],
+                "source_locator": {
                     "document_id": card.document_id,
                     "document_version_id": card.document_version_id,
-                    "research_id": card.research_id,
-                    "title": card.title,
-                    "heading_path": list(card.heading_path),
-                    "snippet": card.text[:snippet_limit],
-                    "source_locator": {
-                        "document_id": card.document_id,
-                        "document_version_id": card.document_version_id,
-                        "span_id": card.locator.span_id,
-                        "span_ids": list(card.covered_span_ids),
-                        "source_sha256": card.locator.source_sha256,
-                        "line_start": card.locator.line_start,
-                        "line_end": card.locator.line_end,
-                        "byte_start": card.locator.byte_start,
-                        "byte_end": card.locator.byte_end,
-                    },
-                    "citation_ids": (
-                        [] if legacy_multi_binding else list(card.citation_ids)
-                    ),
-                    "citation_mapping_status": (
-                        "unavailable_legacy_v1"
-                        if legacy_multi_binding
-                        else "exact_per_locator"
-                    ),
-                    "fact_status": card.fact_status,
-                    "knowledge_enrichment": card.knowledge_enrichment,
-                    "applicability": card.applicability or "not_assessed",
-                    "applicability_matches": list(card.applicability_matches),
-                    "limitations": list(card.limitations),
-                    "failures": list(card.failures),
-                    "conflicts": list(card.applicability_conflicts),
-                    "generation": knowledge.get("generation") if knowledge else None,
-                    "match_reasons": list(card.hit_reasons),
-                    "score": card.score,
-                    "rank": card.rank,
-                    "historical": card.active_status != "active",
-                    "active_status": card.active_status,
-                }
-            )
+                    "span_id": card.locator.span_id,
+                    "span_ids": list(card.covered_span_ids),
+                    "source_sha256": card.locator.source_sha256,
+                    "line_start": card.locator.line_start,
+                    "line_end": card.locator.line_end,
+                    "byte_start": card.locator.byte_start,
+                    "byte_end": card.locator.byte_end,
+                },
+                "citation_ids": (
+                    [] if legacy_multi_binding else list(card.citation_ids)
+                ),
+                "citation_mapping_status": mapping_status,
+                "fact_status": card.fact_status,
+                "knowledge_enrichment": card.knowledge_enrichment,
+                "applicability": card.applicability or "not_assessed",
+                "applicability_matches": list(card.applicability_matches),
+                "limitations": list(card.limitations),
+                "failures": list(card.failures),
+                "conflicts": list(card.applicability_conflicts),
+                "generation": knowledge.get("generation") if knowledge else None,
+                "match_reasons": list(card.hit_reasons),
+                "score": card.score,
+                "rank": card.rank,
+                "historical": card.active_status != "active",
+                "active_status": card.active_status,
+            }
+            if has_citation_proofs:
+                ordered_row["source_citations"] = source_citations
+            ordered.append(ordered_row)
         request_hash = hashlib.sha256(
             canonical_json(
                 {
@@ -432,40 +532,12 @@ class KnowledgeMCPService:
         self._search_provenance.clear()
         recommended = selected[:3]
         for row in recommended:
-            knowledge = knowledge_by_id.get(str(row["object_id"]))
-            raw_source_citations = (
-                knowledge["source_citations"]
-                if knowledge is not None and "source_citations" in knowledge
-                else [
-                    {
-                        "source_locator": locator,
-                        "citation_ids": (
-                            row["citation_ids"]
-                            if len(knowledge["source_locators"]) == 1
-                            else []
-                        ),
-                    }
-                    for locator in knowledge["source_locators"]
-                ]
-                if knowledge is not None
-                else [
-                    {
-                        "source_locator": row["source_locator"],
-                        "citation_ids": row["citation_ids"],
-                    }
-                ]
-            )
             self._search_provenance[str(row["object_id"])] = {
-                "source_citations": [
-                    {
-                        "document_id": row["document_id"],
-                        "document_version_id": row["document_version_id"],
-                        **json.loads(canonical_json(member["source_locator"])),
-                        "citation_ids": list(member["citation_ids"]),
-                        "citation_mapping_status": row["citation_mapping_status"],
-                    }
-                    for member in raw_source_citations
-                ],
+                "source_citations": json.loads(
+                    canonical_json(
+                        source_citations_by_object_id[str(row["object_id"])]
+                    )
+                ),
             }
         recommended_ids = [str(row["object_id"]) for row in recommended]
         return {
@@ -605,7 +677,7 @@ class KnowledgeMCPService:
                     "results": [],
                 }
             source_citations.append(
-                {
+                ({
                     "object_id": object_id,
                     "logical_path": version["logical_path"],
                     "document_id": member["document_id"],
@@ -616,7 +688,20 @@ class KnowledgeMCPService:
                     "byte_end": member["byte_end"],
                     "citation_ids": list(member["citation_ids"]),
                     "citation_mapping_status": member["citation_mapping_status"],
-                }
+                } | (
+                    {
+                        "citation_attributions": json.loads(
+                            canonical_json(member["citation_attributions"])
+                        ),
+                        "source_material_identity": json.loads(
+                            canonical_json(member["source_material_identity"])
+                        )
+                        if member["source_material_identity"] is not None
+                        else None,
+                    }
+                    if "citation_attributions" in member
+                    else {}
+                ))
             )
         return {
             **self._base(resolution),

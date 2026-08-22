@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
-from quant_hub.presentation.citation_overlays import CitationOverlayRegistry
+from quant_hub.presentation.citation_overlays import (
+    CitationOverlayError,
+    CitationOverlayRegistry,
+)
 from quant_hub.web.routes import (
     _select_non_overlapping_citations,
     _toc_with_numbering_semantics,
@@ -70,6 +76,58 @@ class CitationProjectionOverlayTests(unittest.TestCase):
         selected = _select_non_overlapping_citations([broad, exact_two, exact_one])
 
         self.assertEqual([exact_one, exact_two], selected)
+
+    def test_reviewed_overlay_external_link_schema_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = b"# Research\n\nPaper A\n"
+            source_sha256 = hashlib.sha256(source).hexdigest()
+            manifest = root / "overlay.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "qrh-reviewed-citation-projection/v1",
+                        "review_scope": "public-test-fixture",
+                        "reviewed_at": "2026-08-22",
+                        "documents": [
+                            {
+                                "source_path": "research.md",
+                                "document_sha256": source_sha256,
+                                "entries": [
+                                    {
+                                        "key": "paper-a",
+                                        "line_number": 3,
+                                        "marker": "Paper A",
+                                        "source_candidate_id": "candidate-a",
+                                        "relation_summary_zh": "公开测试关系。",
+                                        "paper": {
+                                            "paper_id": "paper_" + "1" * 32,
+                                            "title": "Paper A",
+                                            "external_links": [
+                                                {
+                                                    "kind": "repository",
+                                                    "url": "https://example.invalid/paper-a",
+                                                    "unexpected": True,
+                                                }
+                                            ],
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            registry = CitationOverlayRegistry(
+                None,
+                manifest_path=manifest,
+                source_objects={source_sha256: source},
+                source_paths={source_sha256: "research.md"},
+            )
+            with self.assertRaisesRegex(CitationOverlayError, "external links"):
+                registry.for_document(source_sha256)
 
     def test_current_chapter_toc_uses_hierarchical_counters_and_wraps(self) -> None:
         css = (ROOT / "quant_hub" / "src" / "quant_hub" / "web" / "static" / "styles.css").read_text(encoding="utf-8")

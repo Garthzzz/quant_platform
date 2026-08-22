@@ -47,6 +47,7 @@ from quant_hub.collaboration.service import (
 )
 from quant_hub.evidence.service import EvidenceQueryService
 from quant_hub.presentation.supplements import SupplementalResearchDocuments
+from quant_hub.presentation.citation_overlays import select_non_overlapping_citations
 from quant_hub.research_workspace import (
     ResearchWorkspace,
     WorkspaceCommandOutcome,
@@ -218,34 +219,7 @@ def _workspace() -> ResearchWorkspace:
 
 def _select_non_overlapping_citations(specs: list[Any]) -> list[Any]:
     """选择可同时投影的 occurrence，避免一个坏重叠关闭整篇引用。"""
-
-    state_priority = {"valid": 0, "conflicted": 1, "source-only": 2, "unresolved": 3}
-    candidates = sorted(
-        (
-            item
-            for item in specs
-            if item.byte_start is not None
-            and item.byte_end is not None
-            and int(item.byte_start) < int(item.byte_end)
-        ),
-        key=lambda item: (
-            state_priority.get(str(item.resolution_state), 9),
-            int(item.byte_end) - int(item.byte_start),
-            int(item.byte_start),
-            str(item.citation_id),
-        ),
-    )
-    selected: list[Any] = []
-    for item in candidates:
-        start = int(item.byte_start)
-        end = int(item.byte_end)
-        if any(
-            start < int(existing.byte_end) and int(existing.byte_start) < end
-            for existing in selected
-        ):
-            continue
-        selected.append(item)
-    return sorted(selected, key=lambda item: (int(item.byte_start), int(item.byte_end)))
+    return select_non_overlapping_citations(specs)
 
 
 def _request_id() -> str:

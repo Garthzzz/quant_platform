@@ -33,6 +33,15 @@ class GitGuardTests(unittest.TestCase):
                 "docs/verification/STAGE4_PUBLIC_RAG_REPAIR_20260822.md", policy
             )
         )
+        self.assertTrue(
+            git_guard.allowed(
+                "docs/verification/STAGE4_CITATION_PROJECTION_20260822.md", policy
+            )
+        )
+        citation_record = git_guard.gate(
+            ["docs/verification/STAGE4_CITATION_PROJECTION_20260822.md"], policy
+        )
+        self.assertEqual("pass", citation_record["status"], citation_record)
         self.assertFalse(git_guard.allowed("docs/verification/private-result.md", policy))
 
     def test_gate_reports_secret_by_fingerprint_without_value(self) -> None:

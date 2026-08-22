@@ -12,10 +12,17 @@ import time
 from typing import Any, Literal, Mapping, Sequence
 
 from .contracts import BaseSnapshot, Chunk, canonical_json
+from .citations import (
+    CitationAttribution,
+    CitationProjection,
+    citation_ids_for_binding as projected_citation_ids_for_binding,
+    citation_ids_for_chunk as projected_citation_ids_for_chunk,
+    is_valid_citation_gap,
+)
 from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
-INDEX_VERSION = "qrh-structured-lexical-index/v1.12-evidence-span-bound-bilingual"
+INDEX_VERSION = "qrh-structured-lexical-index/v1.13-evidence-citation-sidecar"
 RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v3"
 
 # Only relations whose direction adds supporting context may introduce a new
@@ -670,7 +677,87 @@ def _heading_labels(ir: Any, heading_path: Sequence[str]) -> tuple[str, ...]:
     )
 
 
-_CITATION_ADJACENCY_RE = re.compile(r"^[\s\W_]{0,24}$", re.UNICODE)
+def citation_attributions_for_evidence_binding(
+    ir: Any, binding: Any
+) -> tuple[CitationAttribution, ...]:
+    """Return minimal proof for native citations attributable to one binding."""
+
+    blocks = {block.source_span.span_id: block for block in ir.blocks}
+    block = blocks.get(str(binding.span_id))
+    if block is None:
+        raise ValueError("knowledge evidence binding span is absent")
+    block_span = block.source_span
+    binding_start = int(binding.byte_start)
+    binding_end = int(binding.byte_end)
+    if binding_start == -1 and binding_end == -1:
+        return ()
+    if not (
+        block_span.byte_start <= binding_start < binding_end <= block_span.byte_end
+    ):
+        raise ValueError("knowledge evidence byte locator is invalid")
+    raw = block_span.text.encode("utf-8")
+    relative_binding_start = binding_start - block_span.byte_start
+    relative_binding_end = binding_end - block_span.byte_start
+    quote_bytes = raw[relative_binding_start:relative_binding_end]
+    try:
+        located_quote = quote_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("knowledge evidence byte locator is not UTF-8 aligned") from error
+    if (
+        located_quote != str(binding.quote)
+        or hashlib.sha256(quote_bytes).hexdigest() != str(binding.quote_sha256)
+    ):
+        raise ValueError("knowledge evidence byte locator differs from quote")
+    citations = sorted(
+        (
+            span
+            for span in block.spans
+            if span.kind == "citation"
+            and "citation_id" in span.attributes
+            and span.attributes.get("locator_precision") == "exact"
+        ),
+        key=lambda span: (span.byte_start, span.byte_end, span.span_id),
+    )
+    selected: dict[str, CitationAttribution] = {}
+    adjacency_cursor = binding_end
+    for span in citations:
+        citation_id = str(span.attributes["citation_id"])
+        contained = binding_start <= span.byte_start and span.byte_end <= binding_end
+        gap_bytes: bytes | None = None
+        if adjacency_cursor <= span.byte_start:
+            relative_start = adjacency_cursor - block_span.byte_start
+            relative_end = span.byte_start - block_span.byte_start
+            candidate_gap = raw[relative_start:relative_end]
+            if is_valid_citation_gap(candidate_gap):
+                gap_bytes = candidate_gap
+        if contained:
+            candidate = CitationAttribution(
+                citation_id=citation_id,
+                relation="contained",
+                anchor_byte_end=binding_end,
+                gap_text="",
+                gap_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+        elif gap_bytes is not None:
+            candidate = CitationAttribution(
+                citation_id=citation_id,
+                relation="adjacent",
+                anchor_byte_end=adjacency_cursor,
+                gap_text=gap_bytes.decode("utf-8"),
+                gap_sha256=hashlib.sha256(gap_bytes).hexdigest(),
+            )
+        elif span.byte_start >= adjacency_cursor:
+            break
+        else:
+            continue
+        previous = selected.get(citation_id)
+        if previous is None or (
+            candidate.relation != previous.relation
+            and candidate.relation == "contained"
+        ):
+            selected[citation_id] = candidate
+        adjacency_cursor = max(adjacency_cursor, span.byte_end)
+    return tuple(selected[key] for key in sorted(selected))
 
 
 def citation_ids_for_evidence_bindings(
@@ -685,83 +772,33 @@ def citation_ids_for_evidence_bindings(
     containing punctuation/Markdown delimiters but no author words.
     """
 
-    blocks = {
-        block.source_span.span_id: block
-        for block in ir.blocks
-    }
     citation_ids: set[str] = set()
     for binding in bindings:
-        block = blocks.get(str(binding.span_id))
-        if block is None:
-            raise ValueError("knowledge evidence binding span is absent")
-        block_span = block.source_span
-        binding_start = int(binding.byte_start)
-        binding_end = int(binding.byte_end)
-        if binding_start == -1 and binding_end == -1:
-            # Legacy/manual in-memory fixtures without byte locators cannot
-            # lend citation authority.  Published artifacts apply their own
-            # stricter exact-locator gate.
-            continue
-        if not (
-            block_span.byte_start <= binding_start < binding_end <= block_span.byte_end
-        ):
-            raise ValueError("knowledge evidence byte locator is invalid")
-        raw = block_span.text.encode("utf-8")
-        relative_binding_start = binding_start - block_span.byte_start
-        relative_binding_end = binding_end - block_span.byte_start
-        quote_bytes = raw[relative_binding_start:relative_binding_end]
-        try:
-            located_quote = quote_bytes.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ValueError("knowledge evidence byte locator is not UTF-8 aligned") from error
-        if (
-            located_quote != str(binding.quote)
-            or hashlib.sha256(quote_bytes).hexdigest()
-            != str(binding.quote_sha256)
-        ):
-            raise ValueError("knowledge evidence byte locator differs from quote")
-        citations = sorted(
-            (
-                span
-                for span in block.spans
-                if span.kind == "citation"
-                and "citation_id" in span.attributes
-                and span.attributes.get("locator_precision") == "exact"
-            ),
-            key=lambda span: (span.byte_start, span.byte_end, span.span_id),
+        citation_ids.update(
+            row.citation_id
+            for row in citation_attributions_for_evidence_binding(ir, binding)
         )
-        adjacency_cursor = binding_end
-        for span in citations:
-            contained = binding_start <= span.byte_start and span.byte_end <= binding_end
-            adjacent = False
-            if adjacency_cursor <= span.byte_start:
-                relative_start = adjacency_cursor - block_span.byte_start
-                relative_end = span.byte_start - block_span.byte_start
-                gap_bytes = raw[relative_start:relative_end]
-                if len(gap_bytes) <= 24:
-                    try:
-                        gap = gap_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        gap = ""
-                    adjacent = bool(
-                        gap_bytes == b"" or _CITATION_ADJACENCY_RE.fullmatch(gap)
-                    )
-            if contained or adjacent:
-                citation_ids.add(str(span.attributes["citation_id"]))
-                adjacency_cursor = max(adjacency_cursor, span.byte_end)
-            elif span.byte_start >= binding_end:
-                # Author text (or a non-adjacent source marker) breaks the
-                # attribution run; later citations belong to later claims.
-                break
     return tuple(sorted(citation_ids))
 
 
 class KnowledgeIndex:
-    def __init__(self, base: BaseSnapshot, enriched: EnrichedSnapshot | None = None):
+    def __init__(
+        self,
+        base: BaseSnapshot,
+        enriched: EnrichedSnapshot | None = None,
+        *,
+        citation_projection: CitationProjection | None = None,
+    ):
         if enriched is not None and enriched.base_snapshot_id != base.snapshot_id:
             raise ValueError("enriched knowledge belongs to another deterministic snapshot")
+        if (
+            citation_projection is not None
+            and citation_projection.base_snapshot_id != base.snapshot_id
+        ):
+            raise ValueError("citation projection belongs to another deterministic snapshot")
         self.base = base
         self.enriched = enriched
+        self.citation_projection = citation_projection
         self.snapshot_id = enriched.snapshot_id if enriched else base.snapshot_id
         applicability_rows = (
             tuple(
@@ -1006,15 +1043,30 @@ class KnowledgeIndex:
         ir = self.base.ir_documents[chunk.document_version_id]
         spans = _span_lookup(self.base, chunk.document_version_id)
         span = spans[chunk.ordered_span_ids[0]]
+        native_citation_ids = {
+            str(child.attributes["citation_id"])
+            for block in ir.blocks
+            if block.source_span.span_id in chunk.ordered_span_ids
+            for child in block.spans
+            if child.kind == "citation"
+            and "citation_id" in child.attributes
+            and chunk.byte_start <= child.byte_start
+            and child.byte_end <= chunk.byte_end
+        }
         citation_ids = tuple(
             sorted(
-                {
-                    str(child.attributes["citation_id"])
-                    for block in ir.blocks
-                    if block.source_span.span_id in chunk.ordered_span_ids
-                    for child in block.spans
-                    if child.kind == "citation" and "citation_id" in child.attributes
-                }
+                native_citation_ids
+                | (
+                    set(
+                        projected_citation_ids_for_chunk(
+                            self.citation_projection,
+                            chunk.document_version_id,
+                            chunk,
+                        )
+                    )
+                    if self.citation_projection is not None
+                    else set()
+                )
             )
         )
         return _Record(
@@ -1081,7 +1133,26 @@ class KnowledgeIndex:
             raise ValueError("knowledge evidence quote is absent or ambiguous")
         prefix = primary.text[: occurrences[0]]
         quote_line_start = primary.line_start + prefix.count("\n")
-        citations = citation_ids_for_evidence_bindings(ir, item.evidence)
+        projected_citations = (
+            {
+                citation_id
+                for binding in item.evidence
+                for citation_id in projected_citation_ids_for_binding(
+                    self.citation_projection,
+                    item.document_version_id,
+                    binding,
+                )
+            }
+            if self.citation_projection is not None
+            else set()
+        )
+        native_citations = set(citation_ids_for_evidence_bindings(ir, item.evidence))
+        citations = tuple(
+            sorted(
+                native_citations
+                | projected_citations
+            )
+        )
         heading_path = next(
             (
                 block.heading_path
@@ -1918,6 +1989,7 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
             raise ValueError("retrieval artifact identity or schema is invalid")
         self.base = base
         self.enriched = None
+        self.citation_projection = None
         self.snapshot_id = snapshot_id
         self._applicability_by_item = {}
         self._document_consensus_applicability = {}
@@ -2093,6 +2165,17 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
                 key: artifact[key]
                 for key in ("documents", "versions", "chunks", "knowledge")
             }
+            if "citation_projection" in artifact or "citations" in artifact:
+                canonical_members["citation_projection"] = artifact[
+                    "citation_projection"
+                ]
+                canonical_members["citations"] = artifact["citations"]
+                canonical_members["native_citation_references"] = artifact[
+                    "native_citation_references"
+                ]
+                canonical_members["citation_source_material"] = artifact[
+                    "citation_source_material"
+                ]
             expected_membership_sha256 = hashlib.sha256(
                 canonical_json(canonical_members).encode("utf-8")
             ).hexdigest()
@@ -2314,4 +2397,5 @@ __all__ = [
     "SearchResponse",
     "TaskContext",
     "citation_ids_for_evidence_bindings",
+    "citation_attributions_for_evidence_binding",
 ]

@@ -1079,6 +1079,12 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
             item.knowledge_item_id,
             searched["next_action"]["recommended_object_ids"],
         )
+        searched_item = next(
+            row
+            for row in searched["results"]
+            if row["object_id"] == item.knowledge_item_id
+        )
+        self.assertNotIn("source_citations", searched_item)
         expanded = service.get_quant_knowledge(object_id=item.knowledge_item_id)
         self.assertEqual("ok", expanded["status"])
         self.assertEqual(2, len(expanded["source_citations"]))
@@ -1089,6 +1095,13 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertEqual(
             [row["span_id"] for row in knowledge["source_locators"]],
             [row["span_id"] for row in expanded["source_citations"]],
+        )
+        self.assertTrue(
+            all(
+                "citation_attributions" not in row
+                and "source_material_identity" not in row
+                for row in expanded["source_citations"]
+            )
         )
 
         legacy_artifact = copy.deepcopy(artifact)
@@ -1149,6 +1162,7 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
             legacy_result["citation_mapping_status"],
         )
         self.assertEqual([], legacy_result["citation_ids"])
+        self.assertNotIn("source_citations", legacy_result)
         legacy_get = legacy_service.get_quant_knowledge(
             object_id=item.knowledge_item_id
         )
@@ -1161,6 +1175,13 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertTrue(
             all(
                 row["citation_mapping_status"] == "unavailable_legacy_v1"
+                for row in legacy_get["source_citations"]
+            )
+        )
+        self.assertTrue(
+            all(
+                "citation_attributions" not in row
+                and "source_material_identity" not in row
                 for row in legacy_get["source_citations"]
             )
         )
@@ -1203,6 +1224,7 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         )
         self.assertEqual("exact_per_locator", single_result["citation_mapping_status"])
         self.assertEqual([citation_a], single_result["citation_ids"])
+        self.assertNotIn("source_citations", single_result)
         single_get = single_service.get_quant_knowledge(
             object_id=single_item.knowledge_item_id
         )
@@ -1214,6 +1236,12 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
         self.assertEqual(
             "exact_per_locator",
             single_get["source_citations"][0]["citation_mapping_status"],
+        )
+        self.assertNotIn(
+            "citation_attributions", single_get["source_citations"][0]
+        )
+        self.assertNotIn(
+            "source_material_identity", single_get["source_citations"][0]
         )
 
     def test_pending_source_explicit_artifact_is_closed_and_searchable(self) -> None:

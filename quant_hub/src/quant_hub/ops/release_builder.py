@@ -14,6 +14,10 @@ from uuid import uuid4
 
 from quant_hub.runtime_seal import RuntimeSealError, safe_tree_file_state
 from quant_hub.knowledge.contracts import BaseSnapshot
+from quant_hub.knowledge.citations import (
+    CitationProjectionError,
+    build_citation_projection,
+)
 from quant_hub.knowledge.semantic import EnrichedSnapshot, KnowledgeGeneration
 from quant_hub.knowledge_mcp.mirror import (
     MirrorError,
@@ -142,6 +146,9 @@ def prepare_knowledge_search(
     generations: Sequence[KnowledgeGeneration] = (),
     source_root: Path | None = None,
     source_objects: Mapping[str, bytes] | None = None,
+    evidence_database_path: Path | None = None,
+    citation_overlay_manifest_path: Path | None = None,
+    evidence_migration_root: Path | None = None,
 ) -> PreparedKnowledgeSearch:
     """Materialize the immutable MCP artifact before release sealing.
 
@@ -165,11 +172,33 @@ def prepare_knowledge_search(
         raise ReleaseBuildError("manifest snapshot differs from knowledge artifact snapshot")
     if (source_root is None) == (source_objects is None):
         raise ReleaseBuildError("provide exactly one of source_root or source_objects")
+    citation_authorities = (
+        evidence_database_path,
+        citation_overlay_manifest_path,
+        evidence_migration_root,
+    )
+    if any(value is not None for value in citation_authorities) and not all(
+        value is not None for value in citation_authorities
+    ):
+        raise ReleaseBuildError(
+            "Evidence database, migration schema, and citation overlay must be configured together"
+        )
     try:
         selected_sources = (
             _source_objects_from_root(snapshot, source_root)
             if source_root is not None
             else dict(source_objects or {})
+        )
+        citation_projection = (
+            build_citation_projection(
+                snapshot,
+                evidence_database_path,
+                selected_sources,
+                overlay_manifest_path=citation_overlay_manifest_path,
+                evidence_migration_root=evidence_migration_root,
+            )
+            if evidence_database_path is not None
+            else None
         )
         snapshot_payload = serialize_snapshot(snapshot)
         source_manifest_payload, source_payloads = source_closure(snapshot, selected_sources)
@@ -178,12 +207,19 @@ def prepare_knowledge_search(
             snapshot,
             enriched=enriched,
             generations=generations,
+            citation_projection=citation_projection,
         )
         validate_search_artifact(
             json.loads(payload.decode("utf-8")),
             expected_snapshot_id=expected_snapshot_id,
         )
-    except (MirrorError, GenericReleaseError, UnicodeError, json.JSONDecodeError) as error:
+    except (
+        CitationProjectionError,
+        MirrorError,
+        GenericReleaseError,
+        UnicodeError,
+        json.JSONDecodeError,
+    ) as error:
         raise ReleaseBuildError("knowledge release closure is invalid") from error
     component_payloads = {
         "ir_sha256": snapshot_payload,
@@ -237,6 +273,9 @@ def seal_knowledge_release(
     generations: Sequence[KnowledgeGeneration] = (),
     source_root: Path | None = None,
     source_objects: Mapping[str, bytes] | None = None,
+    evidence_database_path: Path | None = None,
+    citation_overlay_manifest_path: Path | None = None,
+    evidence_migration_root: Path | None = None,
 ) -> SealedRelease:
     prepared = prepare_knowledge_search(
         candidate_root=candidate_root,
@@ -246,6 +285,9 @@ def seal_knowledge_release(
         generations=generations,
         source_root=source_root,
         source_objects=source_objects,
+        evidence_database_path=evidence_database_path,
+        citation_overlay_manifest_path=citation_overlay_manifest_path,
+        evidence_migration_root=evidence_migration_root,
     )
     return seal_release(
         candidate_root=prepared.root,
