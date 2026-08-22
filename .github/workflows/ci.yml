@@ -31,10 +31,16 @@ jobs:
       - name: Run public-safe unit tests
         shell: pwsh
         env:
-          PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\quant_hub;${{ github.workspace }}\quant_hub\src
           PYTHONDONTWRITEBYTECODE: "1"
           PYTHONUTF8: "1"
         run: |
+          $workspace = (Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path
+          $testPackageRoot = Join-Path $workspace "quant_hub"
+          $sourceRoot = Join-Path $testPackageRoot "src"
+          $env:PYTHONPATH = [string]::Join(
+            [System.IO.Path]::PathSeparator,
+            @($workspace, $testPackageRoot, $sourceRoot)
+          )
           $unittestArgs = @(
             "-B", "-m", "unittest",
             "tests.test_git_guard",
