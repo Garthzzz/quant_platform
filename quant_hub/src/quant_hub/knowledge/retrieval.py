@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
 import sqlite3
 import time
@@ -25,6 +26,10 @@ from .semantic import EnrichedSnapshot, KnowledgeItem
 
 
 INDEX_VERSION = "qrh-structured-lexical-index/v1.15-bounded-query-input"
+LIKE_BASELINE_INDEX_VERSION = "qrh-archive-sqlite-whole-query-like-baseline/v2"
+ARCHIVE_LIKE_PROJECTION_SCHEMA = "qrh-archive-like-projection/v2-source-receipt"
+ARCHIVE_LIKE_PROJECTION_DIAGNOSTIC = "CALLER_SUPPLIED_DIAGNOSTIC"
+ARCHIVE_LIKE_PROJECTION_AUTHORITY = "ARCHIVE_CATALOG_READ_ONLY_EXPORT"
 RETRIEVAL_ARTIFACT_SCHEMA = "qrh-lexical-retrieval-records/v3"
 MAX_QUERY_CHARS = 500
 MAX_SEARCH_LIMIT = 100
@@ -3068,39 +3073,796 @@ class ArtifactKnowledgeIndex(KnowledgeIndex):
 
 
 class LikeBaselineIndex(KnowledgeIndex):
-    """Adapter matching the legacy `%whole query%` LIKE search semantics."""
+    """Legacy Archive ``%whole query%`` SQLite LIKE quality baseline.
 
-    def search(self, query: str, **kwargs: Any) -> SearchResponse:
-        limit = int(kwargs.get("limit", 8))
-        expanded = super().search(query, **{**kwargs, "limit": max(limit, len(self.records))})
-        literal = query.casefold().strip()
-        selected = [
-            card
-            for card in expanded.cards
-            if literal in card.title.casefold() or literal in card.text.casefold()
-        ][:limit]
-        cards = tuple(replace(card, rank=index) for index, card in enumerate(selected, 1))
+    The baseline deliberately does not call :meth:`KnowledgeIndex.search`.
+    Doing so would let the candidate's routing, applicability and no-answer
+    gates pre-filter the baseline corpus and can make the legacy search look
+    weaker than it really is.  Instead, this adapter materializes the same
+    document-level ``title_text/search_text LIKE ? ESCAPE '\\'`` query shape as
+    ``ArchiveCatalog.search`` over every raw chunk, then maps selected documents
+    back to their literal source cards for grounded evaluation.  Archive
+    projection/presentation inputs are mandatory: without exact frozen
+    ``title_text/search_text``, display-title ordering, hidden research and
+    public-search line filtering, equivalence cannot be claimed.
+    """
+
+    _INDEX_VERSION = LIKE_BASELINE_INDEX_VERSION
+
+    @staticmethod
+    def _database_bundle_identity(database_path: Path) -> dict[str, object]:
+        """Hash the SQLite database and WAL without opening a write handle."""
+
+        files: list[dict[str, object]] = []
+        for suffix in ("", "-wal"):
+            candidate = Path(f"{database_path}{suffix}")
+            if not candidate.is_file():
+                continue
+            digest = hashlib.sha256()
+            size = 0
+            with candidate.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+            files.append(
+                {
+                    "role": "database" if not suffix else "wal",
+                    "bytes": size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        if not files or files[0]["role"] != "database":
+            raise ValueError("ArchiveCatalog database is unavailable")
+        return {"files": files}
+
+    @classmethod
+    def from_archive_catalog(
+        cls,
+        base: BaseSnapshot,
+        catalog: object,
+        enriched: EnrichedSnapshot | None = None,
+        *,
+        citation_projection: CitationProjection | None = None,
+    ) -> "LikeBaselineIndex":
+        """Export the exact live ArchiveCatalog projection through a read-only DB.
+
+        This is the only qualifying constructor.  The ordinary constructor is
+        retained for diagnostics and public synthetic tests, but its artifact
+        is explicitly non-authoritative and therefore cannot pass the final
+        retrieval comparison gate.
+        """
+
+        from quant_hub.archive.catalog import ArchiveCatalog
+
+        if not isinstance(catalog, ArchiveCatalog):
+            raise ValueError("Archive LIKE qualification requires ArchiveCatalog")
+        database_path = Path(catalog.settings.archive_database_path).resolve()
+        before = cls._database_bundle_identity(database_path)
+        connection = sqlite3.connect(
+            f"{database_path.as_uri()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                """
+                SELECT search.research_id,search.document_version_id,
+                       search.title_text,search.search_text,
+                       research.display_title,research.canonical_slug,
+                       document.document_id
+                FROM document_search_projection AS search
+                JOIN research USING(research_id)
+                JOIN research_document_version AS version
+                  ON version.document_version_id=search.document_version_id
+                JOIN research_document AS document
+                  ON document.document_id=version.document_id
+                ORDER BY research.display_title,search.document_version_id
+                """
+            ).fetchall()
+        finally:
+            connection.close()
+        after = cls._database_bundle_identity(database_path)
+        if before != after:
+            raise ValueError("ArchiveCatalog database changed during projection export")
+        if not rows:
+            raise ValueError("ArchiveCatalog projection export is empty")
+
+        display_titles: dict[str, str] = {}
+        presented_titles: dict[str, str] = {}
+        title_texts: dict[str, str] = {}
+        search_texts: dict[str, str] = {}
+        hidden_research_ids: set[str] = set()
+        exported_rows: list[dict[str, str]] = []
+        for row in rows:
+            research_id = str(row["research_id"])
+            version_id = str(row["document_version_id"])
+            document_id = str(row["document_id"])
+            display_title = str(row["display_title"])
+            canonical_slug = str(row["canonical_slug"])
+            presented_title = catalog.presentation.research_title(
+                canonical_slug, display_title
+            )
+            previous = display_titles.setdefault(research_id, display_title)
+            previous_presented = presented_titles.setdefault(
+                research_id, presented_title
+            )
+            if previous != display_title or previous_presented != presented_title:
+                raise ValueError("ArchiveCatalog research presentation is inconsistent")
+            if version_id in title_texts or version_id in search_texts:
+                raise ValueError("ArchiveCatalog projection has duplicate versions")
+            base_version = base.versions.get(version_id)
+            if (
+                base_version is None
+                or base_version.document_id != document_id
+                or base_version.research_id != research_id
+            ):
+                raise ValueError("ArchiveCatalog projection identity differs from base")
+            title_texts[version_id] = str(row["title_text"])
+            search_texts[version_id] = str(row["search_text"])
+            if canonical_slug in catalog.presentation.hidden_research_slugs:
+                hidden_research_ids.add(research_id)
+            exported_rows.append(
+                {
+                    "research_id": research_id,
+                    "document_version_id": version_id,
+                    "document_id": document_id,
+                    "display_title": display_title,
+                    "canonical_slug": canonical_slug,
+                    "presented_title": presented_title,
+                    "title_text": str(row["title_text"]),
+                    "search_text": str(row["search_text"]),
+                    "page_url": f"/research/{research_id}/documents/{document_id}",
+                }
+            )
+
+        instance = cls(
+            base,
+            enriched,
+            citation_projection=citation_projection,
+            display_titles_by_research_id=display_titles,
+            presented_titles_by_research_id=presented_titles,
+            title_text_by_version_id=title_texts,
+            search_text_by_version_id=search_texts,
+            hidden_research_ids=tuple(sorted(hidden_research_ids)),
+            search_excluded_line_markers=tuple(
+                catalog.presentation.search_excluded_line_markers
+            ),
+        )
+        diagnostic = json.loads(instance._evaluation_projection_artifact)
+        exported_bytes = canonical_json(exported_rows).encode("utf-8")
+        source_receipt = {
+            "authority": ARCHIVE_LIKE_PROJECTION_AUTHORITY,
+            "producer": "quant_hub.archive.catalog.ArchiveCatalog.search/v1",
+            "base_snapshot_id": base.snapshot_id,
+            "database_bundle": before,
+            "exported_rows": len(exported_rows),
+            "exported_rows_sha256": hashlib.sha256(exported_bytes).hexdigest(),
+            "presentation_sha256": "",
+        }
+        archive_presentation = {
+            "hidden_research_slugs": sorted(
+                catalog.presentation.hidden_research_slugs
+            ),
+            "search_excluded_line_markers": list(
+                sorted(set(catalog.presentation.search_excluded_line_markers))
+            ),
+        }
+        source_receipt["presentation_sha256"] = hashlib.sha256(
+            canonical_json(archive_presentation).encode("utf-8")
+        ).hexdigest()
+        diagnostic["schema_version"] = ARCHIVE_LIKE_PROJECTION_SCHEMA
+        diagnostic["authority"] = ARCHIVE_LIKE_PROJECTION_AUTHORITY
+        diagnostic["source_receipt"] = source_receipt
+        diagnostic["archive_catalog_export_rows"] = exported_rows
+        diagnostic["archive_presentation"] = archive_presentation
+        instance._evaluation_projection_artifact = canonical_json(diagnostic).encode(
+            "utf-8"
+        )
+        instance._evaluation_source_receipt = canonical_json(source_receipt).encode(
+            "utf-8"
+        )
+        instance._evaluation_projection_authority = (
+            ARCHIVE_LIKE_PROJECTION_AUTHORITY
+        )
+        instance._archive_catalog_database_path = database_path
+        return instance
+
+    def __init__(
+        self,
+        base: BaseSnapshot,
+        enriched: EnrichedSnapshot | None = None,
+        *,
+        citation_projection: CitationProjection | None = None,
+        display_titles_by_research_id: Mapping[str, str],
+        presented_titles_by_research_id: Mapping[str, str],
+        title_text_by_version_id: Mapping[str, str],
+        search_text_by_version_id: Mapping[str, str],
+        hidden_research_ids: Sequence[str],
+        search_excluded_line_markers: Sequence[str],
+    ) -> None:
+        baseline_started = time.perf_counter()
+        super().__init__(
+            base,
+            enriched,
+            citation_projection=citation_projection,
+        )
+        display_titles = dict(display_titles_by_research_id)
+        presented_titles = dict(presented_titles_by_research_id)
+        title_texts = dict(title_text_by_version_id)
+        search_texts = dict(search_text_by_version_id)
+        if (
+            isinstance(hidden_research_ids, (str, bytes))
+            or isinstance(search_excluded_line_markers, (str, bytes))
+            or any(not isinstance(value, str) for value in hidden_research_ids)
+            or any(
+                not isinstance(value, str)
+                for value in search_excluded_line_markers
+            )
+        ):
+            raise ValueError("Archive LIKE presentation filters must be string sequences")
+        hidden = tuple(sorted(hidden_research_ids))
+        excluded_markers = tuple(
+            sorted(value.casefold() for value in search_excluded_line_markers)
+        )
+        version_ids = {
+            document.active_version_id
+            for document in base.documents.values()
+            if document.status == "active" and document.active_version_id is not None
+        }
+        research_ids = {
+            base.versions[version_id].research_id for version_id in version_ids
+        }
+        if (
+            set(display_titles) != research_ids
+            or set(presented_titles) != research_ids
+            or set(title_texts) != version_ids
+            or set(search_texts) != version_ids
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or not value
+                for key, value in display_titles.items()
+            )
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or not value
+                for key, value in presented_titles.items()
+            )
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or not value
+                for key, value in title_texts.items()
+            )
+            or any(
+                not isinstance(key, str)
+                or not isinstance(value, str)
+                or not key
+                or not value
+                for key, value in search_texts.items()
+            )
+            or any(value not in research_ids for value in hidden)
+            or len(set(hidden)) != len(hidden)
+            or any(not value for value in excluded_markers)
+            or len(set(excluded_markers)) != len(excluded_markers)
+        ):
+            raise ValueError("Archive LIKE presentation inputs are invalid or incomplete")
+        self._hidden_research_ids = hidden
+        self._search_excluded_line_markers = excluded_markers
+        projection_identity = {
+            "base_snapshot_id": base.snapshot_id,
+            "display_titles_by_research_id": dict(sorted(display_titles.items())),
+            "presented_titles_by_research_id": dict(
+                sorted(presented_titles.items())
+            ),
+            "title_text_by_version_id": dict(sorted(title_texts.items())),
+            "search_text_by_version_id": {
+                version_id: {
+                    "bytes": len(search_texts[version_id].encode("utf-8")),
+                    "sha256": hashlib.sha256(
+                        search_texts[version_id].encode("utf-8")
+                    ).hexdigest(),
+                }
+                for version_id in sorted(search_texts)
+            },
+            "hidden_research_ids": list(hidden),
+            "search_excluded_line_markers": list(excluded_markers),
+        }
+        projection_sha256 = hashlib.sha256(
+            canonical_json(projection_identity).encode("utf-8")
+        ).hexdigest()
+        self._INDEX_VERSION = (
+            f"{LIKE_BASELINE_INDEX_VERSION}+projection-{projection_sha256}"
+        )
+        self._fts.execute(
+            """
+            CREATE TABLE archive_like_projection(
+                document_version_id TEXT PRIMARY KEY,
+                research_id TEXT NOT NULL,
+                display_title TEXT NOT NULL,
+                presented_title TEXT NOT NULL,
+                title_text TEXT NOT NULL,
+                search_text TEXT NOT NULL,
+                active_status TEXT NOT NULL
+            ) STRICT
+            """
+        )
+        rows: list[tuple[str, str, str, str, str, str, str]] = []
+        by_version: dict[str, list[_Record]] = defaultdict(list)
+        for record in self._chunk_records:
+            by_version[record.document_version_id].append(record)
+        if not version_ids <= set(by_version):
+            raise ValueError("Archive LIKE projection has a version without raw evidence")
+        for version_id in sorted(version_ids):
+            records = by_version[version_id]
+            ordered = sorted(
+                records,
+                key=lambda row: (
+                    row.locator.byte_start,
+                    row.locator.byte_end,
+                    row.record_id,
+                ),
+            )
+            rows.append(
+                (
+                    version_id,
+                    ordered[0].research_id,
+                    display_titles[ordered[0].research_id],
+                    presented_titles[ordered[0].research_id],
+                    title_texts[version_id],
+                    search_texts[version_id],
+                    ordered[0].active_status,
+                )
+            )
+        self._fts.executemany(
+            "INSERT INTO archive_like_projection VALUES(?,?,?,?,?,?,?)",
+            rows,
+        )
+        self._fts.commit()
+        # This is the exact, canonical producer artifact consumed by the
+        # retrieval comparison verifier.  It carries the actual ordered
+        # ArchiveCatalog projection rows rather than a class-name assertion.
+        self._evaluation_projection_artifact = canonical_json(
+            {
+                "schema_version": ARCHIVE_LIKE_PROJECTION_SCHEMA,
+                "authority": ARCHIVE_LIKE_PROJECTION_DIAGNOSTIC,
+                "producer": "quant_hub.archive.catalog.ArchiveCatalog.search/v1",
+                "query_contract": {
+                    "where": "title_text LIKE ? OR search_text LIKE ?",
+                    "order_by": "display_title,document_version_id",
+                    "limit_scope": "document",
+                    "snippet_context_before_chars": 60,
+                    "snippet_context_after_chars": 120,
+                },
+                "base_snapshot_id": base.snapshot_id,
+                "rows": [
+                    {
+                        "document_version_id": row[0],
+                        "research_id": row[1],
+                        "display_title": row[2],
+                        "presented_title": row[3],
+                        "title_text": row[4],
+                        "search_text": row[5],
+                        "active_status": row[6],
+                    }
+                    for row in rows
+                ],
+                "hidden_research_ids": list(hidden),
+                "search_excluded_line_markers": list(excluded_markers),
+            }
+        ).encode("utf-8")
+        self._evaluation_projection_authority = ARCHIVE_LIKE_PROJECTION_DIAGNOSTIC
+        self._evaluation_source_receipt = b""
+        self._archive_catalog_database_path: Path | None = None
+        page_count = int(self._fts.execute("PRAGMA page_count").fetchone()[0])
+        page_size = int(self._fts.execute("PRAGMA page_size").fetchone()[0])
+        self.index_footprint_bytes = page_count * page_size
+        self.build_latency_ms = (time.perf_counter() - baseline_started) * 1000
+
+    @property
+    def index_version(self) -> str:
+        return self._INDEX_VERSION
+
+    def evaluation_projection_artifact_bytes(self) -> bytes:
+        """Return the exact Archive projection producer input for evaluation."""
+
+        return self._evaluation_projection_artifact
+
+    def evaluation_projection_authority(self) -> str:
+        """Return whether the projection came from the real read-only producer."""
+
+        return self._evaluation_projection_authority
+
+    def qualification_source_receipt_bytes(self) -> bytes:
+        """Return the exact ArchiveCatalog export receipt, or empty diagnostics."""
+
+        return self._evaluation_source_receipt
+
+    def _public_search_text(self, source_text: str) -> str:
+        return "\n".join(
+            line
+            for line in source_text.splitlines()
+            if not any(
+                marker in line.casefold()
+                for marker in self._search_excluded_line_markers
+            )
+        )
+
+    def search(
+        self,
+        query: str,
+        *,
+        context: TaskContext | None = None,
+        limit: int = 8,
+        include_history: bool = False,
+        include_conflicts: bool = False,
+        minimum_score: float = 0.35,
+        minimum_weighted_coverage: float = 0.12,
+    ) -> SearchResponse:
+        context = TaskContext() if context is None else context
+        _validate_search_inputs(
+            query,
+            context,
+            limit,
+            include_history,
+            include_conflicts,
+            minimum_score,
+            minimum_weighted_coverage,
+        )
+        # ArchiveCatalog has no historical-search switch: even when a qrel asks
+        # the candidate to expose history, the legacy comparison remains on its
+        # active projection.  Do not silently broaden it to superseded versions.
+        literal = query.strip()
+        like = f"%{literal.replace('%', r'\%').replace('_', r'\_')}%"
+        hidden_clause = (
+            " AND research_id NOT IN ("
+            + ",".join("?" for _ in self._hidden_research_ids)
+            + ")"
+            if self._hidden_research_ids
+            else ""
+        )
+        selected_rows = tuple(
+            self._fts.execute(
+                f"""
+                SELECT document_version_id,presented_title,search_text
+                FROM archive_like_projection
+                WHERE (title_text LIKE ? ESCAPE '\\'
+                   OR search_text LIKE ? ESCAPE '\\')
+                  AND active_status='active'
+                {hidden_clause}
+                ORDER BY display_title,document_version_id
+                LIMIT ?
+                """,
+                (like, like, *self._hidden_research_ids, limit),
+            ).fetchall()
+        )
+        folded = literal.casefold()
+        selected_records: list[tuple[_Record, str, str]] = []
+        selected_version_count = 0
+        for selected in selected_rows:
+            version_id = str(selected[0])
+            public_text = self._public_search_text(str(selected[2]))
+            if (
+                folded not in public_text.casefold()
+                and folded not in str(selected[1]).casefold()
+            ):
+                continue
+            selected_version_count += 1
+            records = sorted(
+                (
+                    record
+                    for record in self._chunk_records
+                    if record.document_version_id == version_id
+                ),
+                key=lambda row: (
+                    row.locator.byte_start,
+                    row.locator.byte_end,
+                    row.record_id,
+                ),
+            )
+            literal_records = [
+                record
+                for record in records
+                if folded in record.title.casefold()
+                or folded in self._public_search_text(record.text).casefold()
+            ]
+            if literal_records:
+                # Archive SQLite LIKE applies LIMIT to document rows.  Keep one
+                # deterministic relevance unit per selected document; emitting
+                # every matching chunk here would silently turn document LIMIT
+                # into chunk LIMIT and displace later selected documents.
+                record = literal_records[0]
+            elif records:
+                # Archive LIKE returns a document-level hit.  A title-only hit
+                # has no narrower literal passage, so expose its first raw
+                # source card without manufacturing a semantic locator.
+                record = records[0]
+            else:
+                continue
+            position = public_text.casefold().find(folded)
+            if position < 0:
+                position = 0
+            start = max(0, position - 60)
+            end = min(len(public_text), position + len(literal) + 120)
+            snippet = (
+                ("…" if start else "")
+                + public_text[start:end]
+                + ("…" if end < len(public_text) else "")
+            )
+            selected_records.append((record, str(selected[1]), snippet))
+        selected_records = selected_records[:limit]
+        cards = tuple(
+            EvidenceCard(
+                evidence_id=record.record_id,
+                canonical_key=_record_canonical_key(record),
+                document_id=record.document_id,
+                document_version_id=record.document_version_id,
+                research_id=record.research_id,
+                title=presented_title,
+                text=snippet,
+                score=1.0,
+                rank=rank,
+                source_kind="chunk",
+                fact_status=record.fact_status,
+                knowledge_enrichment=record.knowledge_enrichment,
+                active_status=record.active_status,
+                knowledge_kind=None,
+                cluster_id=None,
+                locator=record.locator,
+                covered_span_ids=(record.locator.span_id,),
+                heading_path=record.heading_path,
+                citation_ids=record.citation_ids,
+                hit_reasons=("legacy:archive-sqlite-whole-query-like",),
+                applicability={},
+                applicability_matches=(),
+                applicability_conflicts=(),
+                limitations=(),
+                failures=(),
+            )
+            for rank, (record, presented_title, snippet) in enumerate(
+                selected_records, 1
+            )
+        )
         return SearchResponse(
             query=query,
             snapshot_id=self.snapshot_id,
-            index_version="qrh-legacy-whole-query-like-baseline/v1",
+            index_version=self._INDEX_VERSION,
             cards=cards,
             answerable=bool(cards),
             no_answer_reason=None if cards else "no_literal_whole_query_match",
-            total_candidates=len(selected),
+            total_candidates=selected_version_count,
         )
 
 
+def validate_authoritative_archive_like_projection(
+    index: KnowledgeIndex,
+) -> dict[str, object]:
+    """Validate the exact live ArchiveCatalog producer extension and receipt.
+
+    Qualification deliberately uses an exact type check.  A plain index, a
+    diagnostic LIKE adapter, or a subclass that merely reports the authority
+    string cannot satisfy this contract.
+    """
+
+    if type(index) is not LikeBaselineIndex:
+        raise ValueError("qualification baseline is not exact LikeBaselineIndex")
+    if (
+        index.evaluation_projection_authority()
+        != ARCHIVE_LIKE_PROJECTION_AUTHORITY
+    ):
+        raise ValueError("Archive LIKE projection is diagnostic")
+    database_path = index._archive_catalog_database_path
+    if database_path is None:
+        raise ValueError("ArchiveCatalog source path is unavailable")
+    live_bundle_at_entry = LikeBaselineIndex._database_bundle_identity(
+        database_path
+    )
+    artifact_bytes = index.evaluation_projection_artifact_bytes()
+    receipt_bytes = index.qualification_source_receipt_bytes()
+    try:
+        artifact = json.loads(artifact_bytes.decode("utf-8", errors="strict"))
+        receipt = json.loads(receipt_bytes.decode("utf-8", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError, AttributeError) as error:
+        raise ValueError("Archive LIKE qualification evidence is invalid JSON") from error
+    artifact_fields = {
+        "schema_version", "authority", "producer", "query_contract",
+        "base_snapshot_id", "rows", "hidden_research_ids",
+        "search_excluded_line_markers", "source_receipt",
+        "archive_catalog_export_rows", "archive_presentation",
+    }
+    receipt_fields = {
+        "authority", "producer", "base_snapshot_id", "database_bundle",
+        "exported_rows", "exported_rows_sha256", "presentation_sha256",
+    }
+    query_contract = {
+        "where": "title_text LIKE ? OR search_text LIKE ?",
+        "order_by": "display_title,document_version_id",
+        "limit_scope": "document",
+        "snippet_context_before_chars": 60,
+        "snippet_context_after_chars": 120,
+    }
+    if (
+        not isinstance(artifact, dict)
+        or set(artifact) != artifact_fields
+        or canonical_json(artifact).encode("utf-8") != artifact_bytes
+        or artifact.get("schema_version") != ARCHIVE_LIKE_PROJECTION_SCHEMA
+        or artifact.get("authority") != ARCHIVE_LIKE_PROJECTION_AUTHORITY
+        or artifact.get("producer")
+        != "quant_hub.archive.catalog.ArchiveCatalog.search/v1"
+        or artifact.get("base_snapshot_id") != index.base.snapshot_id
+        or artifact.get("query_contract") != query_contract
+        or not isinstance(receipt, dict)
+        or set(receipt) != receipt_fields
+        or canonical_json(receipt).encode("utf-8") != receipt_bytes
+        or artifact.get("source_receipt") != receipt
+        or receipt.get("authority") != ARCHIVE_LIKE_PROJECTION_AUTHORITY
+        or receipt.get("producer")
+        != "quant_hub.archive.catalog.ArchiveCatalog.search/v1"
+        or receipt.get("base_snapshot_id") != index.base.snapshot_id
+        or type(receipt.get("exported_rows")) is not int
+        or receipt.get("exported_rows", 0) < 1
+        or not isinstance(receipt.get("exported_rows_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["exported_rows_sha256"])
+        is None
+        or not isinstance(receipt.get("presentation_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt["presentation_sha256"])
+        is None
+    ):
+        raise ValueError("Archive LIKE qualification envelope is not exact")
+
+    database_bundle = receipt["database_bundle"]
+    database_files = (
+        database_bundle.get("files")
+        if isinstance(database_bundle, dict)
+        and set(database_bundle) == {"files"}
+        else None
+    )
+    if (
+        not isinstance(database_files, list)
+        or [row.get("role") for row in database_files if isinstance(row, dict)]
+        not in (["database"], ["database", "wal"])
+        or any(
+            not isinstance(row, dict)
+            or set(row) != {"role", "bytes", "sha256"}
+            or type(row["bytes"]) is not int
+            or row["bytes"] < 1
+            or not isinstance(row["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None
+            for row in database_files
+        )
+    ):
+        raise ValueError("Archive LIKE database receipt is invalid")
+    if live_bundle_at_entry != database_bundle:
+        raise ValueError("ArchiveCatalog source changed after projection export")
+
+    presentation = artifact["archive_presentation"]
+    if (
+        not isinstance(presentation, dict)
+        or set(presentation)
+        != {"hidden_research_slugs", "search_excluded_line_markers"}
+        or any(
+            not isinstance(values, list)
+            or any(not isinstance(value, str) or not value for value in values)
+            or values != sorted(set(values))
+            for values in presentation.values()
+        )
+        or hashlib.sha256(canonical_json(presentation).encode("utf-8")).hexdigest()
+        != receipt["presentation_sha256"]
+        or artifact["search_excluded_line_markers"]
+        != presentation["search_excluded_line_markers"]
+    ):
+        raise ValueError("Archive LIKE presentation receipt is invalid")
+
+    rows = artifact["rows"]
+    exported = artifact["archive_catalog_export_rows"]
+    row_fields = {
+        "document_version_id", "research_id", "display_title",
+        "presented_title", "title_text", "search_text", "active_status",
+    }
+    export_fields = {
+        "research_id", "document_version_id", "document_id", "display_title",
+        "canonical_slug", "presented_title", "title_text", "search_text",
+        "page_url",
+    }
+    if (
+        not isinstance(rows, list)
+        or not rows
+        or not isinstance(exported, list)
+        or len(rows) != len(exported)
+        or receipt["exported_rows"] != len(exported)
+        or hashlib.sha256(canonical_json(exported).encode("utf-8")).hexdigest()
+        != receipt["exported_rows_sha256"]
+        or any(
+            not isinstance(row, dict)
+            or set(row) != row_fields
+            or any(
+                not isinstance(row[name], str) or not row[name]
+                for name in row_fields
+            )
+            or row["active_status"] != "active"
+            for row in rows
+        )
+        or any(
+            not isinstance(row, dict)
+            or set(row) != export_fields
+            or any(
+                not isinstance(row[name], str) or not row[name]
+                for name in export_fields
+            )
+            for row in exported
+        )
+    ):
+        raise ValueError("Archive LIKE exported projection rows are invalid")
+
+    active_version_ids = {
+        document.active_version_id
+        for document in index.base.documents.values()
+        if document.status == "active" and document.active_version_id is not None
+    }
+    if (
+        [row["document_version_id"] for row in rows]
+        != sorted(active_version_ids)
+        or {row["document_version_id"] for row in exported}
+        != active_version_ids
+        or len({row["document_version_id"] for row in exported})
+        != len(exported)
+    ):
+        raise ValueError("Archive LIKE export does not cover exact active versions")
+    hidden_slugs = set(presentation["hidden_research_slugs"])
+    expected_hidden_ids: set[str] = set()
+    rows_by_version = {row["document_version_id"]: row for row in rows}
+    for export in exported:
+        row = rows_by_version[export["document_version_id"]]
+        version = index.base.versions[export["document_version_id"]]
+        if (
+            row["document_version_id"] != export["document_version_id"]
+            or row["research_id"] != export["research_id"]
+            or row["display_title"] != export["display_title"]
+            or row["presented_title"] != export["presented_title"]
+            or row["title_text"] != export["title_text"]
+            or row["search_text"] != export["search_text"]
+            or version.document_id != export["document_id"]
+            or version.research_id != export["research_id"]
+            or export["page_url"]
+            != (
+                f"/research/{export['research_id']}/documents/"
+                f"{export['document_id']}"
+            )
+        ):
+            raise ValueError("Archive LIKE row/source identity differs")
+        if export["canonical_slug"] in hidden_slugs:
+            expected_hidden_ids.add(export["research_id"])
+    if artifact["hidden_research_ids"] != sorted(expected_hidden_ids):
+        raise ValueError("Archive LIKE hidden presentation projection differs")
+    live_bundle_at_exit = LikeBaselineIndex._database_bundle_identity(
+        database_path
+    )
+    if not (
+        live_bundle_at_entry == live_bundle_at_exit == database_bundle
+    ):
+        raise ValueError("ArchiveCatalog source changed during qualification")
+    return artifact
+
+
 __all__ = [
+    "ARCHIVE_LIKE_PROJECTION_AUTHORITY",
+    "ARCHIVE_LIKE_PROJECTION_DIAGNOSTIC",
+    "ARCHIVE_LIKE_PROJECTION_SCHEMA",
     "EvidenceCard",
     "EvidenceLocator",
     "ArtifactKnowledgeIndex",
     "INDEX_VERSION",
     "KnowledgeIndex",
+    "LIKE_BASELINE_INDEX_VERSION",
     "LikeBaselineIndex",
     "RETRIEVAL_ARTIFACT_SCHEMA",
     "SearchResponse",
     "TaskContext",
     "citation_ids_for_evidence_bindings",
     "citation_attributions_for_evidence_binding",
+    "validate_authoritative_archive_like_projection",
 ]

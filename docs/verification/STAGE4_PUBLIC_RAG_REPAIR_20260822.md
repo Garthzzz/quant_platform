@@ -10,6 +10,23 @@ sealed holdout、私有 qrels 或 `stage_evidence/stage4_holdout_v*`，也没有
 公开开发集不是 release qualification 证据；它只用于复现一般性机制、回归和
 性能对照。
 
+> **后续机械更正：**本文最初记录的 legacy whole-query LIKE 数值来自旧
+> `LikeBaselineIndex`。该适配器先调用 structured candidate search 再做 literal
+> filter，并不等价于现网 `document_search_projection LIKE`，所以本文下方旧 LIKE
+> 数值不得作为 5.10 比较证据。现实现已改为独立的
+> `qrh-archive-sqlite-whole-query-like-baseline/v2`：对全部 raw chunk 先物化
+> SQLite `%whole query%` document projection，再映射 grounded source cards，完全不
+> 调用 candidate search。其 SQL 的 LIKE 转义与 `ORDER BY display_title,
+> document_version_id` 对齐 `ArchiveCatalog.search`，并要求调用方显式传入冻结的
+> `document_search_projection.title_text/search_text`、排序用 display title、过滤用
+> presentation title、hidden research 和 `public_search_text` 排除 marker；输入不完整即
+> 拒绝，baseline index identity 还会
+> 纳入这份冻结 projection/presentation 的 SHA-256，不能在预注册后换基线语料。
+> 本文公开夹具机械断言 hidden 与排除 marker 均为空，因此只在该冻结前提下构成等价基线，
+> 不把它外推为任意生产 presentation 的无条件等价。正式比较还必须使用运行前 canonical
+> preregistration，强绑同一 qrel suite hash、candidate/baseline index identity、
+> 困难 slice 和总体 Recall/nDCG/MRR/no-answer 门禁；本文历史表不据此回填 PASS。
+
 ## 一般性根因
 
 1. 确定性 chunk 能命中正向 source locator，但结构化 knowledge summary 可能以

@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schemas/stage5_release_certificate.schema.json",
+  "title": "Quant Research Hub Stage 5 release certificate v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "certificate_id", "issued_at", "authority", "repository", "commit_sha", "release", "d_prior", "final_recovery", "state_only_task", "artifact_refs", "gate_evidence", "runbook_evidence", "certificate_sha256"],
+  "properties": {
+    "schema_version": {"const": "qrh-stage5-release-certificate/v3"},
+    "certificate_id": {"type": "string", "pattern": "^stage5-[0-9a-f]{32}$"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "authority": {"const": "evidence_only"},
+    "repository": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository_id", "full_name", "visibility", "observation_sha256"],
+      "properties": {
+        "repository_id": {"$ref": "#/$defs/id"}, "full_name": {"type": "string"},
+        "visibility": {"const": "public"}, "observation_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "release": {"$ref": "#/$defs/release"},
+    "d_prior": {
+      "type": "object", "additionalProperties": false,
+      "required": ["release_id", "manifest_sha256", "measurement_binding_sha256", "rollback_receipt_sha256"],
+      "properties": {"release_id": {"$ref": "#/$defs/id"}, "manifest_sha256": {"$ref": "#/$defs/sha256"}, "measurement_binding_sha256": {"$ref": "#/$defs/sha256"}, "rollback_receipt_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "final_recovery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bundle_id", "recovery_manifest_sha256", "checkpoint_id", "checkpoint_manifest_sha256", "failure_domain_attestation_sha256", "recovery_receipt_id", "recovery_receipt_sha256"],
+      "properties": {"bundle_id": {"$ref": "#/$defs/id"}, "recovery_manifest_sha256": {"$ref": "#/$defs/sha256"}, "checkpoint_id": {"$ref": "#/$defs/id"}, "checkpoint_manifest_sha256": {"$ref": "#/$defs/sha256"}, "failure_domain_attestation_sha256": {"$ref": "#/$defs/sha256"}, "recovery_receipt_id": {"$ref": "#/$defs/id"}, "recovery_receipt_sha256": {"$ref": "#/$defs/sha256"}}
+    },
+    "state_only_task": {
+      "type": "object", "additionalProperties": false,
+      "required": ["task_identity", "contract_sha256", "task_xml_sha256", "inspection_sha256", "authority_sha256", "project_root", "config_path", "config_sha256", "operational_root", "executable_sha256", "recovery_root", "failure_domain_attestation_path"],
+      "properties": {
+        "task_identity": {"const": "\\QuantResearchHub\\StateOnlyBackup"},
+        "contract_sha256": {"$ref": "#/$defs/sha256"},
+        "task_xml_sha256": {"$ref": "#/$defs/sha256"},
+        "inspection_sha256": {"$ref": "#/$defs/sha256"},
+        "authority_sha256": {"$ref": "#/$defs/sha256"},
+        "project_root": {"type": "string", "minLength": 1},
+        "config_path": {"type": "string", "minLength": 1},
+        "config_sha256": {"$ref": "#/$defs/sha256"},
+        "operational_root": {"type": "string", "minLength": 1},
+        "executable_sha256": {"$ref": "#/$defs/sha256"},
+        "recovery_root": {"type": "string", "minLength": 1},
+        "failure_domain_attestation_path": {"type": "string", "minLength": 1}
+      }
+    },
+    "artifact_refs": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository_observation", "release_manifest", "measured_prior_binding", "recovery_manifest", "checkpoint_manifest", "failure_domain_attestation", "recovery_receipt", "task_candidate", "task_inspection"],
+      "properties": {
+        "repository_observation": {"$ref": "#/$defs/artifact_ref"}, "release_manifest": {"$ref": "#/$defs/artifact_ref"},
+        "measured_prior_binding": {"$ref": "#/$defs/artifact_ref"}, "recovery_manifest": {"$ref": "#/$defs/artifact_ref"},
+        "checkpoint_manifest": {"$ref": "#/$defs/artifact_ref"}, "failure_domain_attestation": {"$ref": "#/$defs/artifact_ref"},
+        "recovery_receipt": {"$ref": "#/$defs/artifact_ref"}, "task_candidate": {"$ref": "#/$defs/artifact_ref"},
+        "task_inspection": {"$ref": "#/$defs/artifact_ref"}
+      }
+    },
+    "gate_evidence": {"type": "array", "minItems": 11, "maxItems": 11, "items": {"$ref": "#/$defs/artifact_ref"}},
+    "runbook_evidence": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/artifact_ref"}},
+    "certificate_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,179}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "release": {"type": "object", "additionalProperties": false, "required": ["release_id", "manifest_sha256", "snapshot_id"], "properties": {"release_id": {"$ref": "#/$defs/id"}, "manifest_sha256": {"$ref": "#/$defs/sha256"}, "snapshot_id": {"$ref": "#/$defs/id"}}},
+    "artifact_ref": {"type": "object", "additionalProperties": false, "required": ["kind", "locator", "sha256"], "properties": {"kind": {"$ref": "#/$defs/id"}, "locator": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$"}, "sha256": {"$ref": "#/$defs/sha256"}}}
+  }
+}

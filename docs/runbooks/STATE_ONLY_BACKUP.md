@@ -26,6 +26,21 @@ retained cold bundle 的 R/RM/C、全部 retained state-only RM/C 和闭包；�
 `deletion_authorized=false`，不能作为删除许可。Stage 5 还必须把实测 D prior manifest
 hash 与报告中的 `retained_release_roots` 对齐后，才可放行任何独立清理器。
 
+每日任务现在强制读取唯一固定输入：
+
+```text
+<RECOVERY_ROOT>\state-only\control\measured_prior_release.json
+```
+
+该 canonical `qrh-measured-prior-release/v2` 必须把当前 active R 绑定到一个 ID 与 manifest
+都不同的 prior R，并通过固定相对 locator 读取、重算和分类验证真实 canonical
+`qrh-d-prior-rollback-receipt/v1` bytes。receipt 的 prior activation、health、writer fence、
+artifact locator 必须精确为 `stage5/d_prior/rollback_receipt.json`；
+active restore 必须全部成功，且 measurement 不得早于 rollback。active 已变化、prior 与 active 相同、binding
+哈希错误或 prior 不在 retained verified cold closure 中时，任务在 capture 前 fail closed，且不
+生成 GC roots 报告。GC 报告显式写入 `measured_prior_release_manifest_sha256` 与
+`measured_prior_binding_sha256`；扫描到一个“看起来较旧”的 release 不能替代实测 prior。
+
 ## 实施门禁
 
 在真实安装或运行前必须同时满足：
@@ -39,7 +54,16 @@ hash 与报告中的 `retained_release_roots` 对齐后，才可放行任何独�
    闭包时任务 fail closed。
 4. 固定 operational Python 已包含当前 wheel；配置、SSH key 和其他凭据位于 Git 外，
    不写入 task candidate、receipt、manifest、日志或 bundle。
-5. 在 Stage 5 真实 apply 前，只允许 `schedule-candidate` 和 fake-adapter 测试，不得注册
+5. 经独立审核的 Stage 5 evidence producer 已在固定 locator
+   `<RECOVERY_ROOT>\state-only\control\scheduled_task_authority.json` 写入 canonical
+   `qrh-state-only-scheduled-task-authority/v1`。该 authority 必须预先绑定 exact
+   repository/commit/tracked tree/release/snapshot，以及 project/config/operational/recovery/
+   operational Python/failure-domain attestation 的 canonical locator、config/executable
+   bytes 和 attestation SHA-256。Verifier 还会重新调用 `RuntimePublishConfig.load`，要求
+   protected config 声明的 project/recovery/operational/attestation 与 GitHub full name
+   逐项等于 authority。本模块只有 verifier，没有生成该 authority 的 producer；缺失时
+   `schedule-candidate` 必须 fail closed。
+6. 在 Stage 5 真实 apply 前，只允许 `schedule-candidate` 和 fake-adapter 测试，不得注册
    Windows Task Scheduler。
 
 ## 候选、安装与检查
@@ -52,10 +76,19 @@ qrh-state-only-backup schedule-candidate `
   --project-root D:\quant\quant_platform
 ```
 
-候选固定为唯一 `\QuantResearchHub\StateOnlyBackup`：每天 03:00 运行、错过时尽快运行、
-禁止并发实例，失败后每 15 分钟重试一次、最多 3 次。它使用 S4U limited principal，
-不存储密码，不在 VM 注册任务。先核对 candidate JSON、固定 Python、argv、working
-directory 和 contract hash，再显式 apply：
+候选固定为唯一 `\QuantResearchHub\StateOnlyBackup`：按恢复主机本地浮动时区每天 03:00
+运行，且必须同时绑定 StartBoundary、Enabled、错过时尽快运行、仅网络可用时运行、禁止
+并发实例、`PT2H` execution limit，以及失败后每 15 分钟重试一次、最多 3 次。battery、
+idle、wake、on-demand、hidden、hard-terminate 与 priority 也必须在 candidate 中逐项声明，
+不能依赖 Task Scheduler 隐式默认值。它使用
+S4U limited principal，不存储密码；candidate 只绑定当前进程 token 的真实 Windows SID SHA-256，
+禁止使用环境用户名或调用方覆盖值，且不在 VM 注册任务。v5-raw-xml-bound candidate 还必须解引用上述
+fixed authority，绑定当前 recovery root 的完整 failure-domain attestation、其 exact locator、host-facts、
+互不重叠的 strict roots、经真实 runtime-config parser 重放的 config bytes 与固定 operational Python
+executable bytes/hash，并逐字段继承 authority
+中的 repository/commit/tree/release/snapshot。任意存在但未被 authority 精确列出的临时 project、
+config 或 operational root 都必须拒绝。先核对 candidate JSON、argv、working directory、
+contract hash 与导出 Task XML 原始 bytes/SHA-256，再显式 apply：
 
 ```powershell
 qrh-state-only-backup schedule-apply `
@@ -64,9 +97,23 @@ qrh-state-only-backup schedule-apply `
   --allow-os-registration
 ```
 
-重复 apply 必须返回 `unchanged`。Task action、trigger、principal、StartWhenAvailable、
-IgnoreNew、2 小时 execution limit 或 retry 设置任一漂移，都必须返回 drift 并重新受控
-注册；不得另建第二个 backup task。
+重复 apply 必须返回 `unchanged`。Task action、StartBoundary/本地时区语义、Enabled、网络
+条件、principal identity、StartWhenAvailable、IgnoreNew、2 小时 execution limit 或 retry
+设置任一漂移，都必须返回 drift 并重新受控注册；不得另建第二个 backup task。真实 inspect
+必须只把同一次 `Export-ScheduledTask` 的 raw XML base64 返回验证边界；不得把 `$t` 的
+Description、Principal、Trigger、Settings 或 PowerShell 自报 verdict/hash 与 XML 混成第二份观察。
+Python 从 raw bytes 独立重算 XML SHA-256、解析 description contract、规范化 `UserId` SID 后重算
+SID SHA-256，并生成 closed canonical projection。SID decimal form 允许 1–15 个 subauthority；
+大小写、空白和十进制前导零先 canonicalize，16 个及以上 subauthority 必须拒绝。Task namespace/version、RegistrationInfo 的
+Description/URI、唯一 Principal、唯一 CalendarTrigger、完整 Settings allowlist/value 和唯一 Exec
+任一不闭合都不是 exact；trigger disabled、`RandomDelay`、`Repetition`、`EndBoundary`、额外
+trigger/principal/action，或未声明的 battery/idle/wake/on-demand 行为字段均拒绝。调用方自报
+contract、SID hash、projection 或 verdict 不能跳过 raw XML 重放。
+
+成功 apply/unchanged 后必须把同一次 inspect 的完整 XML base64、raw SHA，以及仅从该 XML
+派生的 contract SHA、token SID SHA、closed projection、`observed_at` 与自校验 hash 保存为 canonical
+`<RECOVERY_ROOT>\state-only\control\scheduled_task_inspection.json`。Stage 5 只消费这份完整
+artifact bytes，并以 candidate 重新解析；仅复制终端中的三个 hash 不构成 6.9 acceptance evidence。
 
 人工验证一次运行与状态：
 
@@ -98,6 +145,10 @@ count/restore 全部通过的 checkpoint `captured_at`：
 `state-only\audit\status-observations` 和 `state-only\alerts`，不得被新 checkpoint
 覆盖。运行后还会写 attempt、JSONL 日志、GC roots 报告和必要告警；错误只记录受控
 `error_code/reason_codes`，不得写入异常原文或凭据。
+
+计划任务锁冲突不再从 `with` 入口静默逸出。冲突实例不进入 VM capture，也不争用正常
+attempt JSONL；它会在 `state-only\audit\lock-conflicts` 写唯一 canonical failure observation，
+并在 `state-only\alerts` 写 `state_only_backup_locked` 告警，供 scheduler failure/retry 验收。
 
 成功后必须确认：
 

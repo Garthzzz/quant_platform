@@ -27,15 +27,26 @@ from quant_hub.knowledge.retrieval import ArtifactKnowledgeIndex, TaskContext
 from quant_hub.knowledge_mcp.cli import main as mcp_cli
 from quant_hub.knowledge_mcp.evaluation import (
     AcceptanceCaseDefinition,
+    CodexToolTrace,
+    PreregisteredAcceptanceCase,
+    MAX_ACCEPTANCE_CASES,
     QUALITY_DIMENSIONS,
     ToolChoiceCase,
     ToolTraceEvent,
     build_acceptance_preregistration,
     evaluate_codex_trace,
+    evaluate_preregistered_acceptance,
     evaluate_tool_choice,
     load_codex_tool_trace,
+    load_codex_tool_trace_bytes,
+    record_acceptance_preregistration,
     score_response_markers,
+    validate_acceptance_campaign_receipt_bytes,
     validate_acceptance_preregistration_bytes,
+)
+from quant_hub.knowledge_mcp.acceptance_runner import (
+    fake_dispatch_paths,
+    run_fake_acceptance_arm,
 )
 import quant_hub.knowledge_mcp.install as install_module
 from quant_hub.knowledge_mcp.install import (
@@ -65,6 +76,138 @@ from quant_hub.knowledge_mcp.server import (
     StdioMCPServer,
 )
 from quant_hub.knowledge_mcp.service import KnowledgeMCPService
+
+
+TEST_RUN_ID = "public-fake-run-20260822"
+TEST_MODEL = "fake-codex-model"
+TEST_CONFIG_BYTES = b'{"network":"disabled","tools":"fake-only"}'
+TEST_PREREGISTERED_AT = "2026-08-22T00:00:00+00:00"
+TEST_SOURCE_SHA256 = "b" * 64
+TEST_CITATION_ID = "cit_public_fixture"
+TEST_SPAN_ID = "span-public-fixture"
+TEST_DOCUMENT_VERSION_ID = "version-public-fixture"
+TEST_BYTE_START = 10
+TEST_BYTE_END = 20
+
+
+def _acceptance_header(identity: AuthorityIdentity, *, run_id: str = TEST_RUN_ID):
+    return {
+        "authority_identity": identity,
+        "server_name": "quant_research_knowledge",
+        "model": TEST_MODEL,
+        "config_bytes": TEST_CONFIG_BYTES,
+        "run_id": run_id,
+        "preregistered_at": TEST_PREREGISTERED_AT,
+    }
+
+
+def _grounded_get(identity: AuthorityIdentity, object_id: str) -> dict[str, object]:
+    return {
+        "availability": "fresh",
+        "identity": identity.to_dict(),
+        "object_id": object_id,
+        "source_citations": [
+            {
+                "object_id": object_id,
+                "span_id": TEST_SPAN_ID,
+                "source_sha256": TEST_SOURCE_SHA256,
+                "document_version_id": TEST_DOCUMENT_VERSION_ID,
+                "byte_start": TEST_BYTE_START,
+                "byte_end": TEST_BYTE_END,
+                "citation_ids": [TEST_CITATION_ID],
+            }
+        ],
+    }
+
+
+def _structured_response(
+    *,
+    decision: str = "purged split",
+    condition: str = "five-day embargo",
+    limitation: str = "source locator",
+    object_id: str = "evidence-1",
+) -> str:
+    citation = {
+        "object_id": object_id,
+        "document_version_id": TEST_DOCUMENT_VERSION_ID,
+        "source_sha256": TEST_SOURCE_SHA256,
+        "span_id": TEST_SPAN_ID,
+        "byte_start": TEST_BYTE_START,
+        "byte_end": TEST_BYTE_END,
+        "citation_id": TEST_CITATION_ID,
+    }
+    claim = lambda text: {"claim": text, "citations": [citation]}
+    return canonical_json(
+        {
+            "schema_version": "qrh-mcp-structured-acceptance-response/v1",
+            "decision": [claim(decision)],
+            "conditions": [claim(condition)],
+            "limitations": [claim(limitation)],
+        }
+    )
+
+
+def _closed_codex_rows(
+    rows,
+    *,
+    run_id: str | None = None,
+    case_id: str | None = None,
+    arm: str | None = None,
+):
+    started = {
+        "type": "turn.started",
+        "timestamp": "2026-08-22T00:01:00+00:00",
+    }
+    if run_id is not None:
+        started.update(
+            {
+                "run_id": run_id,
+                "case_id": case_id,
+                "model": TEST_MODEL,
+                "config_sha256": hashlib.sha256(TEST_CONFIG_BYTES).hexdigest(),
+                "arm": arm,
+            }
+        )
+    closed = [{"type": "thread.started", "thread_id": "thread-public"}, started]
+    item_number = 0
+    for raw in rows:
+        if raw.get("type") in {"thread.started", "turn.started", "turn.completed", "turn.failed"}:
+            continue
+        item = dict(raw["item"])
+        item_number += 1
+        item_id = f"item-{item_number}"
+        item["id"] = item_id
+        closed.append(
+            {
+                "type": "item.started",
+                "item": {
+                    key: item[key]
+                    for key in (
+                        "id", "type", "server", "tool", "arguments"
+                    )
+                    if key in item
+                },
+            }
+        )
+        terminal_type = (
+            "item.failed"
+            if item.get("status") == "failed" or item.get("error") is not None
+            else "item.completed"
+        )
+        closed.append({"type": terminal_type, "item": item})
+    closed.append(
+        {
+            "type": "turn.completed",
+            "timestamp": "2026-08-22T00:01:01+00:00",
+        }
+    )
+    return tuple(closed)
+
+
+def _closed_trace_bytes(rows, **bindings) -> bytes:
+    return "".join(
+        canonical_json(row) + "\n" for row in _closed_codex_rows(rows, **bindings)
+    ).encode("utf-8")
 from quant_hub.ops.release_identity import manifest_sha256
 
 
@@ -2081,7 +2224,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             "identity": identity.to_dict(),
             "status": "ok",
         }
-        rows = (
+        rows = _closed_codex_rows((
             {"type": "thread.started", "thread_id": "thread-1"},
             {
                 "type": "item.completed",
@@ -2090,6 +2233,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
                     "server": "unrelated",
                     "tool": "read",
                     "status": "completed",
+                    "arguments": {},
                 },
             },
             {
@@ -2118,18 +2262,23 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
                     "status": "completed",
                     "error": None,
                     "arguments": {"object_id": "evidence-1"},
-                    "result": {"structured_content": response},
+                    "result": {
+                        "structured_content": _grounded_get(identity, "evidence-1")
+                    },
                 },
             },
             {
                 "type": "item.completed",
                 "item": {
                     "type": "agent_message",
-                    "text": "purged split; five-day condition; source sha256 locator",
+                    "text": _structured_response(
+                        condition="five-day condition",
+                        limitation="sha256 locator",
+                    ),
                 },
             },
             {"type": "turn.completed"},
-        )
+        ))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.jsonl"
             path.write_text(
@@ -2155,88 +2304,396 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             "condition_limitation_recognition": ("five-day condition",),
             "citation_correctness": ("sha256 locator",),
         }
+        marker_report = score_response_markers(trace.final_response, markers=markers)
+        self.assertEqual("NON_AUTHORITATIVE_COMPONENT", marker_report.authority)
         self.assertEqual(
             {dimension: 1.0 for dimension in QUALITY_DIMENSIONS},
-            score_response_markers(trace.final_response, markers=markers),
+            marker_report.as_dict(),
         )
 
     def test_positive_negative_gain_identity_and_update_sequence_gate(self) -> None:
         identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
         fresh = {"availability": "fresh", "identity": identity.to_dict()}
-        quality = {
-            "grounded_decision": 0.9,
-            "condition_limitation_recognition": 0.85,
-            "citation_correctness": 1.0,
+        markers = {
+            "grounded_decision": ("purged split",),
+            "condition_limitation_recognition": ("five-day embargo",),
+            "citation_correctness": ("source locator",),
         }
-        baseline = {
-            "grounded_decision": 0.5,
-            "condition_limitation_recognition": 0.4,
-            "citation_correctness": 0.6,
-        }
-        report = evaluate_tool_choice(
-            (
-                ToolChoiceCase(
+        prompt = b"independent backtest leakage decision"
+        preregistration = build_acceptance_preregistration(
+            suite_id="integrated-public-suite-v1",
+            **_acceptance_header(identity),
+            cases=(
+                AcceptanceCaseDefinition(
                     case_id="implicit-backtest-leakage",
+                    prompt_bytes=prompt,
                     should_call=True,
                     required_sequence=(
-                        "list_knowledge_updates",
                         "search_quant_knowledge",
                         "get_quant_knowledge",
                     ),
-                    events=tuple(
-                        ToolTraceEvent(name, fresh)
-                        for name in (
-                            "list_knowledge_updates",
-                            "search_quant_knowledge",
-                            "get_quant_knowledge",
-                        )
-                    ),
-                    expected_identity=identity,
-                    decision_claims_current=True,
-                    assisted_quality=quality,
-                    no_mcp_quality=baseline,
+                    maximum_target_calls=2,
                 ),
-                ToolChoiceCase(
+                AcceptanceCaseDefinition(
                     case_id="format-python-file",
+                    prompt_bytes=b"format fixture.py",
                     should_call=False,
-                    events=(),
+                    maximum_target_calls=0,
                 ),
-            )
+            ),
+            marker_definitions=markers,
         )
-        self.assertEqual("PASS", report.status)
-        self.assertEqual(1.0, report.should_call_accuracy)
-        self.assertEqual(1.0, report.should_not_call_accuracy)
-        self.assertEqual(1, report.grounded_gain_cases)
 
-        rejected = evaluate_tool_choice(
-            (
-                ToolChoiceCase(
-                    case_id="bad-current-claim",
-                    should_call=True,
-                    events=(
-                        ToolTraceEvent(
-                            "search_quant_knowledge",
-                            {"availability": "stale", "identity": identity.to_dict()},
-                        ),
-                    ),
-                    expected_identity=identity,
-                    decision_claims_current=True,
-                    assisted_quality=baseline,
-                    no_mcp_quality=baseline,
-                ),
-                ToolChoiceCase(
-                    case_id="unnecessary-search",
-                    should_call=False,
-                    events=(ToolTraceEvent("search_quant_knowledge", fresh),),
+        def call(
+            tool: str,
+            *,
+            arguments: dict[str, object],
+            structured: dict[str, object],
+            server: str = "quant_research_knowledge",
+            status: str = "completed",
+            error: str | None = None,
+        ) -> dict[str, object]:
+            return {
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": server,
+                    "tool": tool,
+                    "status": status,
+                    "arguments": arguments,
+                    "error": error,
+                    "result": {"structured_content": structured},
+                },
+            }
+
+        def trace_bytes(
+            calls: tuple[dict[str, object], ...], final_response: str,
+            *, case_id: str = "implicit-backtest-leakage", arm: str = "assisted",
+        ) -> bytes:
+            rows = (
+                *calls,
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": final_response},
+                },
+            )
+            return _closed_trace_bytes(
+                rows, run_id=TEST_RUN_ID, case_id=case_id, arm=arm
+            )
+
+        search = call(
+            "search_quant_knowledge",
+            arguments={"query": "leakage"},
+            structured={**fresh, "results": [{"object_id": "evidence-1"}]},
+        )
+        get = call(
+            "get_quant_knowledge",
+            arguments={"object_id": "evidence-1"},
+            structured=_grounded_get(identity, "evidence-1"),
+        )
+        assisted = trace_bytes(
+            (search, get),
+            _structured_response(),
+        )
+        control = trace_bytes((), "Use an ordinary split.", arm="no_mcp")
+        no_call_assisted = trace_bytes(
+            (), "Formatting completed.", case_id="format-python-file", arm="assisted"
+        )
+        no_call_control = trace_bytes(
+            (), "Formatting completed.", case_id="format-python-file", arm="no_mcp"
+        )
+        raw_cases = (
+            PreregisteredAcceptanceCase(
+                case_id="implicit-backtest-leakage",
+                prompt_bytes=prompt,
+                assisted_trace_bytes=assisted,
+                no_mcp_trace_bytes=control,
+                expected_identity=identity,
+            ),
+            PreregisteredAcceptanceCase(
+                case_id="format-python-file",
+                prompt_bytes=b"format fixture.py",
+                assisted_trace_bytes=no_call_assisted,
+                no_mcp_trace_bytes=no_call_control,
+            ),
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        ledger_root = Path(temporary.name)
+        preregistration_ledger = ledger_root / "preregistration.json"
+        record_acceptance_preregistration(
+            preregistration, ledger_path=preregistration_ledger
+        )
+        inconsistent_root = ledger_root / "inconsistent-dispatch"
+        _intent_path, completion_path = fake_dispatch_paths(
+            inconsistent_root,
+            run_id=TEST_RUN_ID,
+            case_id="implicit-backtest-leakage",
+            arm="assisted",
+        )
+        completion_path.parent.mkdir(parents=True)
+        completion_path.write_bytes(b"preexisting-completion")
+        fake_calls: list[str] = []
+        with self.assertRaises(FileExistsError):
+            run_fake_acceptance_arm(
+                preregistration=preregistration,
+                preregistration_ledger=preregistration_ledger,
+                dispatch_ledger_root=inconsistent_root,
+                case_id="implicit-backtest-leakage",
+                arm="assisted",
+                prompt_bytes=prompt,
+                config_bytes=TEST_CONFIG_BYTES,
+                fake_transport=lambda _prompt, arm: (
+                    fake_calls.append(arm) or assisted
                 ),
             )
+        self.assertEqual([], fake_calls)
+        campaign_number = 0
+
+        def bind_dispatches(raw):
+            nonlocal campaign_number
+            campaign_number += 1
+            dispatch_root = ledger_root / f"dispatch-{campaign_number}"
+            bound = []
+            for case in raw:
+                assisted_run = run_fake_acceptance_arm(
+                    preregistration=preregistration,
+                    preregistration_ledger=preregistration_ledger,
+                    dispatch_ledger_root=dispatch_root,
+                    case_id=case.case_id,
+                    arm="assisted",
+                    prompt_bytes=case.prompt_bytes,
+                    config_bytes=TEST_CONFIG_BYTES,
+                    fake_transport=lambda _prompt, _arm, payload=case.assisted_trace_bytes: payload,
+                )
+                no_mcp_run = run_fake_acceptance_arm(
+                    preregistration=preregistration,
+                    preregistration_ledger=preregistration_ledger,
+                    dispatch_ledger_root=dispatch_root,
+                    case_id=case.case_id,
+                    arm="no_mcp",
+                    prompt_bytes=case.prompt_bytes,
+                    config_bytes=TEST_CONFIG_BYTES,
+                    fake_transport=lambda _prompt, _arm, payload=case.no_mcp_trace_bytes: payload,
+                )
+                bound.append(
+                    replace(
+                        case,
+                        assisted_dispatch_intent=assisted_run.intent_bytes,
+                        assisted_dispatch_completion=assisted_run.completion_bytes,
+                        no_mcp_dispatch_intent=no_mcp_run.intent_bytes,
+                        no_mcp_dispatch_completion=no_mcp_run.completion_bytes,
+                    )
+                )
+            return tuple(bound), dispatch_root
+
+        def evaluate_cases(raw):
+            bound, dispatch_root = bind_dispatches(raw)
+            report = evaluate_preregistered_acceptance(
+                preregistration,
+                bound,
+                preregistration_ledger=preregistration_ledger,
+                dispatch_ledger_root=dispatch_root,
+                config_bytes=TEST_CONFIG_BYTES,
+            )
+            return report, bound, dispatch_root
+
+        report, cases, dispatch_root = evaluate_cases(raw_cases)
+        self.assertEqual("PASS", report.status)
+        self.assertEqual("AUTHORITATIVE_INTEGRATED_GATE", report.authority)
+        campaign_receipt = json.loads(report.campaign_receipt)
+        self.assertEqual(
+            campaign_receipt,
+            validate_acceptance_campaign_receipt_bytes(
+                report.campaign_receipt,
+                preregistration=preregistration,
+                cases=cases,
+                preregistration_ledger=preregistration_ledger,
+                dispatch_ledger_root=dispatch_root,
+                config_bytes=TEST_CONFIG_BYTES,
+            ),
         )
-        self.assertEqual("FAIL", rejected.status)
-        self.assertIn(
-            "bad-current-claim:stale_or_unavailable_supported_current",
-            rejected.findings,
+        self.assertEqual(
+            "qrh-mcp-acceptance-campaign-receipt/v2-raw-replay",
+            campaign_receipt["schema_version"],
         )
-        self.assertIn("unnecessary-search:meaningless_tool_call", rejected.findings)
+        self.assertEqual(TEST_RUN_ID, campaign_receipt["run_id"])
+        self.assertLess(
+            campaign_receipt["preregistration"]["ledger_registered_at"],
+            campaign_receipt["cases"][0]["assisted_dispatch"]["dispatched_at"],
+        )
+        tampered_campaign = dict(campaign_receipt)
+        tampered_campaign["run_id"] = "post-hoc-run"
+        with self.assertRaisesRegex(ValueError, "raw replay"):
+            validate_acceptance_campaign_receipt_bytes(
+                canonical_json(tampered_campaign).encode("utf-8"),
+                preregistration=preregistration,
+                cases=cases,
+                preregistration_ledger=preregistration_ledger,
+                dispatch_ledger_root=dispatch_root,
+                config_bytes=TEST_CONFIG_BYTES,
+            )
+        self.assertEqual(1, report.should_call_count)
+        self.assertEqual(1, report.should_not_call_count)
+        self.assertEqual(
+            hashlib.sha256(assisted).hexdigest(),
+            report.case_reports[0].assisted_trace_sha256,
+        )
+        self.assertEqual(
+            hashlib.sha256(control).hexdigest(),
+            report.case_reports[0].no_mcp_trace_sha256,
+        )
+        self.assertTrue(
+            all(
+                value == 1.0
+                for value in dict(report.case_reports[0].quality_gains).values()
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "differs from preregistration"):
+            evaluate_cases(
+                (
+                    replace(raw_cases[0], prompt_bytes=b"different prompt"),
+                    raw_cases[1],
+                )
+            )
+
+        guessed_get = call(
+            "get_quant_knowledge",
+            arguments={"object_id": "guessed-not-returned"},
+            structured=fresh,
+        )
+        provenance_failure, _, _ = evaluate_cases(
+            (
+                replace(
+                    raw_cases[0],
+                    assisted_trace_bytes=trace_bytes(
+                        (search, guessed_get),
+                        _structured_response(),
+                    ),
+                ),
+                raw_cases[1],
+            ),
+        )
+        self.assertEqual("FAIL", provenance_failure.status)
+        self.assertTrue(
+            any(
+                "get_without_prior_search_result" in finding
+                for finding in provenance_failure.findings
+            )
+        )
+
+        mixed_locator = json.loads(_structured_response())
+        mixed_locator["decision"][0]["citations"][0]["span_id"] = "other-span"
+        tuple_failure, _, _ = evaluate_cases(
+            (
+                replace(
+                    raw_cases[0],
+                    assisted_trace_bytes=trace_bytes(
+                        (search, get), canonical_json(mixed_locator)
+                    ),
+                ),
+                raw_cases[1],
+            )
+        )
+        self.assertEqual("FAIL", tuple_failure.status)
+        self.assertTrue(
+            any(
+                "final_response_contains_unreturned_citation" in finding
+                for finding in tuple_failure.findings
+            )
+        )
+
+        extra_search = call(
+            "search_quant_knowledge",
+            arguments={"query": "second query"},
+            structured={**fresh, "results": [{"object_id": "evidence-1"}]},
+        )
+        budget_failure, _, _ = evaluate_cases(
+            (
+                replace(
+                    raw_cases[0],
+                    assisted_trace_bytes=trace_bytes(
+                        (search, extra_search, get),
+                        _structured_response(),
+                    ),
+                ),
+                raw_cases[1],
+            ),
+        )
+        self.assertTrue(
+            any(
+                "target_call_budget_exceeded" in finding
+                for finding in budget_failure.findings
+            )
+        )
+
+        failed_get = call(
+            "get_quant_knowledge",
+            arguments={"object_id": "evidence-1"},
+            structured=fresh,
+            status="failed",
+            error="fixture failure",
+        )
+        unrelated = call(
+            "read",
+            arguments={},
+            structured={},
+            server="unrelated_server",
+        )
+        tainted, _, _ = evaluate_cases(
+            (
+                replace(
+                    raw_cases[0],
+                    assisted_trace_bytes=trace_bytes(
+                        (search, failed_get, unrelated),
+                        _structured_response(),
+                    ),
+                ),
+                raw_cases[1],
+            ),
+        )
+        self.assertTrue(
+            any("failed_target_call" in finding for finding in tainted.findings)
+        )
+        self.assertTrue(
+            any("unrelated_mcp_call" in finding for finding in tainted.findings)
+        )
+
+        # Directly constructed parsed events are not an integrated-gate input.
+        # The receipt hash and every gate decision must derive from raw JSONL.
+        with self.assertRaisesRegex(ValueError, "raw trace bytes"):
+            evaluate_preregistered_acceptance(
+                preregistration,
+                (replace(cases[0], assisted_trace_bytes=object()), cases[1]),
+                preregistration_ledger=preregistration_ledger,
+                dispatch_ledger_root=dispatch_root,
+                config_bytes=TEST_CONFIG_BYTES,
+            )
+
+        # The old API accepted fabricated events and caller-provided quality
+        # floats. It is retained only as an explicit fail-closed compatibility
+        # shim and can no longer issue a PASS verdict.
+        with self.assertRaisesRegex(ValueError, "caller-supplied quality floats"):
+            evaluate_tool_choice(
+                (
+                    ToolChoiceCase(
+                        case_id="forged-quality",
+                        should_call=True,
+                        events=(
+                            ToolTraceEvent(
+                                "search_quant_knowledge", fresh, ordinal=1
+                            ),
+                            ToolTraceEvent(
+                                "get_quant_knowledge", fresh, ordinal=2
+                            ),
+                        ),
+                        expected_identity=identity,
+                        assisted_quality={dimension: 1.0 for dimension in QUALITY_DIMENSIONS},
+                        no_mcp_quality={dimension: 0.0 for dimension in QUALITY_DIMENSIONS},
+                    ),
+                )
+            )
 
     def test_trace_state_machine_enforces_provenance_identity_and_budget(self) -> None:
         identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
@@ -2256,7 +2713,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
                 },
             }
 
-        good_rows = (
+        good_rows = _closed_codex_rows((
             call(
                 "search_quant_knowledge",
                 arguments={"query": "fixture"},
@@ -2269,10 +2726,18 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             call(
                 "get_quant_knowledge",
                 arguments={"object_id": "returned-id"},
-                structured={"availability": "fresh", "identity": expected},
+                structured=_grounded_get(identity, "returned-id"),
             ),
-            {"type": "turn.completed"},
-        )
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "agent_message",
+                    "text": (
+                        _structured_response(object_id="returned-id")
+                    ),
+                },
+            },
+        ))
         bad_rows = [
             call(
                 "get_quant_knowledge",
@@ -2301,9 +2766,13 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
                     status="failed",
                     error={"message": "fixture failure"},
                 ),
-                {"type": "turn.completed"},
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "fixture failure"},
+                },
             )
         )
+        bad_rows = list(_closed_codex_rows(tuple(bad_rows)))
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             good_path = root / "good.jsonl"
@@ -2339,6 +2808,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
         )
 
     def test_future_preregistration_closes_marker_bytes_and_prompt_bindings(self) -> None:
+        identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
         markers = {
             "grounded_decision": ("decision-marker",),
             "condition_limitation_recognition": ("condition-marker", "limit-marker"),
@@ -2361,22 +2831,28 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
         )
         first = build_acceptance_preregistration(
             suite_id="future-independent-suite-v1",
+            **_acceptance_header(identity, run_id="future-run-v1"),
             cases=cases,
             marker_definitions=markers,
         )
         second = build_acceptance_preregistration(
             suite_id="future-independent-suite-v1",
+            **_acceptance_header(identity, run_id="future-run-v1"),
             cases=cases,
             marker_definitions=markers,
         )
         self.assertEqual(first, second)
         parsed = validate_acceptance_preregistration_bytes(first)
-        self.assertEqual("qrh-mcp-acceptance-preregistration/v1", parsed["schema_version"])
+        self.assertEqual(
+            "qrh-mcp-acceptance-preregistration/v2-bound",
+            parsed["schema_version"],
+        )
         self.assertNotIn("independent quant research question", first.decode("utf-8"))
         changed_markers = dict(markers)
         changed_markers["grounded_decision"] = ("different-marker",)
         changed = build_acceptance_preregistration(
             suite_id="future-independent-suite-v1",
+            **_acceptance_header(identity, run_id="future-run-v1"),
             cases=cases,
             marker_definitions=changed_markers,
         )
@@ -2399,6 +2875,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "list/tuple"):
                 build_acceptance_preregistration(
                     suite_id="future-independent-suite-v1",
+                    **_acceptance_header(identity, run_id="future-run-v1"),
                     cases=cases,
                     marker_definitions=invalid_markers,
                 )
@@ -2423,6 +2900,245 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             validate_acceptance_preregistration_bytes(
                 canonical_json(scalar_envelope).encode("utf-8")
             )
+
+    def test_raw_jsonl_state_machine_rejects_duplicate_unknown_and_open_events(self) -> None:
+        duplicate = (
+            b'{"type":"turn.started","type":"turn.completed",'
+            b'"timestamp":"2026-08-22T00:01:00+00:00"}\n'
+        )
+        with self.assertRaisesRegex(ValueError, "invalid JSON"):
+            load_codex_tool_trace_bytes(duplicate)
+
+        unknown = (
+            canonical_json(
+                {
+                    "type": "turn.started",
+                    "timestamp": "2026-08-22T00:01:00+00:00",
+                }
+            )
+            + "\n"
+            + canonical_json({"type": "future.unknown"})
+            + "\n"
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "unknown event type"):
+            load_codex_tool_trace_bytes(unknown)
+
+        rows = list(
+            _closed_codex_rows(
+                (
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "done"},
+                    },
+                )
+            )
+        )
+        after_terminal = "".join(
+            canonical_json(row) + "\n"
+            for row in (*rows, {"type": "turn.completed"})
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "unique and last|must be last"):
+            load_codex_tool_trace_bytes(after_terminal)
+
+        open_item = (
+            {"type": "turn.started"},
+            {"type": "item.started", "item": {"id": "open", "type": "reasoning"}},
+            {"type": "turn.completed"},
+        )
+        with self.assertRaisesRegex(ValueError, "unfinished items"):
+            load_codex_tool_trace_bytes(
+                "".join(canonical_json(row) + "\n" for row in open_item).encode(
+                    "utf-8"
+                )
+            )
+
+        changed_tool = (
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "tool-1",
+                    "type": "mcp_tool_call",
+                    "server": "quant_research_knowledge",
+                    "tool": "search_quant_knowledge",
+                    "arguments": {"query": "one"},
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "tool-1",
+                    "type": "mcp_tool_call",
+                    "server": "quant_research_knowledge",
+                    "tool": "get_quant_knowledge",
+                    "arguments": {"object_id": "one"},
+                    "status": "completed",
+                    "result": {"structured_content": {}},
+                },
+            },
+            {"type": "turn.failed"},
+        )
+        with self.assertRaisesRegex(ValueError, "tool identity changed"):
+            load_codex_tool_trace_bytes(
+                "".join(canonical_json(row) + "\n" for row in changed_tool).encode(
+                    "utf-8"
+                )
+            )
+
+        changed_started_field = (
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "message-1",
+                    "type": "agent_message",
+                    "role": "assistant",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message-1",
+                    "type": "agent_message",
+                    "role": "different",
+                    "text": "done",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+        with self.assertRaisesRegex(ValueError, "item identity changed"):
+            load_codex_tool_trace_bytes(
+                "".join(
+                    canonical_json(row) + "\n" for row in changed_started_field
+                ).encode("utf-8")
+            )
+
+        empty_message_then_item = (
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {"id": "message-empty", "type": "agent_message"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message-empty",
+                    "type": "agent_message",
+                    "text": "   ",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {"id": "reasoning-late", "type": "reasoning"},
+            },
+            {
+                "type": "item.completed",
+                "item": {"id": "reasoning-late", "type": "reasoning"},
+            },
+            {"type": "turn.completed"},
+        )
+        with self.assertRaisesRegex(ValueError, "must be non-empty"):
+            load_codex_tool_trace_bytes(
+                "".join(
+                    canonical_json(row) + "\n" for row in empty_message_then_item
+                ).encode("utf-8")
+            )
+
+        final_then_item = (
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {"id": "message-final", "type": "agent_message"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message-final",
+                    "type": "agent_message",
+                    "text": "done",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {"id": "reasoning-after-final", "type": "reasoning"},
+            },
+            {"type": "turn.completed"},
+        )
+        with self.assertRaisesRegex(ValueError, "must be the last item"):
+            load_codex_tool_trace_bytes(
+                "".join(
+                    canonical_json(row) + "\n" for row in final_then_item
+                ).encode("utf-8")
+            )
+
+        no_final_message = (
+            {"type": "turn.started"},
+            {"type": "turn.failed"},
+        )
+        with self.assertRaisesRegex(ValueError, "exactly one non-empty"):
+            load_codex_tool_trace_bytes(
+                "".join(
+                    canonical_json(row) + "\n" for row in no_final_message
+                ).encode("utf-8")
+            )
+
+    def test_preregistration_requires_positive_gain_closed_budget_and_search_get(self) -> None:
+        identity = AuthorityIdentity("release-r2", "a" * 64, "snapshot-r2")
+        markers = {
+            "grounded_decision": ("decision",),
+            "condition_limitation_recognition": ("condition",),
+            "citation_correctness": ("citation",),
+        }
+
+        def build(case, **changes):
+            values = {
+                "suite_id": "closed-public-suite",
+                **_acceptance_header(identity, run_id="closed-run"),
+                "cases": (case,),
+                "marker_definitions": markers,
+            }
+            values.update(changes)
+            return build_acceptance_preregistration(**values)
+
+        valid = AcceptanceCaseDefinition(
+            case_id="case-1",
+            prompt_bytes=b"prompt",
+            should_call=True,
+            required_sequence=("search_quant_knowledge", "get_quant_knowledge"),
+            maximum_target_calls=2,
+        )
+        parsed = validate_acceptance_preregistration_bytes(build(valid))
+        self.assertEqual(identity.to_dict(), parsed["authority_identity"])
+        self.assertEqual(TEST_MODEL, parsed["model"])
+        self.assertEqual("closed-run", parsed["run_id"])
+        with self.assertRaisesRegex(ValueError, "header"):
+            build(valid, minimum_net_gain=0)
+        with self.assertRaisesRegex(ValueError, "case"):
+            build(replace(valid, maximum_target_calls=7))
+        with self.assertRaisesRegex(ValueError, "case"):
+            build(
+                replace(
+                    valid,
+                    required_sequence=("get_quant_knowledge",),
+                )
+            )
+
+        too_many = tuple(
+            replace(valid, case_id=f"case-{index}")
+            for index in range(MAX_ACCEPTANCE_CASES + 1)
+        )
+        with self.assertRaisesRegex(ValueError, "header"):
+            build(valid, cases=too_many)
+
+        normalized_duplicate = dict(markers)
+        normalized_duplicate["grounded_decision"] = ("ＭＡＲＫＥＲ", "marker")
+        with self.assertRaisesRegex(ValueError, "unique"):
+            build(valid, marker_definitions=normalized_duplicate)
+        overlapping = dict(markers)
+        overlapping["grounded_decision"] = ("source",)
+        overlapping["citation_correctness"] = ("source locator",)
+        with self.assertRaisesRegex(ValueError, "non-overlapping"):
+            build(valid, marker_definitions=overlapping)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,11 @@ import tempfile
 import unittest
 
 from quant_hub.knowledge import ReferenceCompiler
-from quant_hub.knowledge.evaluation import QrelSuite, bind_qrel_templates, evaluate
+from quant_hub.knowledge.evaluation import (
+    QrelSuite,
+    bind_qrel_templates,
+    evaluate_non_authoritative,
+)
 from quant_hub.knowledge.retrieval import (
     INDEX_VERSION,
     RETRIEVAL_ARTIFACT_SCHEMA,
@@ -122,17 +126,26 @@ class PublicKnowledgeQualityTests(unittest.TestCase):
         self.suite = bind_qrel_templates(FIXTURE_ROOT / "qrels.json", self.base)
 
     def test_public_development_exact_kind_and_hard_gates(self) -> None:
-        direct = evaluate(self.index, self.suite, split="development")
-        product = evaluate(self.artifact_index, self.suite, split="development")
+        direct = evaluate_non_authoritative(
+            self.index, self.suite, split="development"
+        )
+        product = evaluate_non_authoritative(
+            self.artifact_index, self.suite, split="development"
+        )
+        self.assertEqual("NON_AUTHORITATIVE_DIAGNOSTIC", direct.authority)
         self.assertEqual(13, direct.count)
-        self.assertEqual(1.0, direct.recall_at_k, direct)
+        # These historical public qrels bind source quotes while formal
+        # knowledge cards display a generated method/condition text.  Under
+        # exact displayed-byte credit they remain useful retrieval diagnostics
+        # but must not produce authoritative relevance credit.
+        self.assertEqual(0.0, direct.recall_at_k, direct)
         self.assertEqual(1.0, direct.no_answer_accuracy, direct)
-        self.assertEqual(1.0, direct.citation_accuracy, direct)
+        self.assertFalse(direct.gate_pass, direct)
         self.assertEqual(0, direct.deprecated_errors, direct)
         self.assertEqual(0, direct.conflict_errors, direct)
         self.assertEqual(0, direct.forbidden_errors, direct)
-        self.assertEqual(0, direct.knowledge_kind_errors, direct)
-        self.assertEqual(0, direct.citation_errors, direct)
+        self.assertGreater(direct.knowledge_kind_errors, 0, direct)
+        self.assertGreater(direct.citation_errors, 0, direct)
         self.assertGreaterEqual(
             sum(bool(qrel.forbidden_document_ids) for qrel in self.suite.qrels),
             2,
@@ -242,14 +255,18 @@ class PublicKnowledgeQualityTests(unittest.TestCase):
                 ),
             )
         )
-        direct = evaluate(self.index, suite, split="development")
-        product = evaluate(self.artifact_index, suite, split="development")
-        self.assertEqual(1.0, direct.recall_at_k, direct)
-        self.assertEqual(1.0, direct.citation_accuracy, direct)
-        self.assertEqual(0, direct.knowledge_kind_errors, direct)
-        self.assertEqual(0, direct.citation_errors, direct)
+        direct = evaluate_non_authoritative(
+            self.index, suite, split="development"
+        )
+        product = evaluate_non_authoritative(
+            self.artifact_index, suite, split="development"
+        )
+        self.assertEqual(0.0, direct.recall_at_k, direct)
+        self.assertEqual(0.0, direct.citation_accuracy, direct)
+        self.assertGreater(direct.knowledge_kind_errors, 0, direct)
+        self.assertGreater(direct.citation_errors, 0, direct)
         self.assertEqual(0, direct.forbidden_errors, direct)
-        self.assertTrue(direct.gate_pass, direct)
+        self.assertFalse(direct.gate_pass, direct)
         for field in (
             "recall_at_k",
             "ndcg_at_k",

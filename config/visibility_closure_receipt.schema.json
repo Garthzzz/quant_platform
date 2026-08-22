@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schemas/visibility_closure_receipt.schema.json",
+  "title": "Quant Research Hub visibility closure receipt v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "receipt_id", "recorded_at", "authority", "repository", "commit_sha", "release", "stage5_certificate_ref", "evidence_refs", "receipt_sha256"],
+  "properties": {
+    "schema_version": {"const": "qrh-visibility-closure-receipt/v3"},
+    "receipt_id": {"type": "string", "pattern": "^visibility-[0-9a-f]{32}$"},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "authority": {"const": "evidence_only"},
+    "repository": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository_id", "full_name", "visibility_before", "visibility_after"],
+      "properties": {"repository_id": {"$ref": "#/$defs/id"}, "full_name": {"type": "string"}, "visibility_before": {"const": "public"}, "visibility_after": {"const": "private"}}
+    },
+    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "release": {"$ref": "#/$defs/release"},
+    "stage5_certificate_ref": {"$ref": "#/$defs/artifact_ref"},
+    "evidence_refs": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/artifact_ref"}},
+    "receipt_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,179}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "release": {"type": "object", "additionalProperties": false, "required": ["release_id", "manifest_sha256", "snapshot_id"], "properties": {"release_id": {"$ref": "#/$defs/id"}, "manifest_sha256": {"$ref": "#/$defs/sha256"}, "snapshot_id": {"$ref": "#/$defs/id"}}},
+    "artifact_ref": {"type": "object", "additionalProperties": false, "required": ["kind", "locator", "sha256"], "properties": {"kind": {"$ref": "#/$defs/id"}, "locator": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$"}, "sha256": {"$ref": "#/$defs/sha256"}}}
+  }
+}

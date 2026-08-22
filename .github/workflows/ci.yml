@@ -50,6 +50,7 @@ jobs:
           tests.test_sqlite_checkpoint
           tests.test_checkpoint_cli
           tests.test_state_only_backup
+          tests.test_stage_closure
           tests.test_failure_domain
           tests.test_failure_domain_cli
           tests.test_production_host_facts_cli
@@ -79,6 +80,7 @@ jobs:
           tests.test_knowledge_mcp
           tests.test_knowledge_mcp_stress_public
           tests.test_ds_review_harness
+          tests.test_ds_review_external_v3
           tests.test_generic_research_renderer
           -v
       - name: Build and exercise installable operational wheel
@@ -154,11 +156,17 @@ jobs:
           if ($entries -notcontains "quant_hub/knowledge_mcp/evaluation.py") {
             throw "wheel is missing the MCP trace evaluator"
           }
+          if ($entries -notcontains "quant_hub/knowledge_mcp/acceptance_runner.py") {
+            throw "wheel is missing the fake-only MCP acceptance runner"
+          }
           if ($entries -notcontains "quant_hub/knowledge/semantic_cli.py") {
             throw "wheel is missing the semantic operator CLI"
           }
           if ($entries -notcontains "quant_hub/knowledge/ds_review.py") {
             throw "wheel is missing the zero-network DS review harness"
+          }
+          if ($entries -notcontains "quant_hub/knowledge/ds_review_external_v3.py") {
+            throw "wheel is missing the fake-only external DS review v3 contract"
           }
           if ($entries -notcontains "quant_hub/knowledge/citations.py") {
             throw "wheel is missing the Evidence citation projection module"
@@ -188,6 +196,9 @@ jobs:
           }
           if ($entries -notcontains "quant_hub/ops/state_only_backup.py") {
             throw "wheel is missing the state-only recovery job"
+          }
+          if ($entries -notcontains "quant_hub/ops/stage_closure.py") {
+            throw "wheel is missing the Stage 5/6 closure verifier"
           }
           if ($entries -notcontains "quant_hub/ops/writer_handoff.py") {
             throw "wheel is missing the fixed C-to-D writer handoff"
@@ -279,4 +290,5 @@ jobs:
         run: |
           npm install --global @fission-ai/openspec@latest
           openspec validate design-vm-knowledge-mcp --strict --no-interactive
+          openspec validate enable-ds-public-synthetic-advisory-review-v3 --strict --no-interactive
           openspec validate --all --strict --no-interactive

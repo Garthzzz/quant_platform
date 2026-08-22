@@ -2,6 +2,24 @@
 
 本流程只用于 V39 首次空 D 演练，或活动 D 根整体损坏后的灾难恢复。普通代码回退必须切换 D prior，并继续使用当前 D state；不得用历史 checkpoint 倒退线上状态。
 
+普通 D-prior 回退的闭合证据必须另行写成 canonical
+`qrh-d-prior-rollback-receipt/v1`：active 与 prior 的 release ID、manifest SHA-256 必须分别不同，
+并机械证明 prior 已激活、health、writer fence 与 active restore 全部成功。Stage 5 的
+`qrh-measured-prior-release/v2` 只接受该 receipt 的固定相对 locator 与原始 bytes SHA-256，
+locator 必须精确为 `stage5/d_prior/rollback_receipt.json`，
+在 resolver 内重算、分类验证并检查时序；调用方自报 `pass`、任意 evidence ID 或摘要不能替代
+rollback receipt。resolver 还必须拒绝 hardlink/多链接文件，并在同一打开句柄上复核 read 前后
+handle/path file identity、size 与时间，避免根外别名或 resolve→read 换件冒充 authority bytes。
+本合同不新增回退 executor，也不授权任何 VM 写入。
+
+> 当前实现边界：`prepare-empty` 与 `--qualification-reset-materialized` 的 closed contract
+> 只适用于 V39 qualification 状态，不能用于已经激活、存在 writer/receipt/journal 的 active-D
+> 维护演练。Stage 5 最终 active-D 空根演练目前只有
+> `qrh-active-d-maintenance-drill-plan/v1` inspect-only 计划 skeleton，固定
+> `destructive_apply_enabled=false`，没有删除 executor。恢复 receipt finalize 同样只有
+> evidence-bound、`finalize_enabled=false` 的安全 skeleton。不得把下面的 V39 命令改参数后
+> 复用于 active-D，也不得用调用方布尔值伪造最终恢复成功。
+
 ## 固定权威与边界
 
 - 唯一生产及恢复目标 VM：`10.5.1.240`（OpenSSH alias：`honghu-vm`）。`.223`、`.235` 和第二恢复 VM 不属于本版依赖。

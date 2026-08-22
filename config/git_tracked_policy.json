@@ -13,6 +13,12 @@
     "docs/verification/STAGE4_CITATION_PROJECTION_20260822.md",
     "docs/verification/MCP_RAG_DB_STRESS_OPTIMIZATION_20260822.md",
     "docs/verification/STAGE4_PUBLIC_RAG_REPAIR_20260822.md",
+    "docs/verification/STAGE45_PUBLIC_EVALUATION_CLOSURE_20260822.md",
+    "docs/verification/STAGE45_ROUND2_EVIDENCE_BOUND_CLOSURE_20260822.md",
+    "docs/verification/STAGE45_ROUND3_STRICT_AUTHORITY_STALE_FINAL_20260822.md",
+    "docs/verification/STAGE45_ROUND4_AUTHORITY_WINDOW_CLOSURE_20260823.md",
+    "docs/verification/STAGE45_ROUND5_VERIFIER_INTERNAL_WINDOW_CLOSURE_20260823.md",
+    "docs/verification/ds_v4pro_external_v3_fake_only_runbook.md",
     "project_state/architecture/quant_platform_VM知识MCP总体设计_20260820.md"
   ],
   "tracked_prefixes": [
@@ -21,6 +27,7 @@
     ".github/",
     "config/",
     "docs/runbooks/",
+    "openspec/changes/enable-ds-public-synthetic-advisory-review-v3/",
     "openspec/changes/design-vm-knowledge-mcp/",
     "quant_hub/migrations/",
     "quant_hub/paper_lab/pipeline/",

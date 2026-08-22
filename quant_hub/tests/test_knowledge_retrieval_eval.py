@@ -1,28 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import base64
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import sqlite3
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from quant_hub.knowledge import ReferenceCompiler, TombstoneDirective
+from quant_hub.knowledge.contracts import canonical_json
 from quant_hub.knowledge.evaluation import (
     GroundedLocator,
     Qrel,
     QrelSuite,
+    QrelSuiteValidationError,
     _card_covers_locator,
+    _validate_per_qrel_receipts,
     bind_qrel_templates,
+    build_retrieval_comparison_preregistration,
     compare_candidate_to_baseline,
     evaluate,
+    evaluate_non_authoritative,
+    validate_retrieval_comparison_preregistration,
 )
 from quant_hub.knowledge.retrieval import (
+    ARCHIVE_LIKE_PROJECTION_AUTHORITY,
     ArtifactKnowledgeIndex,
+    INDEX_VERSION,
     KnowledgeIndex,
     LikeBaselineIndex,
     TaskContext,
     citation_ids_for_evidence_bindings,
+    validate_authoritative_archive_like_projection,
 )
 from quant_hub.knowledge_mcp.mirror import build_search_artifact
 from quant_hub.knowledge.semantic import (
@@ -31,6 +45,7 @@ from quant_hub.knowledge.semantic import (
     SemanticJobStore,
     build_enriched_snapshot,
 )
+from quant_hub.archive.catalog import ArchiveCatalog
 
 
 class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
@@ -568,7 +583,10 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
                 ),
             )
         )
-        report = evaluate(self.index, adversarial, split="development")
+        report = evaluate_non_authoritative(
+            self.index, adversarial, split="development"
+        )
+        self.assertEqual("NON_AUTHORITATIVE_DIAGNOSTIC", report.authority)
         self.assertEqual(0, report.forbidden_errors)
         self.assertEqual(0, report.conflict_errors)
         self.assertEqual(0, report.citation_errors)
@@ -801,6 +819,57 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
                 quote_sha256=second.text_sha256,
             )
             self.assertFalse(_card_covers_locator(base, card, second_locator))
+            narrow_quote = "高换手成本".encode("utf-8")
+            narrow_start = first.byte_start + first.text.encode("utf-8").index(
+                narrow_quote
+            )
+            containing_same_span = GroundedLocator(
+                document_version_id=document.active_version_id,
+                span_id=first.span_id,
+                source_sha256=first.source_sha256,
+                byte_start=narrow_start,
+                byte_end=narrow_start + len(narrow_quote),
+                quote_sha256=hashlib.sha256(narrow_quote).hexdigest(),
+            )
+            # The card is on the same source span but covers a wider quote.
+            # Containment used to receive relevance credit; exact grounded
+            # locator identity must reject it.
+            self.assertFalse(
+                _card_covers_locator(base, card, containing_same_span)
+            )
+            exact_locator = GroundedLocator(
+                document_version_id=document.active_version_id,
+                span_id=first.span_id,
+                source_sha256=first.source_sha256,
+                byte_start=byte_start,
+                byte_end=byte_start + len(quote.encode("utf-8")),
+                quote_sha256=hashlib.sha256(quote.encode("utf-8")).hexdigest(),
+            )
+            forged_source = "0" * 64
+            exact_display_card = replace(card, text=quote)
+            self.assertTrue(
+                _card_covers_locator(base, exact_display_card, exact_locator)
+            )
+            self.assertFalse(
+                _card_covers_locator(
+                    base,
+                    replace(exact_display_card, text=quote + " forged suffix"),
+                    exact_locator,
+                )
+            )
+            self.assertFalse(
+                _card_covers_locator(
+                    base,
+                    replace(
+                        card,
+                        locator=replace(
+                            card.locator,
+                            source_sha256=forged_source,
+                        ),
+                    ),
+                    replace(exact_locator, source_sha256=forged_source),
+                )
+            )
             qrel = QrelSuite.create(
                 (
                     Qrel(
@@ -811,16 +880,7 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
                         context=TaskContext(),
                         answerable=True,
                         positive_locators=(
-                            GroundedLocator(
-                                document_version_id=document.active_version_id,
-                                span_id=first.span_id,
-                                source_sha256=first.source_sha256,
-                                byte_start=byte_start,
-                                byte_end=byte_start + len(quote.encode("utf-8")),
-                                quote_sha256=hashlib.sha256(
-                                    quote.encode("utf-8")
-                                ).hexdigest(),
-                            ),
+                            exact_locator,
                         ),
                         negative_locators=(),
                         expected_knowledge_kinds=(),
@@ -830,9 +890,592 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
                     ),
                 )
             )
-            report = evaluate(index, qrel, split="development")
+            report = evaluate_non_authoritative(index, qrel, split="development")
             self.assertLessEqual(report.ndcg_at_k, 1.0)
             self.assertEqual(0, report.forbidden_errors)
+
+    def _public_programmatic_suite(self) -> QrelSuite:
+        document = next(iter(self.base.documents.values()))
+        assert document.active_version_id is not None
+        span = self.base.ir_documents[document.active_version_id].blocks[0].source_span
+        quote = span.text.encode("utf-8")
+        locator = GroundedLocator(
+            document_version_id=document.active_version_id,
+            span_id=span.span_id,
+            source_sha256=span.source_sha256,
+            byte_start=span.byte_start,
+            byte_end=span.byte_end,
+            quote_sha256=hashlib.sha256(quote).hexdigest(),
+        )
+        slices = (
+            "hard_negative", "no_answer", "condition_conflict",
+            "historical_deprecated", "miscitation", "cross_language",
+            "formula_alias", "hard_negative", "condition_conflict",
+        )
+        categories = ("factor", "model", "data", "backtest")
+        suite = QrelSuite.create(
+            tuple(
+                Qrel(
+                    qrel_id=f"public-{index:02d}",
+                    split="development" if index < 6 else "holdout",
+                    category=categories[index % len(categories)],
+                    query=f"public unmatched query {index}",
+                    context=TaskContext(),
+                    answerable=True,
+                    positive_locators=(locator,),
+                    negative_locators=(),
+                    expected_knowledge_kinds=(),
+                    forbidden_document_ids=(),
+                    required_citation_ids=(),
+                    slices=(slices[index],),
+                )
+                for index in range(9)
+            )
+        )
+        self.assertEqual((), suite.validate(self.base))
+        return suite
+
+    def test_public_v3_receipts_require_ledger_suite_projection_and_replay(self) -> None:
+        suite = self._public_programmatic_suite()
+        ledger = self.root / "runtime" / "public-v3-prereg.json"
+        preregistration = build_retrieval_comparison_preregistration(
+            suite=suite,
+            split="development",
+            candidate_index=self.index,
+            baseline_index=self.index,
+            limit=2,
+            difficult_slices=("hard_negative", "condition_conflict"),
+            run_id="public-v3-evidence-bound",
+            ledger_path=ledger,
+        )
+        candidate = evaluate(
+            self.index,
+            suite,
+            split="development",
+            limit=2,
+            comparison_preregistration=preregistration,
+            preregistration_ledger=ledger,
+            comparison_role="candidate",
+        )
+        baseline = evaluate(
+            self.index,
+            suite,
+            split="development",
+            limit=2,
+            comparison_preregistration=preregistration,
+            preregistration_ledger=ledger,
+            comparison_role="baseline",
+        )
+        comparison = compare_candidate_to_baseline(
+            candidate.per_qrel_receipts,
+            baseline.per_qrel_receipts,
+            preregistration=preregistration,
+            preregistration_ledger=ledger,
+            suite=suite,
+            candidate_index=self.index,
+            baseline_index=self.index,
+        )
+        self.assertFalse(comparison.gate_pass)
+        self.assertFalse(comparison.projection_authority_pass)
+        stale_true = json.loads(candidate.per_qrel_receipts[0])
+        stale_true["errors"]["stale"] = True
+        with self.assertRaisesRegex(ValueError, "stale flag differs"):
+            _validate_per_qrel_receipts(
+                (
+                    canonical_json(stale_true).encode("utf-8"),
+                    *candidate.per_qrel_receipts[1:],
+                ),
+                suite=suite,
+                index=self.index,
+            )
+        first_qrel = suite.development()[0]
+        stale_locator = replace(
+            first_qrel.positive_locators[0],
+            document_version_id="missing-live-version",
+        )
+        live_stale_suite = QrelSuite.create(
+            tuple(
+                replace(first_qrel, positive_locators=(stale_locator,))
+                if row.qrel_id == first_qrel.qrel_id
+                else row
+                for row in suite.qrels
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "stale flag differs"):
+            _validate_per_qrel_receipts(
+                candidate.per_qrel_receipts,
+                suite=live_stale_suite,
+                index=self.index,
+            )
+        changed = json.loads(candidate.per_qrel_receipts[0])
+        changed["qrel"]["query_bytes_base64"] = base64.b64encode(b"other").decode()
+        changed["qrel"]["query_bytes"] = 5
+        changed["qrel"]["query_sha256"] = hashlib.sha256(b"other").hexdigest()
+        with self.assertRaisesRegex(ValueError, "member of the supplied suite"):
+            compare_candidate_to_baseline(
+                (
+                    canonical_json(changed).encode("utf-8"),
+                    *candidate.per_qrel_receipts[1:],
+                ),
+                baseline.per_qrel_receipts,
+                preregistration=preregistration,
+                preregistration_ledger=ledger,
+                suite=suite,
+                candidate_index=self.index,
+                baseline_index=self.index,
+            )
+        with self.assertRaises(FileExistsError):
+            build_retrieval_comparison_preregistration(
+                suite=suite,
+                split="development",
+                candidate_index=self.index,
+                baseline_index=self.index,
+                limit=2,
+                difficult_slices=("hard_negative", "condition_conflict"),
+                run_id="cannot-backfill",
+                ledger_path=ledger,
+            )
+
+    def test_archive_like_projection_producer_matches_snippet_and_title_only(self) -> None:
+        display_titles = {
+            version.research_id: self.base.ir_documents[version_id].title
+            for version_id, version in self.base.versions.items()
+        }
+        presented_titles = dict(display_titles)
+        title_texts = {
+            version_id: display_titles[version.research_id]
+            for version_id, version in self.base.versions.items()
+        }
+        search_texts = {
+            version_id: "\n".join(
+                chunk.text
+                for chunk in sorted(
+                    (
+                        chunk
+                        for chunk in self.base.chunks.values()
+                        if chunk.document_version_id == version_id
+                        and chunk.retrievable
+                    ),
+                    key=lambda row: (row.byte_start, row.byte_end, row.chunk_id),
+                )
+            )
+            for version_id in self.base.versions
+        }
+        selected_version = sorted(self.base.versions)[0]
+        selected_research = self.base.versions[selected_version].research_id
+        title_only = "public-title-only-sentinel"
+        title_texts[selected_version] = title_only
+        presented_titles[selected_research] = title_only
+        baseline = LikeBaselineIndex(
+            self.base,
+            self.enriched,
+            display_titles_by_research_id=display_titles,
+            presented_titles_by_research_id=presented_titles,
+            title_text_by_version_id=title_texts,
+            search_text_by_version_id=search_texts,
+            hidden_research_ids=(),
+            search_excluded_line_markers=(),
+        )
+        self.addCleanup(baseline.close)
+        response = baseline.search(title_only, limit=1)
+        self.assertEqual(1, len(response.cards))
+        public_text = search_texts[selected_version]
+        expected = public_text[: min(len(public_text), len(title_only) + 120)]
+        if len(expected) < len(public_text):
+            expected += "…"
+        self.assertEqual(title_only, response.cards[0].title)
+        self.assertEqual(expected, response.cards[0].text)
+        producer = json.loads(baseline.evaluation_projection_artifact_bytes())
+        self.assertEqual(
+            "quant_hub.archive.catalog.ArchiveCatalog.search/v1",
+            producer["producer"],
+        )
+        self.assertEqual("CALLER_SUPPLIED_DIAGNOSTIC", producer["authority"])
+        self.assertEqual(
+            "CALLER_SUPPLIED_DIAGNOSTIC",
+            baseline.evaluation_projection_authority(),
+        )
+        with self.assertRaisesRegex(ValueError, "diagnostic"):
+            validate_authoritative_archive_like_projection(baseline)
+        self.assertEqual("document", producer["query_contract"]["limit_scope"])
+
+    def test_archive_like_authority_requires_read_only_archive_catalog_export(self) -> None:
+        database_path = self.root / "archive-catalog.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE research(
+                    research_id TEXT PRIMARY KEY,
+                    display_title TEXT NOT NULL,
+                    canonical_slug TEXT NOT NULL
+                );
+                CREATE TABLE research_document(
+                    document_id TEXT PRIMARY KEY
+                );
+                CREATE TABLE research_document_version(
+                    document_version_id TEXT PRIMARY KEY,
+                    document_id TEXT NOT NULL
+                );
+                CREATE TABLE document_search_projection(
+                    research_id TEXT NOT NULL,
+                    document_version_id TEXT PRIMARY KEY,
+                    title_text TEXT NOT NULL,
+                    search_text TEXT NOT NULL
+                );
+                """
+            )
+            inserted_research: set[str] = set()
+            for version_id, version in sorted(self.base.versions.items()):
+                title = self.base.ir_documents[version_id].title
+                if version.research_id not in inserted_research:
+                    connection.execute(
+                        "INSERT INTO research VALUES(?,?,?)",
+                        (version.research_id, title, f"public-{len(inserted_research)}"),
+                    )
+                    inserted_research.add(version.research_id)
+                connection.execute(
+                    "INSERT OR IGNORE INTO research_document VALUES(?)",
+                    (version.document_id,),
+                )
+                connection.execute(
+                    "INSERT INTO research_document_version VALUES(?,?)",
+                    (version_id, version.document_id),
+                )
+                search_text = "\n".join(
+                    chunk.text
+                    for chunk in sorted(
+                        (
+                            chunk
+                            for chunk in self.base.chunks.values()
+                            if chunk.document_version_id == version_id
+                            and chunk.retrievable
+                        ),
+                        key=lambda row: (row.byte_start, row.byte_end, row.chunk_id),
+                    )
+                )
+                connection.execute(
+                    "INSERT INTO document_search_projection VALUES(?,?,?,?)",
+                    (version.research_id, version_id, title, search_text),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        replay_change_database = self.root / "archive-catalog-replay-change.sqlite3"
+        prechange_database = self.root / "archive-catalog-prechange.sqlite3"
+        verifier_exit_database = self.root / "archive-catalog-verifier-exit.sqlite3"
+        verdict_exit_database = self.root / "archive-catalog-verdict-exit.sqlite3"
+        shutil.copyfile(database_path, replay_change_database)
+        shutil.copyfile(database_path, prechange_database)
+        shutil.copyfile(database_path, verifier_exit_database)
+        shutil.copyfile(database_path, verdict_exit_database)
+
+        def export_baseline(source_database: Path) -> LikeBaselineIndex:
+            catalog = ArchiveCatalog.__new__(ArchiveCatalog)
+            catalog.settings = SimpleNamespace(
+                archive_database_path=source_database
+            )
+            catalog.presentation = SimpleNamespace(
+                hidden_research_slugs=frozenset(),
+                search_excluded_line_markers=(),
+                research_title=lambda _slug, fallback: fallback,
+            )
+            exported = LikeBaselineIndex.from_archive_catalog(
+                self.base,
+                catalog,
+                self.enriched,
+            )
+            self.addCleanup(exported.close)
+            return exported
+
+        baseline = export_baseline(database_path)
+        replay_change_baseline = export_baseline(replay_change_database)
+        prechange_baseline = export_baseline(prechange_database)
+        verifier_exit_baseline = export_baseline(verifier_exit_database)
+        verdict_exit_baseline = export_baseline(verdict_exit_database)
+        self.assertEqual(
+            "ARCHIVE_CATALOG_READ_ONLY_EXPORT",
+            baseline.evaluation_projection_authority(),
+        )
+        artifact = json.loads(baseline.evaluation_projection_artifact_bytes())
+        self.assertEqual(
+            artifact,
+            validate_authoritative_archive_like_projection(baseline),
+        )
+        self.assertEqual(
+            "ARCHIVE_CATALOG_READ_ONLY_EXPORT",
+            artifact["source_receipt"]["authority"],
+        )
+        self.assertEqual(len(self.base.versions), artifact["source_receipt"]["exported_rows"])
+        self.assertTrue(artifact["source_receipt"]["database_bundle"]["files"])
+
+        def change_source(source_database: Path, suffix: str) -> None:
+            connection = sqlite3.connect(source_database)
+            try:
+                connection.execute(
+                    "UPDATE document_search_projection "
+                    "SET title_text=title_text || ? "
+                    "WHERE document_version_id=?",
+                    (suffix, sorted(self.base.versions)[0]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+        original_bundle_identity = LikeBaselineIndex._database_bundle_identity
+        verifier_bundle_calls = 0
+
+        def change_after_verifier_entry(source_database: Path):
+            nonlocal verifier_bundle_calls
+            bundle = original_bundle_identity(source_database)
+            verifier_bundle_calls += 1
+            if verifier_bundle_calls == 1:
+                change_source(verifier_exit_database, "-verifier-exit")
+            return bundle
+
+        with patch.object(
+            LikeBaselineIndex,
+            "_database_bundle_identity",
+            side_effect=change_after_verifier_entry,
+        ):
+            with self.assertRaisesRegex(ValueError, "during qualification"):
+                validate_authoritative_archive_like_projection(
+                    verifier_exit_baseline
+                )
+        self.assertEqual(2, verifier_bundle_calls)
+
+        class ForgedAuthorityIndex(KnowledgeIndex):
+            def evaluation_projection_authority(self) -> str:
+                return ARCHIVE_LIKE_PROJECTION_AUTHORITY
+
+            def qualification_source_receipt_bytes(self) -> bytes:
+                return baseline.qualification_source_receipt_bytes()
+
+            def evaluation_projection_artifact_bytes(self) -> bytes:
+                return baseline.evaluation_projection_artifact_bytes()
+
+        forged = ForgedAuthorityIndex(self.base, self.enriched)
+        self.addCleanup(forged.close)
+        with self.assertRaisesRegex(ValueError, "exact LikeBaselineIndex"):
+            validate_authoritative_archive_like_projection(forged)
+        with self.assertRaisesRegex(ValueError, "exact LikeBaselineIndex"):
+            validate_authoritative_archive_like_projection(self.index)
+
+        projection_rows = artifact["rows"]
+        diagnostic = LikeBaselineIndex(
+            self.base,
+            self.enriched,
+            display_titles_by_research_id={
+                row["research_id"]: row["display_title"]
+                for row in projection_rows
+            },
+            presented_titles_by_research_id={
+                row["research_id"]: row["presented_title"]
+                for row in projection_rows
+            },
+            title_text_by_version_id={
+                row["document_version_id"]: row["title_text"]
+                for row in projection_rows
+            },
+            search_text_by_version_id={
+                row["document_version_id"]: row["search_text"]
+                for row in projection_rows
+            },
+            hidden_research_ids=tuple(artifact["hidden_research_ids"]),
+            search_excluded_line_markers=tuple(
+                artifact["search_excluded_line_markers"]
+            ),
+        )
+        self.addCleanup(diagnostic.close)
+        suite = self._public_programmatic_suite()
+
+        def comparison_for(
+            comparison_baseline: KnowledgeIndex,
+            run_id: str,
+            *,
+            change_before_compare: Path | None = None,
+            change_during_replay: Path | None = None,
+            change_during_final_verifier: Path | None = None,
+            force_quality_pass: bool = False,
+        ):
+            ledger = self.root / "runtime" / f"{run_id}.json"
+            preregistration = build_retrieval_comparison_preregistration(
+                suite=suite,
+                split="development",
+                candidate_index=self.index,
+                baseline_index=comparison_baseline,
+                limit=2,
+                difficult_slices=("hard_negative", "condition_conflict"),
+                run_id=run_id,
+                ledger_path=ledger,
+            )
+            candidate_report = evaluate(
+                self.index,
+                suite,
+                split="development",
+                limit=2,
+                comparison_preregistration=preregistration,
+                preregistration_ledger=ledger,
+                comparison_role="candidate",
+            )
+            baseline_report = evaluate(
+                comparison_baseline,
+                suite,
+                split="development",
+                limit=2,
+                comparison_preregistration=preregistration,
+                preregistration_ledger=ledger,
+                comparison_role="baseline",
+            )
+
+            if change_before_compare is not None:
+                change_source(change_before_compare, "-prechange")
+
+            def run_comparison():
+                return compare_candidate_to_baseline(
+                    candidate_report.per_qrel_receipts,
+                    baseline_report.per_qrel_receipts,
+                    preregistration=preregistration,
+                    preregistration_ledger=ledger,
+                    suite=suite,
+                    candidate_index=self.index,
+                    baseline_index=comparison_baseline,
+                )
+
+            if change_during_final_verifier is not None:
+                final_bundle_calls = 0
+
+                def change_after_final_verifier_entry(source_database: Path):
+                    nonlocal final_bundle_calls
+                    bundle = original_bundle_identity(source_database)
+                    final_bundle_calls += 1
+                    if final_bundle_calls == 3:
+                        change_source(
+                            change_during_final_verifier,
+                            "-final-verifier-exit",
+                        )
+                    return bundle
+
+                passing_candidate_metrics = {
+                    "recall_at_k": 1.0,
+                    "ndcg_at_k": 1.0,
+                    "reciprocal_rank": 1.0,
+                    "no_answer_accuracy": 1.0,
+                    "citation_accuracy": 1.0,
+                    "hard_errors": 0,
+                    "slices": {
+                        "hard_negative": 1.0,
+                        "condition_conflict": 1.0,
+                    },
+                    "gate_pass": True,
+                }
+                passing_baseline_metrics = {
+                    "recall_at_k": 0.0,
+                    "ndcg_at_k": 0.0,
+                    "reciprocal_rank": 0.0,
+                    "no_answer_accuracy": 0.0,
+                    "citation_accuracy": 0.0,
+                    "hard_errors": 0,
+                    "slices": {
+                        "hard_negative": 0.0,
+                        "condition_conflict": 0.0,
+                    },
+                    "gate_pass": False,
+                }
+                if not force_quality_pass:
+                    raise AssertionError(
+                        "final verifier regression must isolate authority"
+                    )
+                with patch.object(
+                    LikeBaselineIndex,
+                    "_database_bundle_identity",
+                    side_effect=change_after_final_verifier_entry,
+                ), patch(
+                    "quant_hub.knowledge.evaluation._aggregate_receipt_metrics",
+                    side_effect=(
+                        passing_candidate_metrics,
+                        passing_baseline_metrics,
+                    ),
+                ):
+                    report = run_comparison()
+                self.assertEqual(4, final_bundle_calls)
+                return report
+            if change_during_replay is None:
+                return run_comparison()
+            original_search = comparison_baseline.search
+            changed = False
+
+            def changing_search(*args, **kwargs):
+                nonlocal changed
+                if not changed:
+                    changed = True
+                    change_source(change_during_replay, "-during-replay")
+                return original_search(*args, **kwargs)
+
+            with patch.object(
+                comparison_baseline,
+                "search",
+                side_effect=changing_search,
+            ):
+                report = run_comparison()
+            self.assertTrue(changed)
+            return report
+
+        self.assertTrue(
+            comparison_for(baseline, "archive-authoritative").projection_authority_pass
+        )
+        replay_change_report = comparison_for(
+            replay_change_baseline,
+            "archive-replay-window-change",
+            change_during_replay=replay_change_database,
+        )
+        self.assertFalse(replay_change_report.projection_authority_pass)
+        self.assertFalse(replay_change_report.gate_pass)
+        prechange_report = comparison_for(
+            prechange_baseline,
+            "archive-prechange",
+            change_before_compare=prechange_database,
+        )
+        self.assertFalse(prechange_report.projection_authority_pass)
+        self.assertFalse(prechange_report.gate_pass)
+        verifier_exit_report = comparison_for(
+            verdict_exit_baseline,
+            "archive-final-verifier-exit-change",
+            change_during_final_verifier=verdict_exit_database,
+            force_quality_pass=True,
+        )
+        self.assertFalse(verifier_exit_report.projection_authority_pass)
+        self.assertFalse(verifier_exit_report.gate_pass)
+        self.assertEqual(
+            ("hard_negative", "condition_conflict"),
+            verifier_exit_report.improved_slices,
+        )
+        self.assertEqual((), verifier_exit_report.regressed_slices)
+        self.assertEqual(0, verifier_exit_report.hard_error_delta)
+        self.assertTrue(
+            all(gain >= 0.0 for gain in verifier_exit_report.overall_gains.values())
+        )
+        for nonqualifying, run_id in (
+            (self.index, "plain-index"),
+            (diagnostic, "diagnostic-like"),
+            (forged, "forged-authority"),
+        ):
+            report = comparison_for(nonqualifying, run_id)
+            self.assertFalse(report.projection_authority_pass, run_id)
+            self.assertFalse(report.gate_pass, run_id)
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute(
+                "UPDATE document_search_projection SET title_text=title_text || ? "
+                "WHERE document_version_id=?",
+                ("-changed", sorted(self.base.versions)[0]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            validate_authoritative_archive_like_projection(baseline)
 
     def test_qrels_are_grounded_sealed_stale_aware_and_evaluable(self) -> None:
         fixture = Path(__file__).parent / "fixtures" / "knowledge_eval" / "qrels.json"
@@ -845,13 +1488,96 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         tuned = suite.mark_used_for_tuning((suite.development()[0].qrel_id,))
         self.assertTrue(tuned.development()[0].tuned)
 
-        development = evaluate(self.index, suite, split="development")
+        display_titles = {
+            version.research_id: self.base.ir_documents[version_id].title
+            for version_id, version in self.base.versions.items()
+        }
+        presented_titles = dict(display_titles)
+        title_texts = {
+            version_id: (
+                f"{display_titles[version.research_id]} · "
+                f"{Path(version.logical_path).stem}"
+            )
+            for version_id, version in self.base.versions.items()
+        }
+        search_texts = {
+            version_id: "\n".join(
+                chunk.text
+                for chunk in sorted(
+                    (
+                        chunk
+                        for chunk in self.base.chunks.values()
+                        if chunk.document_version_id == version_id
+                        and chunk.retrievable
+                    ),
+                    key=lambda row: (
+                        row.byte_start,
+                        row.byte_end,
+                        row.chunk_id,
+                    ),
+                )
+            )
+            for version_id in self.base.versions
+        }
+        hidden_research_ids: tuple[str, ...] = ()
+        search_excluded_line_markers: tuple[str, ...] = ()
+        # This public fixture explicitly has no Archive presentation hiding or
+        # public-search line exclusions.  A real Archive comparison must pass
+        # its frozen presentation values instead of assuming empty filters.
+        self.assertEqual((), hidden_research_ids)
+        self.assertEqual((), search_excluded_line_markers)
+        baseline_index = LikeBaselineIndex(
+            self.base,
+            self.enriched,
+            display_titles_by_research_id=display_titles,
+            presented_titles_by_research_id=presented_titles,
+            title_text_by_version_id=title_texts,
+            search_text_by_version_id=search_texts,
+            hidden_research_ids=hidden_research_ids,
+            search_excluded_line_markers=search_excluded_line_markers,
+        )
+        self.addCleanup(baseline_index.close)
+        preregistration_ledger = self.root / "runtime" / "retrieval-prereg.json"
+        preregistration = build_retrieval_comparison_preregistration(
+            suite=suite,
+            split="development",
+            candidate_index=self.index,
+            baseline_index=baseline_index,
+            limit=8,
+            difficult_slices=("hard_negative", "condition_conflict", "cross_language"),
+            run_id="public-retrieval-run-20260822",
+            ledger_path=preregistration_ledger,
+        )
+        self.assertEqual(
+            suite.suite_hash,
+            validate_retrieval_comparison_preregistration(
+                preregistration
+            ).suite["content_hash"],
+        )
+        development = evaluate(
+            self.index,
+            suite,
+            split="development",
+            comparison_preregistration=preregistration,
+            preregistration_ledger=preregistration_ledger,
+            comparison_role="candidate",
+        )
         holdout = evaluate(self.index, suite, split="holdout")
         product_development = evaluate(
             self.artifact_index, suite, split="development"
         )
         product_holdout = evaluate(self.artifact_index, suite, split="holdout")
         self.assertEqual(8, development.count)
+        self.assertEqual("AUTHORITATIVE_EVALUATOR", development.authority)
+        self.assertEqual(development.count, len(development.per_qrel_receipts))
+        validation_receipt = json.loads(development.suite_validation_receipt)
+        self.assertEqual("PASS", validation_receipt["status"])
+        first_receipt = json.loads(development.per_qrel_receipts[0])
+        self.assertEqual(8, first_receipt["limit"])
+        self.assertEqual(
+            hashlib.sha256(development.suite_validation_receipt).hexdigest(),
+            first_receipt["suite_validation_receipt_sha256"],
+        )
         self.assertEqual(4, holdout.count)
         self.assertEqual(0, development.deprecated_errors)
         self.assertEqual(0, development.conflict_errors)
@@ -868,10 +1594,10 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         no_answer = next(
             row for row in suite.development() if row.qrel_id == "dev-no-answer"
         )
-        answerable_only = evaluate(
+        answerable_only = evaluate_non_authoritative(
             self.index, QrelSuite.create((answerable,)), split="development"
         )
-        mixed = evaluate(
+        mixed = evaluate_non_authoritative(
             self.index,
             QrelSuite.create((answerable, no_answer)),
             split="development",
@@ -923,15 +1649,126 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
                 getattr(holdout, field), getattr(product_holdout, field), field
             )
 
-        baseline_index = LikeBaselineIndex(self.base, self.enriched)
-        self.addCleanup(baseline_index.close)
-        baseline = evaluate(baseline_index, suite, split="development")
-        comparison = compare_candidate_to_baseline(
-            development,
-            baseline,
-            difficult_slices=("hard_negative", "condition_conflict", "cross_language"),
+        # The baseline must evaluate the full raw SQLite LIKE projection and
+        # never reuse candidate search as a pre-filter.
+        with patch.object(
+            KnowledgeIndex,
+            "search",
+            side_effect=AssertionError("candidate search leaked into LIKE baseline"),
+        ):
+            baseline_index.search("Rank IC 筛选横截面因子")
+        baseline = evaluate(
+            baseline_index,
+            suite,
+            split="development",
+            comparison_preregistration=preregistration,
+            preregistration_ledger=preregistration_ledger,
+            comparison_role="baseline",
         )
-        self.assertTrue(comparison.gate_pass, comparison)
+        chunks_by_version = {
+            version_id: [
+                chunk.text
+                for chunk in self.base.chunks.values()
+                if chunk.document_version_id == version_id and chunk.retrievable
+            ]
+            for version_id in self.base.versions
+        }
+        literal_query = next(
+            character
+            for texts in chunks_by_version.values()
+            for character in texts[0]
+            if not character.isspace()
+            and sum(character in text for text in texts) >= 2
+        )
+        document_units = baseline_index.search(literal_query, limit=6)
+        self.assertGreater(len(document_units.cards), 0)
+        self.assertEqual(
+            len(document_units.cards),
+            len({card.document_version_id for card in document_units.cards}),
+        )
+        comparison = compare_candidate_to_baseline(
+            development.per_qrel_receipts,
+            baseline.per_qrel_receipts,
+            preregistration=preregistration,
+            preregistration_ledger=preregistration_ledger,
+            suite=suite,
+            candidate_index=self.index,
+            baseline_index=baseline_index,
+        )
+        # Exact displayed-byte credit intentionally invalidates the historical
+        # aggregate-only qualification: neither side may receive locator
+        # credit from a wider or differently displayed card.
+        self.assertFalse(comparison.gate_pass, comparison)
+        self.assertFalse(comparison.projection_authority_pass, comparison)
+        tampered_receipt = json.loads(development.per_qrel_receipts[0])
+        tampered_receipt["metrics"]["recall_at_k"] = (
+            0.0
+            if tampered_receipt["metrics"]["recall_at_k"] != 0.0
+            else 1.0
+        )
+        with self.assertRaisesRegex(ValueError, "metrics do not match"):
+            compare_candidate_to_baseline(
+                (
+                    canonical_json(tampered_receipt).encode("utf-8"),
+                    *development.per_qrel_receipts[1:],
+                ),
+                baseline.per_qrel_receipts,
+                preregistration=preregistration,
+                preregistration_ledger=preregistration_ledger,
+                suite=suite,
+                candidate_index=self.index,
+                baseline_index=baseline_index,
+            )
+        with self.assertRaisesRegex(ValueError, "sequence of per-qrel"):
+            compare_candidate_to_baseline(
+                development,
+                baseline,
+                preregistration=preregistration,
+                preregistration_ledger=preregistration_ledger,
+                suite=suite,
+                candidate_index=self.index,
+                baseline_index=baseline_index,
+            )
+        with self.assertRaisesRegex(ValueError, "canonical JSON"):
+            compare_candidate_to_baseline(
+                development.per_qrel_receipts,
+                baseline.per_qrel_receipts,
+                preregistration=preregistration + b"\n",
+                preregistration_ledger=preregistration_ledger,
+                suite=suite,
+                candidate_index=self.index,
+                baseline_index=baseline_index,
+            )
+
+        legacy_research_id = self._record_for_path("legacy.md").research_id
+        filtered_baseline = LikeBaselineIndex(
+            self.base,
+            self.enriched,
+            display_titles_by_research_id=display_titles,
+            presented_titles_by_research_id=presented_titles,
+            title_text_by_version_id=title_texts,
+            search_text_by_version_id=search_texts,
+            hidden_research_ids=(legacy_research_id,),
+            search_excluded_line_markers=("忽略容量",),
+        )
+        self.addCleanup(filtered_baseline.close)
+        self.assertNotEqual(
+            baseline_index.index_version,
+            filtered_baseline.index_version,
+        )
+        filtered_report = evaluate(filtered_baseline, suite, split="development")
+        with self.assertRaises(ValueError):
+            compare_candidate_to_baseline(
+                development.per_qrel_receipts,
+                filtered_report.per_qrel_receipts,
+                preregistration=preregistration,
+                preregistration_ledger=preregistration_ledger,
+                suite=suite,
+                candidate_index=self.index,
+                baseline_index=filtered_baseline,
+            )
+        self.assertFalse(filtered_baseline.search("原始均值").answerable)
+        self.assertFalse(filtered_baseline.search("忽略容量").answerable)
 
         # A source revision invalidates version-grounded qrels automatically.
         (self.root / "data.md").write_text(
@@ -949,7 +1786,13 @@ class KnowledgeRetrievalEvaluationTests(unittest.TestCase):
         miscitation = QrelSuite.create(
             (replace(source, required_citation_ids=("citation-does-not-exist",)),)
         )
-        report = evaluate(self.index, miscitation, split="development")
+        with self.assertRaises(QrelSuiteValidationError) as caught:
+            evaluate(self.index, miscitation, split="development")
+        receipt = json.loads(caught.exception.receipt)
+        self.assertEqual("FAIL", receipt["status"])
+        report = evaluate_non_authoritative(
+            self.index, miscitation, split="development"
+        )
         self.assertEqual(1, report.citation_errors)
         self.assertFalse(report.gate_pass)
 
