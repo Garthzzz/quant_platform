@@ -34,55 +34,81 @@ jobs:
           PYTHONPATH: ${{ github.workspace }};${{ github.workspace }}\quant_hub;${{ github.workspace }}\quant_hub\src
           PYTHONDONTWRITEBYTECODE: "1"
           PYTHONUTF8: "1"
-        run: >-
-          python -B -m unittest
-          tests.test_git_guard
-          tests.test_legacy_browser_baseline
-          tests.test_ids_config
-          tests.test_migrations
-          tests.test_objects
-          tests.test_comment_store
-          tests.test_comment_anchor_projection
-          tests.test_web_security
-          tests.test_release_inventory
-          tests.test_release_builder
-          tests.test_release_identity
-          tests.test_sqlite_checkpoint
-          tests.test_checkpoint_cli
-          tests.test_state_only_backup
-          tests.test_stage_closure
-          tests.test_failure_domain
-          tests.test_failure_domain_cli
-          tests.test_production_host_facts_cli
-          tests.test_vm_boundary
-          tests.test_vm_bootstrap_cli
-          tests.test_recovery_bundle
-          tests.test_cold_bundle_cli
-          tests.test_cold_restore_cli
-          tests.test_deployment_controller
-          tests.test_publish_cli
-          tests.test_publish_adapters
-          tests.test_publish_runtime
-          tests.test_operational_source_cli
-          tests.test_vm_deploy_cli
-          tests.test_windows_service
-          tests.test_writer_handoff
-          tests.test_writer_handoff_client
-          tests.test_knowledge_reference_compiler
-          tests.test_knowledge_semantic
-          tests.test_knowledge_semantic_partition_provider
-          tests.test_knowledge_semantic_cli
-          tests.test_semantic_authority
-          tests.test_knowledge_retrieval_eval
-          tests.test_knowledge_public_quality
-          tests.test_knowledge_release_build
-          tests.test_knowledge_citation_projection
-          tests.test_knowledge_mcp
-          tests.test_knowledge_mcp_stress_public
-          tests.test_ds_review_harness
-          tests.test_ds_review_external_v3
-          tests.test_generic_research_renderer
-          -v
+        run: |
+          $unittestArgs = @(
+            "-B", "-m", "unittest",
+            "tests.test_git_guard",
+            "tests.test_legacy_browser_baseline",
+            "tests.test_ids_config",
+            "tests.test_migrations",
+            "tests.test_objects",
+            "tests.test_comment_store",
+            "tests.test_comment_anchor_projection",
+            "tests.test_web_security",
+            "tests.test_release_inventory",
+            "tests.test_release_builder",
+            "tests.test_release_identity",
+            "tests.test_sqlite_checkpoint",
+            "tests.test_checkpoint_cli",
+            "tests.test_state_only_backup",
+            "tests.test_stage_closure",
+            "tests.test_failure_domain",
+            "tests.test_failure_domain_cli",
+            "tests.test_production_host_facts_cli",
+            "tests.test_vm_boundary",
+            "tests.test_vm_bootstrap_cli",
+            "tests.test_recovery_bundle",
+            "tests.test_cold_bundle_cli",
+            "tests.test_cold_restore_cli",
+            "tests.test_deployment_controller",
+            "tests.test_publish_cli",
+            "tests.test_publish_adapters",
+            "tests.test_publish_runtime",
+            "tests.test_operational_source_cli",
+            "tests.test_vm_deploy_cli",
+            "tests.test_windows_service",
+            "tests.test_writer_handoff",
+            "tests.test_writer_handoff_client",
+            "tests.test_knowledge_reference_compiler",
+            "tests.test_knowledge_semantic",
+            "tests.test_knowledge_semantic_partition_provider",
+            "tests.test_knowledge_semantic_cli",
+            "tests.test_semantic_authority",
+            "tests.test_knowledge_retrieval_eval",
+            "tests.test_knowledge_public_quality",
+            "tests.test_knowledge_release_build",
+            "tests.test_knowledge_citation_projection",
+            "tests.test_knowledge_mcp",
+            "tests.test_knowledge_mcp_stress_public",
+            "tests.test_ds_review_harness",
+            "tests.test_ds_review_external_v3",
+            "tests.test_generic_research_renderer",
+            "-v"
+          )
+          $unitLog = Join-Path $env:RUNNER_TEMP "qrh-public-unittest.log"
+          $PSNativeCommandUseErrorActionPreference = $false
+          & python @unittestArgs *> $unitLog
+          $unitExit = $LASTEXITCODE
+          if ($unitExit -ne 0) {
+            $failureIdentifiers = @(
+              Select-String -LiteralPath $unitLog -Pattern '(?<identifier>(?:FAIL|ERROR): [A-Za-z0-9_.]+ \([A-Za-z0-9_.]+\))' |
+                ForEach-Object { $_.Matches[0].Groups['identifier'].Value } |
+                Sort-Object -Unique
+            )
+            [System.IO.File]::Delete($unitLog)
+            if ($failureIdentifiers.Count -eq 0) {
+              Write-Output "::error title=Public unit test failure::unittest exited $unitExit without a structured FAIL/ERROR identifier"
+            }
+            else {
+              foreach ($identifier in $failureIdentifiers | Select-Object -First 20) {
+                $message = $identifier.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                Write-Output "::error title=Public unit test failure::$message"
+              }
+            }
+            exit $unitExit
+          }
+          [System.IO.File]::Delete($unitLog)
+          Write-Output "Public-safe unit tests passed"
       - name: Build and exercise installable operational wheel
         shell: pwsh
         run: |
