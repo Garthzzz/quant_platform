@@ -24,7 +24,7 @@ jobs:
           cache-dependency-path: quant_hub/pyproject.toml
       - name: Install runtime and test dependencies
         shell: pwsh
-        run: python -m pip install --disable-pip-version-check -e ./quant_hub pytest
+        run: python -m pip install --disable-pip-version-check "setuptools==80.10.2" -e ./quant_hub pytest
       - name: Verify public Git boundary
         shell: pwsh
         run: python -B tools/release/git_guard.py gate --scope tracked
@@ -101,6 +101,16 @@ jobs:
                 ForEach-Object { $_.Matches[0].Groups['identifier'].Value } |
                 Sort-Object -Unique
             )
+            $exceptionTypes = @(
+              Select-String -LiteralPath $unitLog -Pattern '(?<exception>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):' |
+                ForEach-Object { $_.Matches[0].Groups['exception'].Value } |
+                Sort-Object -Unique
+            )
+            $missingModules = @(
+              Select-String -LiteralPath $unitLog -Pattern "ModuleNotFoundError: No module named '(?<module>[A-Za-z_][A-Za-z0-9_.]*)'" |
+                ForEach-Object { $_.Matches[0].Groups['module'].Value } |
+                Sort-Object -Unique
+            )
             [System.IO.File]::Delete($unitLog)
             if ($failureIdentifiers.Count -eq 0) {
               Write-Output "::error title=Public unit test failure::unittest exited $unitExit without a structured FAIL/ERROR identifier"
@@ -110,6 +120,12 @@ jobs:
                 $message = $identifier.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
                 Write-Output "::error title=Public unit test failure::$message"
               }
+            }
+            foreach ($exceptionType in $exceptionTypes | Select-Object -First 20) {
+              Write-Output "::error title=Public unit test exception type::$exceptionType"
+            }
+            foreach ($missingModule in $missingModules | Select-Object -First 20) {
+              Write-Output "::error title=Missing public Python module::$missingModule"
             }
             exit $unitExit
           }
