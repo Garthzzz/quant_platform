@@ -1112,6 +1112,21 @@ def validate_search_artifact(value: object, *, expected_snapshot_id: str) -> Map
         (str(row["document_version_id"]), str(row["containing_span_id"]))
         for row in native_citations
     )
+    # A resolved sidecar occurrence is itself a source-bound artifact member.
+    # Container spans such as list/list_item/quote can be required to replay
+    # the exact marker bytes without also becoming a retrievable chunk or a
+    # formal-knowledge locator. Keep those spans in the closed reference set;
+    # ``required_source_material`` above still rejects every unrelated extra.
+    for citation in citations.values():
+        for version_id, version in versions.items():
+            if (
+                version.get("is_current") is True
+                and version["source_sha256"] == citation["source_sha256"]
+            ):
+                structurally_referenced_material.update(
+                    (version_id, str(span_id))
+                    for span_id in citation["containing_span_ids"]
+                )
     for row in knowledge.values():
         version_id = row.get("document_version_id")
         locators = row.get("source_locators")

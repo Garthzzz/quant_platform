@@ -573,6 +573,86 @@ class KnowledgeCitationProjectionTests(unittest.TestCase):
             }
         self.assertEqual(direct, rebuilt)
 
+    def test_projection_container_material_is_a_closed_structural_member(self) -> None:
+        sources = self.root / "projection-container-sources"
+        sources.mkdir()
+        source = (
+            "# Projection container\n\n"
+            "- First reviewed Alpha occurrence.\n"
+            "- Second list item keeps the container non-atomic.\n"
+        ).encode("utf-8")
+        (sources / "list.md").write_bytes(source)
+        report = ReferenceCompiler().compile(sources)
+        self.assertIsNotNone(report.candidate_snapshot)
+        base = report.candidate_snapshot
+        assert base is not None
+        source_sha256 = hashlib.sha256(source).hexdigest()
+        marker = "Alpha"
+        marker_start = source.index(marker.encode("utf-8"))
+        overlay = self._write_overlay(
+            "projection-container-overrides.json",
+            {
+                "schema_version": "qrh-reviewed-citation-projection/v1",
+                "review_scope": "projection-container-public-fixture",
+                "reviewed_at": NOW,
+                "documents": [
+                    {
+                        "source_path": "list.md",
+                        "document_sha256": source_sha256,
+                        "entries": [
+                            {
+                                "key": "projection-container-alpha",
+                                "line_number": source[:marker_start].count(b"\n") + 1,
+                                "marker": marker,
+                                "source_candidate_id": "candidate-container-alpha",
+                                "relation_summary_zh": "公开容器引用回归。",
+                                "paper": {
+                                    "paper_id": "paper_" + "7" * 32,
+                                    "title": "Container Citation Fixture",
+                                    "external_links": [
+                                        {
+                                            "kind": "repository",
+                                            "url": "https://example.invalid/container",
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        projection = build_citation_projection(
+            base,
+            self.database,
+            {source_sha256: source},
+            overlay_manifest_path=overlay,
+            evidence_migration_root=MIGRATIONS,
+        )
+        artifact = json.loads(
+            build_search_artifact(base, citation_projection=projection)
+        )
+        material_keys = {
+            (row["document_version_id"], row["span_id"])
+            for row in artifact["citation_source_material"]
+        }
+        chunk_keys = {
+            (row["document_version_id"], span_id)
+            for row in artifact["chunks"]
+            for span_id in row["ordered_span_ids"]
+        }
+        occurrence_keys = {
+            (version["version_id"], span_id)
+            for row in artifact["citations"]
+            for version in artifact["versions"]
+            if version["is_current"] is True
+            and version["source_sha256"] == row["source_sha256"]
+            for span_id in row["containing_span_ids"]
+        }
+        self.assertEqual(material_keys, occurrence_keys)
+        self.assertTrue(material_keys - chunk_keys)
+        validate_search_artifact(artifact, expected_snapshot_id=base.snapshot_id)
+
     def test_mcp_search_get_returns_only_the_selected_locator_citation(self) -> None:
         citation_a = self._insert_occurrence("[A]", binding_status="resolved", key="a")
         citation_b = self._insert_occurrence("[B]", binding_status="resolved", key="b")
