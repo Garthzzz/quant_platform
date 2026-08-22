@@ -5,6 +5,7 @@ import hashlib
 import http.cookiejar
 import json
 from pathlib import Path
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.parse
 import urllib.request
 
@@ -32,7 +34,7 @@ from quant_hub.ops.vm_service_cli import (
     record_service_control_evidence,
     verify_protected_service_state,
 )
-from quant_hub.ops.vm_deploy_cli import WindowsServiceRuntime
+from quant_hub.ops.vm_deploy_cli import VMDeployCLIError, WindowsServiceRuntime
 from quant_hub.ops.vm_boundary import build_vm_write_audit, capture_vm_write_snapshot
 from quant_hub.runtime_seal import safe_tree_file_state
 from quant_hub.web.access_gate import LOGIN_TEMPLATE, derive_password_digest
@@ -71,6 +73,28 @@ class Settings:
     def default(cls, **values):
         return SimpleNamespace(**values)
 '''
+
+
+def _remove_windows_test_fixture_tree(target: Path, *, exact_parent: Path) -> None:
+    """Remove one test-owned child after transient Windows handle release."""
+
+    if target.parent != exact_parent or target == exact_parent:
+        raise AssertionError("test fixture cleanup escaped its exact parent")
+    deadline = time.monotonic() + 5.0
+    while target.exists():
+        parent_resolved = exact_parent.resolve(strict=True)
+        target_resolved = target.resolve(strict=True)
+        if target_resolved.parent != parent_resolved:
+            raise AssertionError("test fixture cleanup target resolved outside its parent")
+        try:
+            shutil.rmtree(target)
+        except OSError as error:
+            if getattr(error, "winerror", None) not in {5, 32, 33}:
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(0.05, remaining))
 
 
 class FakeInstaller:
@@ -461,6 +485,21 @@ class WindowsServiceTopologyTests(unittest.TestCase):
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (self.root / "state").glob("*.sqlite3")
         }
+        popen_arguments: list[tuple[str, ...]] = []
+        cleanup_targets: list[Path] = []
+
+        def observed_popen(arguments, **kwargs):
+            popen_arguments.append(tuple(arguments))
+            return subprocess.Popen(arguments, **kwargs)
+
+        def sharing_once_then_remove(path: Path) -> None:
+            cleanup_targets.append(path)
+            if len(cleanup_targets) == 1:
+                error = OSError("injected Windows sharing violation")
+                error.winerror = 32
+                raise error
+            shutil.rmtree(path)
+
         runtime = WindowsServiceRuntime(
             root=self.root,
             service_name="QuantResearchHub",
@@ -480,6 +519,8 @@ class WindowsServiceTopologyTests(unittest.TestCase):
             workspace_database_path="state/research_workspace.sqlite3",
             write_paths=(),
             candidate_python=Path(sys.executable),
+            candidate_popen_factory=observed_popen,
+            candidate_probe_rmtree=sharing_once_then_remove,
             allow_test_root=True,
         )
         release = self.releases["release-r2"]
@@ -518,7 +559,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         )
         self.assertFalse(any((self.root / "state").glob("*.sqlite3-wal")))
         self.assertFalse(any((self.root / "state").glob("*.sqlite3-shm")))
-        self.assertFalse((self.root / "tmp" / "candidate-probes").exists())
+        self.assertEqual(Path(sys.executable).resolve(), Path(popen_arguments[0][0]).resolve())
+        self.assertEqual(2, len(cleanup_targets))
+        self.assertEqual(cleanup_targets[0], cleanup_targets[1])
+        self.assertTrue((self.root / "tmp" / "candidate-probes").is_dir())
+        self.assertEqual([], list((self.root / "tmp" / "candidate-probes").iterdir()))
 
     def test_candidate_probe_rejects_wrong_one_time_login_and_cleans(self) -> None:
         release = self.releases["release-r2"]
@@ -557,7 +602,150 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         self.assertEqual(
             active_before, (self.root / "control" / "active_release.json").read_bytes()
         )
-        self.assertFalse((self.root / "tmp" / "candidate-probes").exists())
+        self.assertTrue((self.root / "tmp" / "candidate-probes").is_dir())
+        self.assertEqual([], list((self.root / "tmp" / "candidate-probes").iterdir()))
+
+    def test_candidate_probe_reaps_already_exited_process_after_log_handles_close(self) -> None:
+        release = self.releases["release-r2"]
+        captured_logs = []
+
+        class AlreadyExitedProcess:
+            def __init__(self) -> None:
+                self.wait_timeouts: list[float] = []
+                self.logs_closed_when_waited = False
+
+            def poll(self):
+                return 7
+
+            def terminate(self):
+                raise AssertionError("an already exited process must not be terminated")
+
+            def wait(self, timeout):
+                self.wait_timeouts.append(timeout)
+                self.logs_closed_when_waited = all(handle.closed for handle in captured_logs)
+                return 7
+
+            def kill(self):
+                raise AssertionError("an already exited process must not be killed")
+
+        exited = AlreadyExitedProcess()
+
+        def fake_popen(_arguments, **kwargs):
+            captured_logs.extend((kwargs["stdout"], kwargs["stderr"]))
+            self.assertTrue(all(not handle.closed for handle in captured_logs))
+            return exited
+
+        runtime = WindowsServiceRuntime(
+            root=self.root,
+            service_name="QuantResearchHub",
+            base_url="http://127.0.0.1:8765",
+            listen_host="127.0.0.1",
+            port=8765,
+            critical_paths=("/login", "/api/v1/research", "/api/v1/dashboard"),
+            writer_authority="D-active",
+            service_entry_relative_path="tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+            application_source_relative_path="runtime_contract/code/src",
+            archive_root_relative_path="reference/archive",
+            var_root_relative_path="runtime",
+            migration_root_relative_path="runtime_contract/migrations/platform",
+            access_password_digest_path="state/viewer_access_password.digest",
+            session_key_path="state/viewer_secret.key",
+            comment_database_path="state/comments.sqlite3",
+            workspace_database_path="state/research_workspace.sqlite3",
+            write_paths=(),
+            candidate_python=Path(sys.executable),
+            candidate_popen_factory=fake_popen,
+            allow_test_root=True,
+        )
+        with mock.patch.object(
+            WindowsServiceRuntime, "_get_at", return_value=(0, b"")
+        ), mock.patch.object(
+            WindowsServiceRuntime,
+            "_authenticated_surfaces",
+            return_value=(False, False, False),
+        ):
+            with self.assertRaisesRegex(VMDeployCLIError, "browser/API"):
+                runtime.candidate_probe(
+                    self.root / "releases" / "release-r2",
+                    {
+                        "release_id": "release-r2",
+                        "manifest_sha256": manifest_sha256(release),
+                        "snapshot_id": release["content"]["snapshot_id"],
+                    },
+                )
+        self.assertEqual([10], exited.wait_timeouts)
+        self.assertTrue(exited.logs_closed_when_waited)
+        self.assertTrue(all(handle.closed for handle in captured_logs))
+        self.assertEqual([], list((self.root / "tmp" / "candidate-probes").iterdir()))
+
+    def test_candidate_probe_cleanup_exhaustion_preserves_original_failure_and_sibling(self) -> None:
+        release = self.releases["release-r2"]
+        manifest_hash = manifest_sha256(release)
+        probe_parent = self.root / "tmp" / "candidate-probes"
+        probe_parent.mkdir(parents=True, exist_ok=True)
+        sibling = probe_parent / "retained-diagnostic"
+        sibling.mkdir()
+        (sibling / "evidence.txt").write_text("retain\n", encoding="utf-8")
+        probe_root = probe_parent / f"release-r2-{manifest_hash[:16]}"
+        cleanup_targets: list[Path] = []
+
+        def sharing_forever(path: Path) -> None:
+            cleanup_targets.append(path)
+            error = OSError("injected Windows sharing violation")
+            error.winerror = 32
+            raise error
+
+        runtime = WindowsServiceRuntime(
+            root=self.root,
+            service_name="QuantResearchHub",
+            base_url="http://127.0.0.1:8765",
+            listen_host="127.0.0.1",
+            port=8765,
+            critical_paths=("/login", "/api/v1/research", "/api/v1/dashboard"),
+            writer_authority="D-active",
+            service_entry_relative_path="tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+            application_source_relative_path="runtime_contract/code/src",
+            archive_root_relative_path="reference/archive",
+            var_root_relative_path="runtime",
+            migration_root_relative_path="runtime_contract/migrations/platform",
+            access_password_digest_path="state/viewer_access_password.digest",
+            session_key_path="state/viewer_secret.key",
+            comment_database_path="state/comments.sqlite3",
+            workspace_database_path="state/research_workspace.sqlite3",
+            write_paths=(),
+            candidate_python=Path(sys.executable),
+            candidate_probe_rmtree=sharing_forever,
+            candidate_cleanup_retry_seconds=0.0,
+            allow_test_root=True,
+            candidate_login_password_transform=lambda value: value + "-wrong",
+        )
+        try:
+            with self.assertRaisesRegex(
+                VMDeployCLIError, "cleanup exhausted.*sharing retry deadline"
+            ) as raised:
+                runtime.candidate_probe(
+                    self.root / "releases" / "release-r2",
+                    {
+                        "release_id": "release-r2",
+                        "manifest_sha256": manifest_hash,
+                        "snapshot_id": release["content"]["snapshot_id"],
+                    },
+                )
+            self.assertIsInstance(raised.exception.__cause__, VMDeployCLIError)
+            self.assertIn("browser/API", str(raised.exception.__cause__))
+            self.assertEqual([probe_root], cleanup_targets)
+            self.assertTrue((sibling / "evidence.txt").is_file())
+            self.assertTrue(probe_root.is_dir())
+        finally:
+            if probe_root.exists():
+                _remove_windows_test_fixture_tree(
+                    probe_root, exact_parent=probe_parent
+                )
+            if sibling.exists():
+                _remove_windows_test_fixture_tree(
+                    sibling, exact_parent=probe_parent
+                )
+
     def test_install_candidate_is_hashed_idempotent_and_d_root_configured(self) -> None:
         executable = (
             self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"

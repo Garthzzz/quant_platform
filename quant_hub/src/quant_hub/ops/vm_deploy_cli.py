@@ -19,6 +19,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -29,7 +30,7 @@ from urllib.request import Request, urlopen
 
 from quant_hub.web.access_gate import derive_password_digest
 
-from quant_hub.config import ensure_no_reparse_components
+from quant_hub.config import ensure_no_reparse_components, stat_is_reparse_point
 from quant_hub.runtime_seal import read_json
 
 from .deployment import (
@@ -102,6 +103,104 @@ def verify_production_root(path: Path) -> Path:
     if approved != PRODUCTION_VM_ROOT:
         raise VMDeployCLIError(r"vm-root must be exactly D:\quant\quant_platform")
     return verify_existing_vm_write_path(path, allow_root=True)
+
+
+def _probe_directory_identity(path: Path, *, label: str) -> tuple[str, int, int]:
+    """Return a stable identity for one exact, ordinary probe directory."""
+
+    try:
+        ensure_no_reparse_components(path)
+        info = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, ValueError) as error:
+        raise VMDeployCLIError(f"{label} is unavailable for candidate cleanup") from error
+    if not stat.S_ISDIR(info.st_mode) or stat_is_reparse_point(info):
+        raise VMDeployCLIError(f"{label} is not an ordinary directory")
+    return os.path.normcase(str(resolved)), int(info.st_dev), int(info.st_ino)
+
+
+def _verify_probe_cleanup_target(
+    *,
+    probe_parent: Path,
+    probe_root: Path,
+    expected_parent_identity: tuple[str, int, int],
+    expected_root_identity: tuple[str, int, int],
+) -> None:
+    """Revalidate that cleanup still targets only the directory we created."""
+
+    expected_root = probe_parent / probe_root.name
+    if probe_root.absolute() != expected_root.absolute() or probe_root.parent != probe_parent:
+        raise VMDeployCLIError("candidate probe cleanup target escaped its exact parent")
+    parent_identity = _probe_directory_identity(
+        probe_parent, label="candidate probe parent"
+    )
+    root_identity = _probe_directory_identity(probe_root, label="candidate probe root")
+    if parent_identity != expected_parent_identity:
+        raise VMDeployCLIError("candidate probe parent identity changed before cleanup")
+    if root_identity != expected_root_identity:
+        raise VMDeployCLIError("candidate probe root identity changed before cleanup")
+    parent_resolved = Path(parent_identity[0])
+    root_resolved = Path(root_identity[0])
+    if root_resolved.parent != parent_resolved or root_resolved.name != probe_root.name:
+        raise VMDeployCLIError("candidate probe cleanup target is outside its exact parent")
+
+
+def _settle_candidate_process(process: subprocess.Popen[bytes]) -> None:
+    """Fully reap a candidate process regardless of its last polled state."""
+
+    try:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                # The child can exit between poll and terminate.  wait() below
+                # is the authority for the final process state.
+                pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise VMDeployCLIError("candidate probe process could not be fully reaped") from error
+
+
+def _remove_candidate_probe_root(
+    *,
+    probe_parent: Path,
+    probe_root: Path,
+    expected_parent_identity: tuple[str, int, int],
+    expected_root_identity: tuple[str, int, int],
+    remove: Callable[[Path], None],
+    retry_seconds: float,
+) -> None:
+    """Remove exactly one probe root, retrying only Windows sharing failures."""
+
+    deadline = time.monotonic() + max(0.0, retry_seconds)
+    while True:
+        if not os.path.lexists(probe_root):
+            return
+        _verify_probe_cleanup_target(
+            probe_parent=probe_parent,
+            probe_root=probe_root,
+            expected_parent_identity=expected_parent_identity,
+            expected_root_identity=expected_root_identity,
+        )
+        try:
+            remove(probe_root)
+            return
+        except OSError as error:
+            windows_error = getattr(error, "winerror", None)
+            if windows_error not in {5, 32, 33}:
+                raise VMDeployCLIError(
+                    "candidate probe cleanup failed with a non-retryable error"
+                ) from error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise VMDeployCLIError(
+                    "candidate probe cleanup exhausted the Windows sharing retry deadline"
+                ) from error
+            time.sleep(min(0.05, remaining))
 
 
 def verify_runtime_environment(
@@ -324,6 +423,12 @@ class WindowsServiceRuntime:
     candidate_python: Path | None = field(default=None, repr=False, compare=False)
     candidate_popen_factory: Callable[..., subprocess.Popen[bytes]] = field(
         default=subprocess.Popen, repr=False, compare=False
+    )
+    candidate_probe_rmtree: Callable[[Path], None] = field(
+        default=shutil.rmtree, repr=False, compare=False
+    )
+    candidate_cleanup_retry_seconds: float = field(
+        default=5.0, repr=False, compare=False
     )
     allow_test_root: bool = field(default=False, repr=False, compare=False)
     candidate_login_password_transform: Callable[[str], str] = field(
@@ -648,10 +753,17 @@ class WindowsServiceRuntime:
         for directory in (state, temporary, logs):
             directory.mkdir()
             ensure_no_reparse_components(directory)
+        probe_parent_identity = _probe_directory_identity(
+            probe_parent, label="candidate probe parent"
+        )
+        probe_root_identity = _probe_directory_identity(
+            probe_root, label="candidate probe root"
+        )
         active_path = self.root / "control" / "active_release.json"
         active_before = active_path.read_bytes() if active_path.exists() else None
         process: subprocess.Popen[bytes] | None = None
         evidence: dict[str, object] | None = None
+        probe_failure: Exception | None = None
         try:
             for source_name, destination_name in (
                 ("comments.sqlite3", "comments.sqlite3"),
@@ -773,22 +885,45 @@ class WindowsServiceRuntime:
                     == active_before if active_path.exists() else active_before is None,
                     "cleaned": False,
                 }
+        except Exception as error:
+            probe_failure = error
         finally:
-            if process is not None and process.poll() is None:
-                process.terminate()
+            resource_failure: Exception | None = None
+            if process is not None:
                 try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=5)
-            ensure_no_reparse_components(probe_root)
-            shutil.rmtree(probe_root)
+                    _settle_candidate_process(process)
+                except Exception as error:
+                    resource_failure = error
+                finally:
+                    process = None
+            cleanup_failure: Exception | None = None
             try:
-                probe_parent.rmdir()
-            except OSError:
-                # A concurrent serialized probe or retained diagnostic makes
-                # the parent non-empty; never broaden cleanup beyond it.
-                pass
+                _remove_candidate_probe_root(
+                    probe_parent=probe_parent,
+                    probe_root=probe_root,
+                    expected_parent_identity=probe_parent_identity,
+                    expected_root_identity=probe_root_identity,
+                    remove=self.candidate_probe_rmtree,
+                    retry_seconds=self.candidate_cleanup_retry_seconds,
+                )
+            except Exception as error:
+                cleanup_failure = error
+            if cleanup_failure is not None:
+                if resource_failure is not None:
+                    cleanup_failure.add_note(
+                        f"candidate process/log cleanup also failed: {resource_failure}"
+                    )
+                if probe_failure is not None:
+                    raise cleanup_failure from probe_failure
+                if resource_failure is not None:
+                    raise cleanup_failure from resource_failure
+                raise cleanup_failure
+            if resource_failure is not None:
+                if probe_failure is not None:
+                    raise resource_failure from probe_failure
+                raise resource_failure
+        if probe_failure is not None:
+            raise probe_failure.with_traceback(probe_failure.__traceback__)
         if evidence is None or evidence["active_unchanged"] is not True:
             raise VMDeployCLIError("candidate probe did not preserve active authority")
         evidence["cleaned"] = not probe_root.exists()
