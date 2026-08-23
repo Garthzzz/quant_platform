@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from quant_hub.knowledge.contracts import canonical_json
 from quant_hub.knowledge import ReferenceCompiler
@@ -146,6 +147,17 @@ class LocalRecoveryActions:
 
 class PublishRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These historical tests exercise logic downstream of the product gate.
+        # Product NOT_READY behavior is covered unpatched in
+        # test_failure_domain_rotation, including a freshly installed wheel.
+        for target in (
+            "quant_hub.ops.publish_runtime.require_failure_domain_authority",
+            "quant_hub.ops.publish.require_failure_domain_authority",
+            "quant_hub.ops.publish_adapters.require_failure_domain_authority",
+        ):
+            authority = patch(target, return_value=None)
+            authority.start()
+            self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()

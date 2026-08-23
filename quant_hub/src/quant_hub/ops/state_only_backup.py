@@ -58,12 +58,16 @@ from .release_identity import (
     validate_recovery_manifest,
     validate_release_manifest,
 )
-from .failure_domain import FailureDomainError, collect_host_facts
+from .failure_domain_authority import require_failure_domain_authority
+from .failure_domain import (
+    FailureDomainError,
+    collect_host_facts,
+    rebuild_legacy_attestation_diagnostic,
+)
 from .stage_closure import (
     DirectoryEvidenceResolver,
     StageClosureError,
     artifact_ref,
-    verify_failure_domain_attestation,
     verify_measured_prior_binding,
 )
 
@@ -420,6 +424,7 @@ def _controlled_environment(root: Path, attempt_id: str) -> Iterator[Path]:
 
 
 def _attestation_sha(config: RuntimePublishConfig) -> str:
+    require_failure_domain_authority()
     value = _canonical_read(config.recovery.attestation_path)
     claimed = value.get("attestation_sha256")
     return _sha(claimed, label="failure-domain attestation hash")
@@ -1150,6 +1155,7 @@ def run_state_only_backup(
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
     id_factory: Callable[[], str] = lambda: uuid4().hex,
 ) -> StateOnlyRunResult:
+    require_failure_domain_authority()
     recovery_root = config.recovery.recovery_root.resolve(strict=True)
     ensure_no_reparse_components(recovery_root)
     root = _state_root(recovery_root)
@@ -1583,6 +1589,7 @@ def _current_token_sid_sha256() -> str:
 def _load_scheduler_attestation(
     *, recovery_root: Path, attestation_path: Path
 ) -> tuple[Mapping[str, object], str, Path, Path]:
+    require_failure_domain_authority()
     recovery = _strict_existing_path(recovery_root, kind="directory", label="recovery root")
     attestation_file = _strict_existing_path(
         attestation_path, kind="file", label="failure-domain attestation"
@@ -1594,10 +1601,27 @@ def _load_scheduler_attestation(
         document = json.loads(raw.decode("utf-8"))
         if canonical_manifest_bytes(document) != raw:
             raise StateOnlyBackupError("scheduler attestation is not canonical JSON")
-        attestation = verify_failure_domain_attestation(document)
-    except (UnicodeDecodeError, json.JSONDecodeError, StageClosureError) as error:
-        raise StateOnlyBackupError("scheduler failure-domain attestation failed") from error
-    recovery_facts = attestation["recovery"]
+        if not isinstance(document, dict):
+            raise StateOnlyBackupError("scheduler attestation is not an object")
+        claimed = document.get("attestation_sha256")
+        material = dict(document)
+        material.pop("attestation_sha256", None)
+        attestation = rebuild_legacy_attestation_diagnostic(
+            production_facts=document["production"],
+            recovery_facts=document["recovery"],
+            independence_probe=document["independence_probe"],
+            observed_at=str(document["observed_at"]),
+        )
+        if (
+            attestation.authority
+            or attestation.status != "DIAGNOSTIC_ONLY"
+            or (claimed is not None and claimed != attestation.sha256)
+            or material != attestation.payload
+        ):
+            raise StateOnlyBackupError("scheduler legacy diagnostic identity differs")
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, FailureDomainError) as error:
+        raise StateOnlyBackupError("scheduler failure-domain diagnostic failed") from error
+    recovery_facts = attestation.payload["recovery"]
     assert isinstance(recovery_facts, Mapping)
     try:
         actual = collect_host_facts(
@@ -1613,7 +1637,7 @@ def _load_scheduler_attestation(
     ):
         if actual[field] != recovery_facts[field]:
             raise StateOnlyBackupError("scheduler is running on another recovery host/root")
-    return attestation, hashlib.sha256(raw).hexdigest(), recovery, attestation_file
+    return document, hashlib.sha256(raw).hexdigest(), recovery, attestation_file
 
 
 def _task_authority_ref(value: object) -> Mapping[str, object]:
@@ -1636,6 +1660,8 @@ def validate_task_authority(value: object) -> Mapping[str, object]:
     Stage 5 evidence producer must materialize it at the fixed recovery-root
     locator before either candidate generation or Task Scheduler apply exists.
     """
+
+    require_failure_domain_authority()
 
     fields = {
         "schema_version", "authorization_id", "authorized_at", "authority",
@@ -1816,6 +1842,7 @@ def build_task_candidate(
     recovery_root: Path,
     failure_domain_attestation_path: Path,
 ) -> Mapping[str, object]:
+    require_failure_domain_authority()
     config = _strict_existing_path(config_path, kind="file", label="config")
     project = _strict_existing_path(project_root, kind="directory", label="project root")
     operational = _strict_existing_path(
@@ -1909,6 +1936,7 @@ def build_task_candidate(
 
 
 def validate_task_candidate(value: object) -> Mapping[str, object]:
+    require_failure_domain_authority()
     if not isinstance(value, dict) or set(value) != {
         "schema_version", "task_identity", "host_role", "host_binding", "schedule",
         "authority_ref", "repository_binding", "release_binding", "principal", "action",
@@ -2482,6 +2510,7 @@ def validate_task_inspection_artifact(
 def apply_task_candidate(
     candidate: object, *, adapter: TaskSchedulerAdapter, allow_os_registration: bool
 ) -> TaskApplyResult:
+    require_failure_domain_authority()
     value = validate_task_candidate(candidate)
     if not allow_os_registration:
         raise StateOnlyBackupError("Task Scheduler apply requires explicit opt-in")
@@ -2588,6 +2617,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "schedule-apply":
             sub.add_argument("--allow-os-registration", action="store_true")
     args = parser.parse_args(argv)
+    require_failure_domain_authority()
     config = RuntimePublishConfig.load(
         args.config, expected_project_root=args.project_root
     )

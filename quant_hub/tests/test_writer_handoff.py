@@ -353,6 +353,12 @@ class FakeRuntime:
 
 class WriterHandoffTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = mock.patch(
+            "quant_hub.ops.writer_handoff.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         self.fixture = Fixture()
         self.runtime = FakeRuntime(self.fixture.root)
 
@@ -396,7 +402,11 @@ class WriterHandoffTests(unittest.TestCase):
         self.assertFalse(receipt["mutation_performed"])
         self.assertEqual(3901, observation["legacy_process"]["pid"])
         self.assertEqual(self.fixture.baseline.manifest_sha256, observation["v39"]["manifest_sha256"])
-        self.assertTrue(observation["d"]["recovery"]["failure_domain_accepted"])
+        self.assertFalse(observation["d"]["recovery"]["failure_domain_accepted"])
+        self.assertEqual(
+            "unavailable-v2",
+            observation["d"]["recovery"]["failure_domain_attestation_schema"],
+        )
         self.assertEqual(
             "pending_first_production_start",
             observation["d"]["protected_session_key_status"],

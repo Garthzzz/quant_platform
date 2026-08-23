@@ -1,19 +1,11 @@
-"""Machine-readable collection and verification of recovery failure-domain facts."""
+"""Read-only diagnostics and fail-closed failure-domain command router."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
-from uuid import uuid4
-
-from quant_hub.ops.failure_domain import (
-    attest_failure_domain,
-    build_independence_probe,
-    canonical_bytes,
-    collect_host_facts,
-)
+import sys
 from quant_hub.ops.vm_boundary import (
     PRODUCTION_VM_ROOT,
     VMBoundaryError,
@@ -32,31 +24,17 @@ def _guard_production_facts_paths(root: Path, output: Path) -> None:
     validate_production_vm_write_path(str(output), allow_root=False)
 
 
-def _read(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise RuntimeError("evidence JSON must be an object")
-    return value
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] in {
+        "issue-challenge", "capture-recovery-facts",
+        "capture-independence-probe", "observe", "rotate-prepare",
+        "rotate-apply", "verify-current", "diagnose-legacy-current",
+        "source-manifest",
+    }:
+        from quant_hub.ops.failure_domain_rotation import main as rotation_main
 
-
-def _write_new(path: Path, value: object) -> None:
-    target = path.resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        raise RuntimeError(f"evidence already exists: {target}")
-    temporary = target.parent / f".{target.name}.partial-{uuid4().hex}"
-    try:
-        with temporary.open("xb") as stream:
-            stream.write(canonical_bytes(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-
-
-def main() -> int:
+        return rotation_main(arguments)
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     facts = subparsers.add_parser("facts")
@@ -76,32 +54,20 @@ def main() -> int:
     probe.add_argument("--materialization-event", type=Path, required=True)
     probe.add_argument("--probe-tool", type=Path, required=True)
     probe.add_argument("--output", type=Path, required=True)
-    args = parser.parse_args()
-
-    if args.command == "facts":
-        if args.role == "production":
-            _guard_production_facts_paths(args.root, args.output)
-        value = collect_host_facts(
-            args.root, role=args.role, tool_version=args.tool_version
+    args = parser.parse_args(arguments)
+    print(
+        json.dumps(
+            {
+                "status": "NOT_READY",
+                "authority": False,
+                "error_code": "FAILURE_DOMAIN_AUTHORITY_NOT_READY",
+                "command": args.command,
+                "output_created": False,
+            },
+            sort_keys=True,
         )
-    elif args.command == "attest":
-        result = attest_failure_domain(
-            production_facts=_read(args.production_facts),
-            recovery_facts=_read(args.recovery_facts),
-            independence_probe=_read(args.independence_probe),
-            observed_at=args.observed_at,
-        )
-        value = {**result.payload, "attestation_sha256": result.sha256}
-    else:
-        value = build_independence_probe(
-            recovery_root=args.recovery_root,
-            bundle_root=args.bundle_root,
-            materialization_event_path=args.materialization_event,
-            probe_tool_path=args.probe_tool,
-        )
-    _write_new(args.output, value)
-    print(json.dumps({"status": "PASS", "output": str(args.output.resolve())}))
-    return 0
+    )
+    return 2
 
 
 if __name__ == "__main__":

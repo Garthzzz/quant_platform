@@ -24,6 +24,10 @@ from uuid import uuid4
 
 from quant_hub.config import ensure_no_reparse_components
 
+from .failure_domain_authority import (
+    FailureDomainAuthorityNotReady,
+    require_failure_domain_authority,
+)
 from .publish_adapters import (
     CommandResult,
     CommandRunner,
@@ -31,7 +35,7 @@ from .publish_adapters import (
     VMConfig,
     exact_production_root_parent_guard_script,
     ssh_target_guard_script,
-    subprocess_runner,
+    _subprocess_runner,
     verified_d_tooling_python_script,
 )
 from .release_identity import canonical_manifest_bytes, manifest_sha256
@@ -140,9 +144,10 @@ class WriterHandoffClient:
         self,
         config: WriterHandoffClientConfig,
         *,
-        command_runner: CommandRunner = subprocess_runner,
+        command_runner: CommandRunner = _subprocess_runner,
         nonce_factory: Callable[[int], bytes] = secrets.token_bytes,
     ):
+        require_failure_domain_authority()
         self.config = config
         self.command_runner = command_runner
         self.nonce_factory = nonce_factory
@@ -606,6 +611,7 @@ class WriterHandoffClient:
             staging.unlink(missing_ok=True)
 
     def inspect(self, baseline: V39Baseline) -> str:
+        require_failure_domain_authority()
         seeded = self._module(self._base_arguments("seed-access-identity", baseline))
         if seeded.returncode != 0:
             raise WriterHandoffClientError("fixed V39 access identity seed failed")
@@ -656,6 +662,7 @@ class WriterHandoffClient:
         return actual_hash
 
     def status(self, inspection_hash: str, baseline: V39Baseline) -> WriterHandoffClientResult:
+        require_failure_domain_authority()
         _, nonce = self._load_inspection(inspection_hash, baseline)
         status = self._remote_status(inspection_hash, nonce, baseline)
         evidence_id: str | None = None
@@ -676,6 +683,7 @@ class WriterHandoffClient:
         )
 
     def finalize(self, inspection_hash: str, baseline: V39Baseline) -> WriterHandoffClientResult:
+        require_failure_domain_authority()
         _, nonce = self._load_inspection(inspection_hash, baseline)
         status = self._remote_status(inspection_hash, nonce, baseline)
         if status["status"] == "finalize_required":
@@ -718,6 +726,7 @@ class WriterHandoffClient:
         )
 
     def run(self, baseline: V39Baseline) -> WriterHandoffClientResult:
+        require_failure_domain_authority()
         inspection_hash = self.inspect(baseline)
         try:
             _, nonce = self._load_inspection(inspection_hash, baseline)
@@ -784,6 +793,7 @@ class WriterHandoffClient:
 
 
 def _client_from_runtime_config(path: Path, project_root: Path) -> WriterHandoffClient:
+    require_failure_domain_authority()
     from .publish_runtime import RuntimePublishConfig
 
     runtime = RuntimePublishConfig.load(path, expected_project_root=project_root)
@@ -807,6 +817,11 @@ def main(argv: list[str] | None = None) -> int:
         sub = commands.add_parser(command)
         sub.add_argument("--inspection-sha256", required=True)
     args = parser.parse_args(argv)
+    try:
+        require_failure_domain_authority()
+    except FailureDomainAuthorityNotReady as error:
+        print(json.dumps(error.document(), ensure_ascii=False, sort_keys=True))
+        return 2
     try:
         client = _client_from_runtime_config(args.config, args.project_root)
         baseline = V39Baseline(args.release_manifest_sha256)

@@ -26,11 +26,12 @@ from quant_hub.config import ensure_no_reparse_components
 from .publish_adapters import (
     CommandResult,
     exact_production_root_parent_guard_script,
-    subprocess_runner,
+    _subprocess_runner,
 )
 from .publish_runtime import RuntimePublishConfig
 from .recovery_bundle import RecoveryVerification, verify_recovery_bundle
-from .failure_domain import attest_failure_domain
+from .failure_domain_authority import require_failure_domain_authority
+from .failure_domain import rebuild_legacy_attestation_diagnostic
 from .vm_boundary import (
     PRODUCTION_WRITE_AREAS,
     declared_production_vm_write_set,
@@ -407,7 +408,7 @@ class OpenSSHColdRestore:
         self,
         config: RuntimePublishConfig,
         *,
-        command_runner: Callable[[Sequence[str]], CommandResult] = subprocess_runner,
+        command_runner: Callable[[Sequence[str]], CommandResult] = _subprocess_runner,
         bundle_verifier: Callable[[Path], RecoveryVerification] = verify_recovery_bundle,
     ) -> None:
         if config.vm.target_address != "10.5.1.240":
@@ -690,6 +691,7 @@ class OpenSSHColdRestore:
         This keeps the bundle as the only large file inventory authority.
         """
 
+        require_failure_domain_authority()
         if expected_legacy_deployment_id != _LEGACY_V39_DEPLOYMENT_ID:
             raise ColdRestoreCLIError(
                 "qualification reset is fixed to the exact legacy V39 deployment"
@@ -787,7 +789,7 @@ class OpenSSHColdRestore:
                 "qualification reset requires the exact legacy V39 bundle"
             )
         try:
-            rebuilt = attest_failure_domain(
+            rebuilt = rebuild_legacy_attestation_diagnostic(
                 production_facts=attestation["production"],
                 recovery_facts=attestation["recovery"],
                 independence_probe=attestation["independence_probe"],
@@ -800,6 +802,8 @@ class OpenSSHColdRestore:
             raise ColdRestoreCLIError(
                 "qualification failure-domain attestation is invalid"
             ) from error
+        if rebuilt.authority or rebuilt.status != "DIAGNOSTIC_ONLY":
+            raise ColdRestoreCLIError("legacy attestation diagnostic marker differs")
         expected_attestation_fields = {
             "schema_version", "observed_at", "production_host_facts_sha256",
             "recovery_host_facts_sha256", "production", "recovery",
@@ -2323,6 +2327,7 @@ class OpenSSHColdRestore:
         expected_legacy_deployment_id: str,
         qualification_reset_materialized: bool = False,
     ) -> Mapping[str, object]:
+        require_failure_domain_authority()
         if qualification_reset_materialized:
             return self._inspect_qualification_reset(
                 bundle_root,
@@ -2388,6 +2393,7 @@ class OpenSSHColdRestore:
         expected_legacy_deployment_id: str,
         qualification_reset_materialized: bool = False,
     ) -> Mapping[str, object]:
+        require_failure_domain_authority()
         if qualification_reset_materialized:
             return self._apply_qualification_reset(
                 bundle_root,
@@ -2501,6 +2507,7 @@ class OpenSSHColdRestore:
     def restore(
         self, bundle_root: Path, *, evidence_output: Path
     ) -> Mapping[str, object]:
+        require_failure_domain_authority()
         bundle, report, restore_name, python_identity, tool_identity = (
             self._verified_bundle(bundle_root)
         )
@@ -2678,6 +2685,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+    require_failure_domain_authority()
     config = RuntimePublishConfig.load(args.config, expected_project_root=args.project_root)
     operator = OpenSSHColdRestore(config)
     if args.command == "restore":

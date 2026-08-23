@@ -161,6 +161,13 @@ class FakeScheduler:
 
 class StateOnlyFixture(unittest.TestCase):
     def setUp(self) -> None:
+        for target in (
+            "quant_hub.ops.state_only_backup.require_failure_domain_authority",
+            "quant_hub.ops.publish_runtime.require_failure_domain_authority",
+        ):
+            authority = patch(target, return_value=None)
+            authority.start()
+            self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         token_patch = patch(
@@ -1388,6 +1395,10 @@ class VMStagingCleanupTests(unittest.TestCase):
                 publish_recovery_cli,
                 "verify_existing_vm_write_path",
                 side_effect=lambda path, **_: path,
+            ), patch.object(
+                publish_recovery_cli,
+                "require_failure_domain_authority",
+                return_value=None,
             ):
                 result = publish_recovery_cli.cleanup_capture(
                     vm_root=root, checkpoint_id="checkpoint-target"

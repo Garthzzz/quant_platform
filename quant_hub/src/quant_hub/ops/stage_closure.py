@@ -21,10 +21,10 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 from quant_hub.config import ensure_no_reparse_components
 
+from .failure_domain_authority import require_failure_domain_authority
 from .failure_domain import (
     FailureDomainError,
-    verify_host_facts,
-    verify_independence_probe,
+    rebuild_legacy_attestation_diagnostic,
 )
 from .release_identity import (
     canonical_manifest_bytes,
@@ -425,6 +425,7 @@ def _verify_repository_observation(value: object) -> Mapping[str, object]:
 
 
 def _verify_failure_domain_attestation(value: object) -> Mapping[str, object]:
+    require_failure_domain_authority()
     document = _mapping(
         value,
         {
@@ -434,32 +435,25 @@ def _verify_failure_domain_attestation(value: object) -> Mapping[str, object]:
         },
         label="failure-domain attestation",
     )
-    if (
-        document["schema_version"] != "qrh-recovery-failure-domain-attestation/v1"
-        or document["verdict"] != "independent_failure_domain"
-    ):
-        raise StageClosureError("failure-domain attestation verdict differs")
     try:
-        production = verify_host_facts(document["production"], expected_role="production")
-        recovery = verify_host_facts(document["recovery"], expected_role="recovery")
-        verify_independence_probe(document["independence_probe"])
+        rebuilt = rebuild_legacy_attestation_diagnostic(
+            production_facts=document["production"],
+            recovery_facts=document["recovery"],
+            independence_probe=document["independence_probe"],
+            observed_at=str(document["observed_at"]),
+        )
     except (FailureDomainError, TypeError) as error:
-        raise StageClosureError("failure-domain attestation facts failed") from error
-    if (
-        production["facts_sha256"] != document["production_host_facts_sha256"]
-        or recovery["facts_sha256"] != document["recovery_host_facts_sha256"]
-        or production["machine_identity"] == recovery["machine_identity"]
-        or production["storage_authority"] == recovery["storage_authority"]
-        or recovery["reparse_or_symlink"] is not False
-        or recovery["path_kind"] != "local"
-    ):
-        raise StageClosureError("failure-domain attestation is not independent")
+        raise StageClosureError("failure-domain diagnostic replay failed") from error
+    if rebuilt.authority or rebuilt.status != "DIAGNOSTIC_ONLY":
+        raise StageClosureError("legacy attestation diagnostic marker differs")
+    if document != rebuilt.payload:
+        raise StageClosureError("legacy failure-domain diagnostic identity differs")
     _timestamp(document["observed_at"], label="failure-domain observed_at")
     return document
 
 
 def verify_failure_domain_attestation(value: object) -> Mapping[str, object]:
-    """Public categorical verifier shared by Scheduler and Stage 5."""
+    """Reject legacy v1 input; Stage 5 requires integrated v2 authority."""
 
     return _verify_failure_domain_attestation(value)
 
@@ -614,6 +608,7 @@ def _stage_certificate_material(
     runbook_evidence: Sequence[Mapping[str, object]], issued_at: str,
     resolver: EvidenceArtifactResolver,
 ) -> dict[str, object]:
+    require_failure_domain_authority()
     refs = _mapping(artifact_refs, set(_STAGE_ARTIFACT_KINDS), label="Stage 5 artifact refs")
     repo_ref, repo = _json_artifact(refs["repository_observation"], expected_kind="repository_observation", resolver=resolver, verifier=_verify_repository_observation)
     release_ref, release_manifest = _json_artifact(refs["release_manifest"], expected_kind="release_manifest", resolver=resolver, verifier=validate_release_manifest)
@@ -800,6 +795,7 @@ def build_stage5_release_certificate(
     gate_evidence: Sequence[Mapping[str, object]], runbook_evidence: Sequence[Mapping[str, object]],
     resolver: EvidenceArtifactResolver,
 ) -> Mapping[str, object]:
+    require_failure_domain_authority()
     value = _stage_certificate_material(
         artifact_refs=artifact_refs, gate_evidence=gate_evidence,
         runbook_evidence=runbook_evidence, issued_at=issued_at, resolver=resolver,
@@ -812,6 +808,7 @@ def build_stage5_release_certificate(
 def verify_stage5_release_certificate(
     value: object, *, resolver: EvidenceArtifactResolver
 ) -> Mapping[str, object]:
+    require_failure_domain_authority()
     certificate = _mapping(
         value,
         {

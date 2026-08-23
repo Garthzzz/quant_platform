@@ -44,7 +44,7 @@ from quant_hub.config import ensure_no_reparse_components
 from quant_hub.runtime_seal import read_json, write_atomic_new_json
 from quant_hub.web.access_gate import ACCESS_PASSWORD_ITERATIONS, ACCESS_PASSWORD_SALT
 
-from .failure_domain import ATTESTATION_SCHEMA
+from .failure_domain_authority import require_failure_domain_authority
 from .release_identity import (
     canonical_manifest_bytes,
     manifest_sha256,
@@ -176,6 +176,7 @@ class WindowsHandoffRuntime:
     """
 
     def __init__(self, root: Path):
+        require_failure_domain_authority()
         self.root = _root(root, allow_test_root=False)
         runtime_tmp = (self.root / "tmp").resolve(strict=True)
         ensure_no_reparse_components(runtime_tmp)
@@ -339,6 +340,7 @@ class WindowsHandoffRuntime:
         return tuple(sorted(matches))
 
     def observe(self, port: int) -> RuntimeObservation:
+        require_failure_domain_authority()
         listeners = self._listener_pids(port)
         deployment = self._deployment()
         legacy_deployment: Mapping[str, object] | None = None
@@ -355,6 +357,7 @@ class WindowsHandoffRuntime:
         )
 
     def stop_legacy(self, expected: LegacyProcess) -> None:
+        require_failure_domain_authority()
         observed = self._process(expected.pid)
         if observed != expected or self._listener_pids(PORT) != (expected.pid,):
             raise WriterHandoffError("legacy process changed before termination")
@@ -371,6 +374,7 @@ class WindowsHandoffRuntime:
         self._stopped_legacy = expected
 
     def wait_port_free(self, port: int) -> bool:
+        require_failure_domain_authority()
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             if not self._listener_pids(port):
@@ -391,6 +395,7 @@ class WindowsHandoffRuntime:
             raise WriterHandoffError(f"fixed D service {action} failed")
 
     def start_d_service(self, service_name: str) -> None:
+        require_failure_domain_authority()
         self._service_action("start", service_name)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -403,12 +408,14 @@ class WindowsHandoffRuntime:
         raise WriterHandoffError("D service did not open its listener in time")
 
     def stop_d_service(self, service_name: str) -> None:
+        require_failure_domain_authority()
         if self._service().get("status") != "stopped":
             self._service_action("stop", service_name)
         if not self.wait_port_free(PORT):
             raise WriterHandoffError("D listener remained open after service stop")
 
     def d_external_open(self, port: int) -> bool:
+        require_failure_domain_authority()
         # Any listener after the D start attempt is exposure.  Ambiguity is
         # intentionally resolved toward forbidding legacy rollback.
         if self._listener_pids(port):
@@ -416,6 +423,7 @@ class WindowsHandoffRuntime:
         return self._d_was_open
 
     def probe_d(self, baseline: V39Baseline) -> Mapping[str, object]:
+        require_failure_domain_authority()
         deadline = time.monotonic() + 45
         deployment: Mapping[str, object] | None = None
         while time.monotonic() < deadline:
@@ -471,6 +479,7 @@ class WindowsHandoffRuntime:
         }
 
     def start_legacy(self, expected: LegacyProcess) -> None:
+        require_failure_domain_authority()
         executable = Path(expected.executable).resolve(strict=True)
         server = Path(str(LEGACY_SERVER)).resolve(strict=True)
         if (
@@ -500,6 +509,7 @@ class WindowsHandoffRuntime:
     def verify_legacy_restored(
         self, expected: LegacyProcess, deployment_id: str, port: int
     ) -> bool:
+        require_failure_domain_authority()
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             deployment = self._deployment()
@@ -644,6 +654,7 @@ def _session_key_ready(root: Path) -> bool:
 def _find_recovery_evidence(
     root: Path, baseline: V39Baseline
 ) -> Mapping[str, object]:
+    require_failure_domain_authority()
     materializations: list[tuple[str, str]] = []
     for path in (root / "audit" / "events").glob("cold-materialization-*.json"):
         # The shipped empty-D restorer writes this event from PowerShell.  Its
@@ -731,14 +742,15 @@ def _find_recovery_evidence(
         "recovery_protection_receipt_sha256": protection[1],
         "recovery_manifest_sha256": recovery[2],
         "checkpoint_manifest_sha256": recovery[3],
-        "failure_domain_attestation_schema": ATTESTATION_SCHEMA,
-        "failure_domain_accepted": True,
+        "failure_domain_attestation_schema": "unavailable-v2",
+        "failure_domain_accepted": False,
     }
 
 
 def inspect_d_closure(root: Path, baseline: V39Baseline) -> Mapping[str, object]:
     """Mechanically validate the read-only D active/control/state closure."""
 
+    require_failure_domain_authority()
     active_path = _inside(root, "control/active_release.json")
     active = validate_active_release(read_json(active_path))
     release_path = (root / "releases" / baseline.release_id).resolve(strict=True)
@@ -954,6 +966,8 @@ def seed_v39_access_identity(
     executing legacy code.
     """
 
+    require_failure_domain_authority()
+
     root = _root(vm_root, allow_test_root=allow_test_root)
     if override_detector():
         raise WriterHandoffError(
@@ -1135,6 +1149,7 @@ def inspect_writer_handoff(
 ) -> Mapping[str, object]:
     """Return, but do not persist, one immutable read-only inspection receipt."""
 
+    require_failure_domain_authority()
     if _NONCE_RE.fullmatch(nonce) is None:
         raise WriterHandoffError("inspection nonce must be 24 random bytes")
     root = _root(vm_root, allow_test_root=allow_test_root)
@@ -1724,6 +1739,7 @@ def apply_writer_handoff(
 ) -> HandoffApplyResult:
     """Consume one inspection receipt and perform the one-time writer cutover."""
 
+    require_failure_domain_authority()
     root = _root(vm_root, allow_test_root=allow_test_root)
     receipt = validate_inspection_receipt(inspection_receipt)
     actual_hash = manifest_sha256(receipt)
@@ -2005,6 +2021,7 @@ def finalize_writer_handoff(
     and returns the same immutable receipt.
     """
 
+    require_failure_domain_authority()
     root = _root(vm_root, allow_test_root=allow_test_root)
     attempt_id = _identifier(attempt_id, label="handoff attempt ID")
     if _NONCE_RE.fullmatch(nonce) is None:
@@ -2186,6 +2203,7 @@ def inspect_writer_handoff_status(
     journal, probe a service, or infer an attempt ID from timestamps.
     """
 
+    require_failure_domain_authority()
     root = _root(vm_root, allow_test_root=allow_test_root)
     inspection_hash = _sha(inspection_sha256, label="inspection receipt")
     if _NONCE_RE.fullmatch(nonce) is None:
@@ -2345,6 +2363,7 @@ def main(argv: list[str] | None = None) -> int:
     seed_parser.add_argument("--release-manifest-sha256", required=True)
     args = parser.parse_args(argv)
     try:
+        require_failure_domain_authority()
         root = _root(args.vm_root, allow_test_root=False)
         baseline = V39Baseline(args.release_manifest_sha256)
         if args.command == "inspect":

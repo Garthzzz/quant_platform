@@ -70,9 +70,10 @@ from .publish_adapters import (
     VMDeploymentAdapter,
     ssh_target_guard_script,
     verified_d_tooling_python_script,
-    subprocess_runner as remote_subprocess_runner,
+    _subprocess_runner as _remote_subprocess_runner,
 )
-from .failure_domain import attest_failure_domain
+from .failure_domain_authority import require_failure_domain_authority
+from .failure_domain import rebuild_legacy_attestation_diagnostic
 from .recovery_bundle import build_recovery_bundle, verify_recovery_bundle
 from .release_builder import seal_knowledge_release
 from .release_identity import manifest_sha256, validate_release_manifest
@@ -324,7 +325,7 @@ class ProcessResult:
 ProcessRunner = Callable[[Sequence[str], Path], ProcessResult]
 
 
-def production_process_runner(arguments: Sequence[str], cwd: Path) -> ProcessResult:
+def _production_process_runner(arguments: Sequence[str], cwd: Path) -> ProcessResult:
     completed = subprocess.run(
         list(arguments), cwd=cwd, shell=False, check=False, capture_output=True,
         text=True, encoding="utf-8", errors="replace",
@@ -403,7 +404,7 @@ class OpenSSHRecoveryActions:
         self,
         runtime: RuntimePublishConfig,
         *,
-        command_runner: Callable[[Sequence[str]], CommandResult] = remote_subprocess_runner,
+        command_runner: Callable[[Sequence[str]], CommandResult] = _remote_subprocess_runner,
         vm_backend: OpenSSHVMBackend | None = None,
         deployment_invoker: OpenSSHDeploymentInvoker | None = None,
     ) -> None:
@@ -453,6 +454,7 @@ class OpenSSHRecoveryActions:
         return value
 
     def capture_checkpoint(self, *, material: ReleaseMaterial) -> Path:
+        require_failure_domain_authority()
         checkpoint_id = f"checkpoint-{material.release_manifest_sha256[:20]}-{uuid4().hex[:12]}"
         return self.capture_state_only_checkpoint(
             release_id=material.release_id,
@@ -461,6 +463,7 @@ class OpenSSHRecoveryActions:
         )
 
     def read_active_identity(self) -> Mapping[str, str]:
+        require_failure_domain_authority()
         value = self._remote(
             (
                 "-B", "-m", "quant_hub.ops.publish_recovery_cli",
@@ -489,6 +492,7 @@ class OpenSSHRecoveryActions:
         release_manifest_sha256: str,
         checkpoint_id: str,
     ) -> Path:
+        require_failure_domain_authority()
         if (
             _NAME.fullmatch(release_id) is None
             or _NAME.fullmatch(checkpoint_id) is None
@@ -538,6 +542,7 @@ class OpenSSHRecoveryActions:
         return destination
 
     def cleanup_state_only_capture(self, *, checkpoint_id: str) -> None:
+        require_failure_domain_authority()
         if _NAME.fullmatch(checkpoint_id) is None:
             raise PublishRuntimeError("state-only cleanup checkpoint identity is invalid")
         value = self._remote(
@@ -562,6 +567,7 @@ class OpenSSHRecoveryActions:
         recovery_manifest_sha256: str,
         checkpoint_root: Path,
     ) -> ActivationAuthorization:
+        require_failure_domain_authority()
         attempt_id = f"deploy-{publish_candidate_sha256[:24]}"
         finalized = self.deployment_invoker.invoke(
             vm_root=self.runtime.vm.root,
@@ -658,6 +664,7 @@ class RecoveryProtectionCoordinator:
         self.now = now
 
     def _attestation(self) -> Mapping[str, object]:
+        require_failure_domain_authority()
         try:
             value = json.loads(self.config.attestation_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -673,7 +680,7 @@ class RecoveryProtectionCoordinator:
             raise PublishRuntimeError("failure-domain attestation schema is not closed")
         claimed = value.get("attestation_sha256")
         try:
-            rebuilt = attest_failure_domain(
+            rebuilt = rebuild_legacy_attestation_diagnostic(
                 production_facts=value["production"],
                 recovery_facts=value["recovery"],
                 independence_probe=value["independence_probe"],
@@ -681,6 +688,8 @@ class RecoveryProtectionCoordinator:
             )
         except (KeyError, TypeError, ValueError) as error:
             raise PublishRuntimeError("failure-domain attestation cannot be verified") from error
+        if rebuilt.authority or rebuilt.status != "DIAGNOSTIC_ONLY":
+            raise PublishRuntimeError("legacy attestation diagnostic marker differs")
         if claimed != rebuilt.sha256 or any(
             value.get(key) != rebuilt.payload.get(key) for key in rebuilt.payload
         ):
@@ -708,6 +717,7 @@ class RecoveryProtectionCoordinator:
         first real empty-D materialisation event exists.  It must never be used
         to register a recovery-protection receipt.
         """
+        require_failure_domain_authority()
         root = self.config.recovery_root.resolve(strict=True)
         ensure_no_reparse_components(root)
         if not root.is_dir():
@@ -722,6 +732,7 @@ class RecoveryProtectionCoordinator:
             raise PublishRuntimeError("operational bootstrap root is unavailable")
 
     def preflight(self) -> None:
+        require_failure_domain_authority()
         self.preflight_materials()
         self._attestation()
 
@@ -731,6 +742,7 @@ class RecoveryProtectionCoordinator:
         material: ReleaseMaterial,
         publish_candidate_sha256: str,
     ) -> ActivationAuthorization:
+        require_failure_domain_authority()
         self.preflight()
         checkpoint_root = self.actions.capture_checkpoint(material=material).resolve(strict=True)
         checkpoint = verify_sqlite_checkpoint(checkpoint_root)
@@ -960,6 +972,7 @@ class ProductionSourceFreezer:
         return existing_manifest, existing_tree
 
     def __call__(self, snapshot: GitSnapshot) -> FrozenSources:
+        require_failure_domain_authority()
         candidate_parent = self.config.candidate_root.resolve()
         candidate_parent.mkdir(parents=True, exist_ok=True)
         ensure_no_reparse_components(candidate_parent)
@@ -1271,6 +1284,7 @@ class ExactGitPush:
         self.runner = runner
 
     def __call__(self, commit_sha: str) -> PushResult:
+        require_failure_domain_authority()
         push = self.runner(
             (
                 "git", "push", "--porcelain", self.config.git_remote,
@@ -1292,7 +1306,7 @@ class ExactGitPush:
 
 @dataclass(frozen=True)
 class RuntimeDependencies:
-    process_runner: ProcessRunner = production_process_runner
+    process_runner: ProcessRunner = _production_process_runner
     secret_provider: SecretProvider | None = None
     http_get: Callable | None = None
     vm_backend: object | None = None
@@ -1309,6 +1323,7 @@ class ProductionPublishRuntime:
         *,
         dependencies: RuntimeDependencies | None = None,
     ) -> None:
+        require_failure_domain_authority()
         deps = dependencies or RuntimeDependencies()
         secret_provider = deps.secret_provider or EnvironmentSecretProvider()
         freezer = ProductionSourceFreezer(config, process_runner=deps.process_runner)
@@ -1319,7 +1334,7 @@ class ProductionPublishRuntime:
         if deps.http_get is not None:
             github_arguments["http_get"] = deps.http_get
         ci = GitHubExactSHACI(config.github, **github_arguments)
-        remote_runner = deps.remote_command_runner or remote_subprocess_runner
+        remote_runner = deps.remote_command_runner or _remote_subprocess_runner
         vm_backend = deps.vm_backend or OpenSSHVMBackend(
             config.vm, command_runner=remote_runner
         )
@@ -1377,6 +1392,7 @@ class ProductionPublishRuntime:
         self.coordinator = PublishCoordinator(PublishQueue(config.state_root), self.pipeline)
 
     def publish(self, *, commit_sha: str, candidate_only: bool = False) -> Mapping[str, object]:
+        require_failure_domain_authority()
         target = self.config.github.credential_target
         if target is not None and not isinstance(self.secret_provider(target), SecretValue):
             raise PublishRuntimeError("protected GitHub credential is unavailable")

@@ -46,7 +46,114 @@ qrh-cold-bundle `
 
 Operational bootstrap 至少覆盖受哈希保护的 `tooling/python`、固定 service entry/host/access gate、`deployment_runtime.json` 与 `service_install_candidate.json`。Bundle 禁止包含 access digest、viewer password、API key、SSH/GitHub 凭据或 Authorization header；这些受保护材料在恢复后另行注入。
 
+## Failure-domain attestation 新鲜度刷新
+
+> 当前生产就绪状态固定为 `FAKE_ONLY/NOT_READY`。仓库尚无同时绑定 exact committed
+> Git/CI/wheel identity、SSH host authentication 与 production stdout capture 的 integrated
+> runner。已安装产品包不包含 `current`、`history/archive`、`intent` 或 `completion` 的写入、
+> 原子替换、CAS、锁或中断恢复 core；测试代码也不能从产品包导入这些能力。
+
+`issue-challenge`、`capture-recovery-facts`、`capture-independence-probe`、`observe`、
+`rotate-prepare --mode prepare`、`rotate-apply` 和正式 `verify-current` 都会在任何文件访问或
+写入前返回结构化 `NOT_READY`，进程退出码为 `2`，且 `authority=false`。这些兼容命令名不是
+可用的 producer 或轮换入口。旧 schema 的 closed JSON、时间、hash 与 lineage 校验仅供只读
+故障诊断；即使使用当前 module hash 手工构造一条完全自洽的 legacy lineage，也只能得到
+`DIAGNOSTIC_ONLY`，不能得到 `PASS` 或 refresh authority。
+
+`rotate-prepare --mode inspect` 只读取既有 legacy synthetic observation 及其完整 lineage，输出
+`DIAGNOSTIC_ONLY`，不创建 `intent-output`。`diagnose-legacy-current` 只读检查现存 attestation，
+同样不授予 authority。不得用旧 facts 改时间重签，不得手工覆盖 `current`，也不得把诊断结果
+用于 VM 写入、恢复、candidate、服务切换或 writer handoff。
+
+产品中唯一正式入口是 `quant_hub.ops.failure_domain_authority.require_failure_domain_authority`。
+当前入口无参数、无文件系统能力且固定抛出 `FAILURE_DOMAIN_AUTHORITY_NOT_READY`；不存在产品 fallback。
+publish、cold bundle、publish recovery、cold restore/qualification reset、Stage 5、state-only、
+Scheduler 与 writer handoff 均在读取 failure-domain 证据或产生写入前经过该入口。legacy v1
+facts/probe/attestation 只可作 `DIAGNOSTIC_ONLY`、`authority=false` 的历史解析材料；即使新鲜、
+自洽也不能生成 protection、qualification、handoff、Scheduler 或 Stage 5 authority。
+
+安装 wheel 后的 `qrh-publish` 与 `qrh-writer-handoff-client` 在参数解析完成后、读取 config/path、
+执行 Git、证据或远端操作前调用该入口；`publish_recovery_cli` 的 capture、capture-legacy、
+identify-active、cleanup-capture、register 也在各 public API 及 CLI 分支入口拒绝。三者统一输出
+`FailureDomainAuthorityNotReady.document()` 的 closed JSON（`status=NOT_READY`、
+`authority=false`、固定 `error_code`）并以退出码 `2` 结束，不回显调用方路径或配置正文。
+
+Round7 把同一边界下沉到公开 Python API，而不把通用只读诊断误封：`PublishQueue` 构造只保存
+lexical 路径，不创建 state/audit；队列写、publish pipeline/coordinator、production runtime 构造与
+publish、source freeze、recovery protection、五个 `OpenSSHRecoveryActions` 方法、incremental
+upload/deploy/invoker、writer client 构造/工厂/方法，以及 `WindowsHandoffRuntime` 构造和公开 OS
+方法，均以唯一 gate 作为首条有效语句。当前 `NOT_READY` 下，config/path/tree/subprocess/SSH/OS/
+service boundary 调用数必须为零，且临时树不得变化。
+
+`inspect_local_git`、`dry_run_plan` 和现有 remote inventory 属于 `DIAGNOSTIC_ONLY`；exact-SHA
+GitHub CI 与固定本地测试/public guard 属于 `QUALIFICATION_INPUT`。它们不能产生或携带
+failure-domain/protection/release authority。Git 调用固定使用 `--no-optional-locks`；remote
+inventory 已移除隐式 `New-Item`，只允许读取已存在目录。fresh installed-wheel 测试维护一份 closed
+surface inventory；新增导出 class/public method/factory/helper 未分类即失败，并逐项验证 gated
+surface 的首条有效语句。该清单只覆盖 formal release/recovery/handoff 域，不扩张到研究、数据库或
+MCP 通用模块。
+
+Round8 不再使用 `__all__` 缩小上述清单：source 与 fresh installed-wheel 都枚举六个正式模块中所有
+不以下划线开头的顶层 function、class、本模块定义的 callable type alias，以及 class 的公开
+method、classmethod、staticmethod、property 与 `__call__`；内部正式 factory 由单独闭集列明。
+`__all__` 只校验文档导出名称存在、无重复且与 callable inventory 一致。各分类数量与总量从实际
+inventory 机械计算，分类交集、未分类和已分类但不存在项必须同时为空，不能写死一个预期总数。
+`GitHubCIConfig`、`VMConfig`、transport/deployment protocol、固定拒绝的 unavailable recovery
+adapter 和 `ExactGitPush` 均已明确分类；`ExactGitPush.__call__` 的唯一 gate 必须是首条有效语句，
+fresh-wheel 动态验证 process 调用数为零。实际边界 runner 仅以 `_urllib_http_get`、
+`_subprocess_runner`、`_production_process_runner` 私有名存在，旧公共名不可导入；这不改变
+diagnostic/qualification 输入的既有只读行为。
+
+未来 integrated runner 必须以独立产品模块引入，不得把旧写 core 恢复到当前诊断模块。新实现
+必须同时具备新 schema 和进程内、不可序列化的 capability 对象；capability 只能由完成 exact
+Git/CI/wheel 校验及 SSH host authentication 的 runner 创建，JSON、路径、环境变量和调用者参数
+均不得构造或恢复该对象。该威胁模型不声称防御能修改代码与证据文件的同一 OS 管理员，也不为此
+引入 secret、MAC 或 Keyring。
+
+Round6 changed-file source manifest 使用确定性算法：repo-relative path 必须为 NFC、UTF-8、正斜杠
+形式；按 UTF-8 bytes 排序，对每项依次追加 `path + NUL + lowercase_sha256hex + NUL`，最后计算
+整体 SHA-256。以下只读命令可复算，输出仍标记 `DIAGNOSTIC_ONLY`：
+
+```powershell
+qrh-failure-domain source-manifest --repo-root D:\quant\quant_platform `
+  --path docs/runbooks/COLD_RECOVERY.md `
+  --path openspec/changes/design-vm-knowledge-mcp/specs/vm-atomic-deployment/spec.md `
+  --path openspec/changes/design-vm-knowledge-mcp/tasks.md `
+  --path quant_hub/pyproject.toml `
+  --path quant_hub/src/quant_hub/ops/cold_bundle_cli.py `
+  --path quant_hub/src/quant_hub/ops/cold_restore_cli.py `
+  --path quant_hub/src/quant_hub/ops/failure_domain.py `
+  --path quant_hub/src/quant_hub/ops/failure_domain_authority.py `
+  --path quant_hub/src/quant_hub/ops/failure_domain_rotation.py `
+  --path quant_hub/src/quant_hub/ops/operational_source_cli.py `
+  --path quant_hub/src/quant_hub/ops/production_host_facts_cli.py `
+  --path quant_hub/src/quant_hub/ops/publish.py `
+  --path quant_hub/src/quant_hub/ops/publish_adapters.py `
+  --path quant_hub/src/quant_hub/ops/publish_recovery_cli.py `
+  --path quant_hub/src/quant_hub/ops/publish_runtime.py `
+  --path quant_hub/src/quant_hub/ops/stage_closure.py `
+  --path quant_hub/src/quant_hub/ops/state_only_backup.py `
+  --path quant_hub/src/quant_hub/ops/writer_handoff.py `
+  --path quant_hub/src/quant_hub/ops/writer_handoff_client.py `
+  --path quant_hub/tests/test_cold_bundle_cli.py `
+  --path quant_hub/tests/test_cold_restore_cli.py `
+  --path quant_hub/tests/test_failure_domain_rotation.py `
+  --path quant_hub/tests/test_publish_adapters.py `
+  --path quant_hub/tests/test_publish_cli.py `
+  --path quant_hub/tests/test_publish_runtime.py `
+  --path quant_hub/tests/test_stage_closure.py `
+  --path quant_hub/tests/test_state_only_backup.py `
+  --path quant_hub/tests/test_writer_handoff.py `
+  --path quant_hub/tests/test_writer_handoff_client.py `
+  --path tools/release/failure_domain_cli.py
+```
+
 ## 空 D 传输与物化
+
+**当前不可执行：**以下命令保留为 integrated authenticated runner v2 完成后的目标操作协议，
+当前 wheel 会在读取 config、bundle、attestation 或连接 VM 前固定返回/抛出
+`FAILURE_DOMAIN_AUTHORITY_NOT_READY`。不得通过调用 legacy v1 helper、修改测试 patch 或手工重签来
+绕过。只有 v2 authority 经独立审核放行后，才可恢复本节的真实 qualification/restore 操作。
 
 不依赖 SMB/UNC，也不手工复制广播包。确认 `.240` exact D 根真实存在、无 reparse 且为空后，运行：
 

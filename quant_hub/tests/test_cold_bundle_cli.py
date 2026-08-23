@@ -57,6 +57,15 @@ def _release_manifest() -> dict[str, object]:
 
 class ColdBundleBuilderTests(unittest.TestCase):
     def setUp(self) -> None:
+        for target in (
+            "quant_hub.ops.cold_bundle_cli.require_failure_domain_authority",
+            "quant_hub.ops.cold_restore_cli.require_failure_domain_authority",
+            "quant_hub.ops.publish_recovery_cli.require_failure_domain_authority",
+            "quant_hub.ops.publish_runtime.require_failure_domain_authority",
+        ):
+            authority = patch(target, return_value=None)
+            authority.start()
+            self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

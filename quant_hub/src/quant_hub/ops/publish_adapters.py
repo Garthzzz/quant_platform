@@ -22,6 +22,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from quant_hub.config import ensure_no_reparse_components
 
+from .failure_domain_authority import require_failure_domain_authority
 from .publish import (
     CIResult,
     PublishError,
@@ -197,7 +198,7 @@ class HTTPResponse:
 HTTPGet = Callable[[str, Mapping[str, str], float], HTTPResponse]
 
 
-def urllib_http_get(url: str, headers: Mapping[str, str], timeout: float) -> HTTPResponse:
+def _urllib_http_get(url: str, headers: Mapping[str, str], timeout: float) -> HTTPResponse:
     """最小 GitHub GET adapter；异常不回显 URL/header/body。"""
 
     class NoRedirect(HTTPRedirectHandler):
@@ -227,7 +228,7 @@ class GitHubExactSHACI:
         config: GitHubCIConfig,
         *,
         secret_provider: SecretProvider,
-        http_get: HTTPGet = urllib_http_get,
+        http_get: HTTPGet = _urllib_http_get,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ):
@@ -380,6 +381,7 @@ class IncrementalVMTransport:
         )
 
     def __call__(self, candidate: Mapping[str, object]) -> TransferResult:
+        require_failure_domain_authority()
         release_id, release_hash, candidate_hash = self._candidate(candidate)
         material = self.material_resolver(release_id, release_hash)
         if material.release_id != release_id or material.release_manifest_sha256 != release_hash:
@@ -462,7 +464,7 @@ class CommandResult:
 CommandRunner = Callable[[Sequence[str]], CommandResult]
 
 
-def subprocess_runner(arguments: Sequence[str]) -> CommandResult:
+def _subprocess_runner(arguments: Sequence[str]) -> CommandResult:
     """不使用 shell；失败不回显可能含敏感信息的 stdout/stderr。"""
 
     completed = subprocess.run(
@@ -685,7 +687,7 @@ def bootstrap_verified_d_tooling_python_script(
 class OpenSSHVMBackend:
     """使用 Windows OpenSSH/PowerShell 的实际 backend；命令均为 argv，不经 shell。"""
 
-    def __init__(self, config: VMConfig, *, command_runner: CommandRunner = subprocess_runner):
+    def __init__(self, config: VMConfig, *, command_runner: CommandRunner = _subprocess_runner):
         self.config = config
         self.command_runner = command_runner
 
@@ -726,16 +728,25 @@ class OpenSSHVMBackend:
         )
 
     def ensure_directory(self, path: PureWindowsPath) -> None:
+        require_failure_domain_authority()
         approved = validate_production_vm_write_path(path, allow_root=False)
         self._ssh(self._ensure_directory_script(approved))
 
     def inventory(self, path: PureWindowsPath) -> Mapping[str, ReleaseFile]:
+        """Read-only remote inventory; it never creates the target directory."""
+
         approved = validate_production_vm_write_path(path, allow_root=False)
         script = (
-            self._ensure_directory_script(approved)
-            +
-            f"$r={_ps_literal(str(approved))};"
-            "$root=(Resolve-Path -LiteralPath $r).Path;"
+            "$ErrorActionPreference='Stop';"
+            + exact_production_root_parent_guard_script()
+            + f"$r={_ps_literal(str(approved))};"
+            "$targetFull=[IO.Path]::GetFullPath($r);"
+            "if(-not $targetFull.StartsWith($rootFull+'\\',[StringComparison]::OrdinalIgnoreCase))"
+            "{throw 'target_escaped_exact_root'};"
+            "$target=Get-Item -LiteralPath $targetFull -Force -ErrorAction Stop;"
+            "if(-not $target.PSIsContainer){throw 'non_directory'};"
+            "if(($target.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0){throw 'reparse'};"
+            "$root=$target.FullName;"
             "$bad=@(Get-ChildItem -LiteralPath $root -Directory -Recurse -Force|Where-Object{"
             "($_.Attributes-band[IO.FileAttributes]::ReparsePoint)-ne 0});"
             "if($bad.Count-ne 0){throw 'reparse'};"
@@ -768,6 +779,7 @@ class OpenSSHVMBackend:
         return inventory
 
     def upload(self, local_path: Path, remote_path: PureWindowsPath) -> None:
+        require_failure_domain_authority()
         approved = validate_production_vm_write_path(remote_path, allow_root=False)
         self.ensure_directory(approved.parent)
         expected_bytes = local_path.stat().st_size
@@ -855,6 +867,7 @@ class VMDeploymentAdapter:
         self.activation_authorization_resolver = activation_authorization_resolver
 
     def __call__(self, candidate: Mapping[str, object]) -> VMDeployResult:
+        require_failure_domain_authority()
         release_id, release_hash, candidate_hash = IncrementalVMTransport._candidate(candidate)
         deployment_mode = candidate.get("deployment_mode")
         if deployment_mode not in {"activate", "candidate_only"}:
@@ -921,7 +934,7 @@ class VMDeploymentAdapter:
 class OpenSSHDeploymentInvoker:
     """实际远端调用固定 ``quant_hub.ops.vm_deploy_cli``；不接受任意命令。"""
 
-    def __init__(self, config: VMConfig, *, command_runner: CommandRunner = subprocess_runner):
+    def __init__(self, config: VMConfig, *, command_runner: CommandRunner = _subprocess_runner):
         self.config = config
         self.command_runner = command_runner
 
@@ -936,6 +949,7 @@ class OpenSSHDeploymentInvoker:
         deployment_attempt_id: str | None,
         recovery_protection_receipt_id: str | None,
     ) -> Mapping[str, object]:
+        require_failure_domain_authority()
         root = validate_production_vm_write_path(vm_root, allow_root=True)
         if deployment_mode not in {"activate", "candidate_only"}:
             raise PublishAdapterError("deployment_mode is invalid")
@@ -1011,5 +1025,4 @@ __all__ = [
     "exact_production_root_parent_guard_script",
     "ssh_target_guard_script",
     "verified_d_tooling_python_script",
-    "subprocess_runner",
 ]

@@ -22,6 +22,11 @@ import uuid
 
 from quant_hub.config import ensure_no_reparse_components
 
+from .failure_domain_authority import (
+    FailureDomainAuthorityNotReady,
+    require_failure_domain_authority,
+)
+
 
 PUBLISH_STATE_SCHEMA = "qrh-publish-state/v1"
 PUBLISH_EVENT_SCHEMA = "qrh-publish-audit-event/v1"
@@ -242,6 +247,7 @@ class PublishPipeline:
         return result
 
     def execute(self, request: PublishRequest) -> PublishResult:
+        require_failure_domain_authority()
         expected_sha = _full_sha(request.commit_sha, "request.commit_sha")
         deployment_mode = _deployment_mode(request.deployment_mode)
         snapshot = self._call("inspect_git", self.actions.inspect_git, expected_sha)
@@ -347,10 +353,18 @@ class PublishQueue:
     def __init__(self, state_root: Path):
         if not state_root.is_absolute():
             raise PublishError("publish state root must be absolute")
-        ensure_no_reparse_components(state_root)
-        state_root.mkdir(parents=True, exist_ok=True)
-        ensure_no_reparse_components(state_root)
-        self.root = state_root.resolve(strict=True)
+        # Construction is deliberately lexical and zero-mutation. Queue
+        # materialisation belongs to the gated orchestration methods below.
+        self.root = state_root
+        self.events = self.root / "audit"
+        self.state_path = self.root / "publish_state.json"
+        self.lock_path = self.root / "publish_state.lock"
+
+    def _materialize(self) -> None:
+        ensure_no_reparse_components(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        ensure_no_reparse_components(self.root)
+        self.root = self.root.resolve(strict=True)
         self.events = self.root / "audit"
         self.events.mkdir(exist_ok=True)
         self.state_path = self.root / "publish_state.json"
@@ -473,6 +487,8 @@ class PublishQueue:
     def submit(self, request: PublishRequest) -> str:
         """提交 request；返回 ``running`` 或 ``pending``，绝不取消 running。"""
 
+        require_failure_domain_authority()
+        self._materialize()
         with self._locked():
             state = self._load()
             requests = state["requests"]
@@ -511,6 +527,8 @@ class PublishQueue:
     def finish(self, request_id: str, result: PublishResult | Exception) -> str | None:
         """结束 running 并提升最新 pending；失败也不会丢弃新的 pending。"""
 
+        require_failure_domain_authority()
+        self._materialize()
         with self._locked():
             state = self._load()
             if state["running_request_id"] != request_id:
@@ -548,6 +566,8 @@ class PublishQueue:
             return str(pending) if pending is not None else None
 
     def request(self, request_id: str) -> Mapping[str, object]:
+        require_failure_domain_authority()
+        self._materialize()
         with self._locked():
             state = self._load()
             requests = state["requests"]
@@ -557,6 +577,8 @@ class PublishQueue:
             return json.loads(json.dumps(requests[request_id]))
 
     def running_request(self) -> PublishRequest | None:
+        require_failure_domain_authority()
+        self._materialize()
         with self._locked():
             state = self._load()
             request_id = state["running_request_id"]
@@ -577,6 +599,7 @@ class PublishCoordinator:
         self.pipeline = pipeline
 
     def submit_and_drain(self, request: PublishRequest) -> Mapping[str, object]:
+        require_failure_domain_authority()
         disposition = self.queue.submit(request)
         if disposition == "pending":
             return self.queue.request(request.request_id)
@@ -602,7 +625,7 @@ def inspect_local_git(project_root: Path, expected_sha: str) -> GitSnapshot:
 
     def git(*args: str) -> str:
         completed = subprocess.run(
-            ["git", *args], cwd=root, check=False, capture_output=True,
+            ["git", "--no-optional-locks", *args], cwd=root, check=False, capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
         if completed.returncode:
@@ -634,7 +657,7 @@ def dry_run_plan(
     root = project_root.resolve(strict=True)
     if expected_sha is None:
         completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=root, check=False,
+            ["git", "--no-optional-locks", "rev-parse", "HEAD"], cwd=root, check=False,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         if completed.returncode:
@@ -675,6 +698,11 @@ def main(argv: list[str] | None = None) -> int:
         help="显式无生产切换候选演练；默认 publish 必须完成 activation",
     )
     args = parser.parse_args(argv)
+    try:
+        require_failure_domain_authority()
+    except FailureDomainAuthorityNotReady as error:
+        print(json.dumps(error.document(), ensure_ascii=False, sort_keys=True))
+        return 2
     if args.dry_run:
         result = dry_run_plan(
             args.project_root,

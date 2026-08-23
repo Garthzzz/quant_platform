@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from quant_hub.ops.cold_restore_cli import (
     ColdRestoreCLIError,
@@ -516,6 +517,12 @@ class InterruptedTransferRunner:
 
 class ColdRestorePrepareEmptyTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.cold_restore_cli.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -876,6 +883,12 @@ class ColdRestorePrepareEmptyTests(unittest.TestCase):
 
 class ColdRestoreMaterializedQualificationResetTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.cold_restore_cli.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()

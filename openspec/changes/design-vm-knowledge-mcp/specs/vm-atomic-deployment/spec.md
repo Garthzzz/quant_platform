@@ -78,6 +78,42 @@
 - **WHEN** 发布系统准备接受最终 `RECOVERY_ROOT`
 - **THEN** 它 SHALL 先记录 production/recovery host identity、storage authority、volume/backend、UNC/reparse 解析和工具版本，拒绝同机/同 storage 根；并在唯一生产 VM 的真实空 D 物化成功后，将 off-host bundle 的闭包验证、empty-root 事件与同一 root/host/storage 身份机械绑定成最终 failure-domain attestation
 
+#### Scenario: Failure-domain attestation 超过 TTL
+- **WHEN** current attestation 超龄但生产/recovery authority 与 retained bundle 仍需继续使用
+- **THEN** 当前系统 SHALL 返回 `FAKE_ONLY/NOT_READY`，不得改时间重签、重新封装旧 facts/probe 或产生新的正式 authority；只有未来独立 integrated runner 以新 schema 和不可序列化 capability 重新采集并绑定 exact Git/CI/wheel、SSH host authentication、production/recovery facts 与 off-host probe 后，才可设计正式刷新路径
+
+#### Scenario: 未就绪实现收到 prepare、apply 或 producer 命令
+- **WHEN** 调用 `issue/capture/observe`、`rotate-prepare --mode prepare`、`rotate-apply` 或正式 `verify-current`
+- **THEN** 已安装产品包 SHALL 在任何文件访问或写入前返回结构化 `NOT_READY`、退出码 `2` 与 `authority=false`；包内 SHALL 不存在可导入的 current/archive/completion writer、CAS、锁、原子替换或中断恢复 core，test-only 代码也不得从产品包导入这些能力
+
+#### Scenario: 对 legacy synthetic lineage 执行 inspect
+- **WHEN** `rotate-prepare --mode inspect` 读取 closed、canonical、hash/TTL/path 完整的历史 synthetic challenge/capture/observation lineage
+- **THEN** 系统 SHALL 只返回 `DIAGNOSTIC_ONLY` 与 `authority=false`，不得创建 intent、archive、completion 或修改 current；即使 producer hash 等于当前 module bytes，也不得提升为正式 authority
+
+#### Scenario: 新鲜 current 缺少 committed completion lineage
+- **WHEN** current bytes 本身 canonical、未超 TTL，且调用者提供任意 legacy completion lineage
+- **THEN** 在 integrated runner 不存在期间正式 `verify-current` SHALL 无条件拒绝；legacy current 仅可进入单独只读 diagnostic API，不得被 qualification/publish 当作正式刷新 authority
+
+#### Scenario: 尚无 integrated production capture runner
+- **WHEN** 当前实现尚不能同时机械绑定 exact committed Git/CI/wheel code identity、SSH host authentication 与 production stdout capture
+- **THEN** 正式 rotation SHALL 标记为 `FAKE_ONLY/NOT_READY`；未来实现 SHALL 位于独立 module，采用新 schema，并要求只有 integrated runner 可创建的进程内、不可序列化 capability，JSON、路径、环境变量或普通调用参数均不得构造或恢复该 capability。威胁模型 SHALL 明确不声称防御可修改代码与证据文件的同一 OS 管理员，且不得为此引入 secret、MAC 或 Keyring
+
+#### Scenario: legacy v1 被正式产品 consumer 使用
+- **WHEN** publish、cold bundle、publish recovery、cold restore/qualification reset、Stage 5、state-only、Scheduler 或 writer handoff 收到新鲜且自洽的 legacy v1 facts/probe/attestation/receipt
+- **THEN** 所有 consumer SHALL 先调用唯一 `failure_domain_authority` v2 入口，并在任何 failure-domain 证据读取或写入前固定拒绝为 `FAILURE_DOMAIN_AUTHORITY_NOT_READY`、`authority=false`；不得直接调用 `attest_failure_domain`、旧 categorical verifier 或从旧 protection receipt 推导 `failure_domain_accepted=true`。旧 v1 纯函数及 source manifest 只可返回 `DIAGNOSTIC_ONLY`，不得成为产品 fallback
+
+#### Scenario: 正式发布、writer client 与 recovery CLI 缺少 v2 authority
+- **WHEN** 安装 wheel 后调用 `qrh-publish`（含 dry-run）、`qrh-writer-handoff-client` 的 run/status/finalize，或 `publish_recovery_cli` 的 capture/capture-legacy/identify-active/cleanup-capture/register，且 v2 authority 仍为 NOT_READY
+- **THEN** 各入口 SHALL 在参数解析后、读取 config/path/evidence、执行 Git/SSH/remote 或建立 VM 写入快照前，通过同一 `FailureDomainAuthorityNotReady.document()` 输出 closed JSON：`status=NOT_READY`、`authority=false`、固定 `error_code`，退出码为 2；输出不得包含调用方路径正文。每个 publish recovery public API 自身也 SHALL 以 authority gate 作为首条有效语句，不能只依赖上游 CLI
+
+#### Scenario: 公开 Python 能力绕开 CLI 直接调用
+- **WHEN** 调用 formal release/recovery/handoff 域中任何会授予 protection/release/handoff 资格，或会创建/删除文件目录、写 Git、执行远端/OS/service 动作的导出 class、public method、factory 或 helper
+- **THEN** 该 callable SHALL 以唯一 failure-domain gate 作为首条有效语句；`ProductionPublishRuntime`、writer client 与 Windows runtime 的构造也 SHALL 在读取 config/path 或建立能力对象前拒绝，`PublishQueue` 构造 SHALL 保持零写入并只在 gated 方法内物化。`ExactGitPush.__call__` SHALL 在 process runner 前以唯一 gate 固定拒绝。source 与 fresh installed-wheel 的 closed API inventory SHALL 不受 `__all__` 过滤，枚举所有非私有顶层 function/class、本模块 callable alias、class 公开 descriptor/method/`__call__` 及明确的内部正式 factory；`__all__` 只作导出文档一致性附加断言。分类计数 SHALL 从 inventory 机械产生，分类交集、漏项与幽灵项均为零；boundary spies SHALL 证明 NOT_READY 下 config/path/tree/subprocess/HTTP/remote/OS 调用为零
+
+#### Scenario: 通用只读诊断作为 integrated runner 前置输入
+- **WHEN** 调用 `inspect_local_git`、`dry_run_plan`、existing-directory remote inventory、exact-SHA GitHub CI 或固定本地 test/public guard
+- **THEN** 系统 SHALL 将其分类为 `DIAGNOSTIC_ONLY` 或 `QUALIFICATION_INPUT`，不得产生或携带 failure-domain/protection/release authority；Git 检查 SHALL 禁止 optional lock 并保持 repository tree byte identity，remote inventory SHALL 不创建目录或执行 move/delete，测试产生的临时内容 SHALL 自动清理。不得仅因只读 Git/HTTP/SSH subprocess 的存在而误用 failure-domain gate，从而形成 integrated runner 的前置闭环
+
 #### Scenario: 首个 qualification bundle 与最终 attestation 存在依赖顺序
 - **WHEN** V39 首次恢复尚没有 empty-D materialization event
 - **THEN** 系统 SHALL 允许在已验证不同 host/storage、无 reparse 的开发机候选根生成 no-secret qualification bundle，但 SHALL NOT 将它称为 recovery-protected 或生成 protection receipt；只有该 bundle 完成真实空 D 物化且最终 attestation 通过后才可进入生产门禁

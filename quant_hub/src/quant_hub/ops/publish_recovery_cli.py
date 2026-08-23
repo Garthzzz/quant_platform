@@ -22,7 +22,10 @@ from quant_hub.collaboration.checkpoint import create_sqlite_checkpoint
 from quant_hub.runtime_seal import read_json
 
 from .deployment import DeploymentController
-from .failure_domain import attest_failure_domain
+from .failure_domain_authority import (
+    FailureDomainAuthorityNotReady,
+    require_failure_domain_authority,
+)
 from .release_identity import (
     canonical_manifest_bytes,
     manifest_sha256,
@@ -63,6 +66,7 @@ def _child(value: Path) -> Path:
 
 
 def capture(*, vm_root: Path, checkpoint_id: str, state_authority_id: str):
+    require_failure_domain_authority()
     root = _root(vm_root)
     controller = DeploymentController(root)
     active, _release = controller.read_active()
@@ -97,6 +101,7 @@ def capture(*, vm_root: Path, checkpoint_id: str, state_authority_id: str):
 def identify_active(*, vm_root: Path):
     """Return only the unique active pointer and its resolved immutable R."""
 
+    require_failure_domain_authority()
     root = _root(vm_root)
     active, release = DeploymentController(root).read_active()
     observed_hash = manifest_sha256(release)
@@ -117,6 +122,7 @@ def cleanup_capture(*, vm_root: Path, checkpoint_id: str):
     retained recovery authority.
     """
 
+    require_failure_domain_authority()
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", checkpoint_id) is None:
         raise PublishRecoveryCLIError("checkpoint_id is invalid")
     root = _root(vm_root)
@@ -160,6 +166,7 @@ def capture_legacy(
     SQLite scratch bytes remain below the exact production D root.
     """
 
+    require_failure_domain_authority()
     root = _root(vm_root)
     active_pointer = _child(root / "control" / "active_release.json")
     d_state = tuple(
@@ -205,6 +212,7 @@ def register(
     recovery_manifest_path: Path,
     protection_evidence_path: Path,
 ):
+    require_failure_domain_authority()
     root = _root(vm_root)
     for path in (
         checkpoint_manifest_path,
@@ -225,17 +233,6 @@ def register(
         raise PublishRecoveryCLIError("protection evidence schema is not closed")
     if evidence["schema_version"] != "qrh-publish-recovery-protection-evidence/v1":
         raise PublishRecoveryCLIError("protection evidence schema is unsupported")
-    attestation = evidence["failure_domain_attestation"]
-    if not isinstance(attestation, dict):
-        raise PublishRecoveryCLIError("failure-domain attestation is missing")
-    rebuilt = attest_failure_domain(
-        production_facts=attestation["production"],
-        recovery_facts=attestation["recovery"],
-        independence_probe=attestation["independence_probe"],
-        observed_at=str(attestation["observed_at"]),
-    )
-    if attestation.get("attestation_sha256") != rebuilt.sha256:
-        raise PublishRecoveryCLIError("failure-domain attestation hash differs")
     candidate_path, observed_release_hash = DeploymentController(root).verify_finalized_release(
         release_id=release_id,
         expected_manifest_sha256=release_manifest_sha256,
@@ -331,17 +328,24 @@ def main(argv: list[str] | None = None) -> int:
     cleanup_parser.add_argument("--vm-root", type=Path, required=True)
     cleanup_parser.add_argument("--checkpoint-id", required=True)
     args = parser.parse_args(argv)
+    try:
+        require_failure_domain_authority()
+    except FailureDomainAuthorityNotReady as error:
+        print(json.dumps(error.document(), ensure_ascii=False, sort_keys=True))
+        return 2
     root = _root(args.vm_root)
     before = capture_vm_write_snapshot(root)
     operation = f"publish-recovery-{args.command}"
     try:
         if args.command == "capture":
+            require_failure_domain_authority()
             value = capture(
                 vm_root=root,
                 checkpoint_id=args.checkpoint_id,
                 state_authority_id=args.state_authority_id,
             )
         elif args.command == "capture-legacy":
+            require_failure_domain_authority()
             value = capture_legacy(
                 vm_root=root,
                 checkpoint_id=args.checkpoint_id,
@@ -350,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
                 release_manifest_sha256=args.release_manifest_sha256,
             )
         elif args.command == "register":
+            require_failure_domain_authority()
             value = register(
                 vm_root=root,
                 release_id=args.release_id,
@@ -361,8 +366,10 @@ def main(argv: list[str] | None = None) -> int:
                 protection_evidence_path=args.protection_evidence,
             )
         elif args.command == "identify-active":
+            require_failure_domain_authority()
             value = identify_active(vm_root=root)
         else:
+            require_failure_domain_authority()
             value = cleanup_capture(
                 vm_root=root,
                 checkpoint_id=args.checkpoint_id,

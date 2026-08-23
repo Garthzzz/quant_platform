@@ -27,7 +27,7 @@ from .publish_adapters import (
     bootstrap_verified_d_tooling_python_script,
     exact_production_root_parent_guard_script,
     ssh_target_guard_script,
-    subprocess_runner,
+    _subprocess_runner,
 )
 from .publish_runtime import RuntimePublishConfig
 from .recovery_bundle import (
@@ -470,7 +470,7 @@ class OperationalSourceOrchestrator:
         self,
         config: RuntimePublishConfig,
         *,
-        command_runner: Callable[[Sequence[str]], CommandResult] = subprocess_runner,
+        command_runner: Callable[[Sequence[str]], CommandResult] = _subprocess_runner,
         backend: OpenSSHVMBackend | None = None,
     ) -> None:
         self.config = config

@@ -386,6 +386,12 @@ class FakeBoundary:
 
 class WriterHandoffClientTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.writer_handoff_client.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.project = root / "project"
@@ -540,6 +546,12 @@ class WriterHandoffClientTests(unittest.TestCase):
 
 class AccessIdentitySeedTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.writer_handoff.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "D-root"
         self.root.mkdir()
@@ -681,6 +693,12 @@ class AccessIdentitySeedTests(unittest.TestCase):
 
 class WriterHandoffStatusTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.writer_handoff.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "D-root"
         self.root.mkdir()
@@ -779,6 +797,9 @@ class WriterHandoffClientCLIContractTests(unittest.TestCase):
         with patch(
             "quant_hub.ops.writer_handoff_client._client_from_runtime_config",
             return_value=client,
+        ), patch(
+            "quant_hub.ops.writer_handoff_client.require_failure_domain_authority",
+            return_value=None,
         ), redirect_stdout(output):
             code = writer_handoff_client_main(
                 [

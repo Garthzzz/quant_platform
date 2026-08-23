@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from quant_hub.ops.publish import (
     CIResult,
@@ -27,6 +30,7 @@ from quant_hub.ops.publish import (
     dry_run_plan,
     main,
 )
+from quant_hub.ops.failure_domain_authority import failure_domain_authority_status
 
 
 SHA_A = "1" * 40
@@ -101,6 +105,14 @@ class FakeActions:
 
 
 class PublishPipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.publish.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
+
     def test_happy_path_is_fixed_order_and_pushes_exactly_once(self) -> None:
         fake = FakeActions()
         result = PublishPipeline(fake.bundle()).execute(
@@ -217,6 +229,12 @@ class PublishPipelineTests(unittest.TestCase):
 
 class PublishQueueTests(unittest.TestCase):
     def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.publish.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
 
@@ -297,10 +315,11 @@ class PublishDryRunTests(unittest.TestCase):
             self.assertEqual(str(repository), plan["project_root"])
             self.assertEqual(7, len(plan["steps"]))
 
-    def test_standalone_cli_requires_protected_config_for_non_dry_run(self) -> None:
-        with self.assertRaises(SystemExit) as caught:
-            main(["--project-root", str(Path.cwd())])
-        self.assertEqual(2, caught.exception.code)
+    def test_standalone_cli_rejects_before_missing_config_is_consulted(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(2, main(["--project-root", str(Path.cwd())]))
+        self.assertEqual(failure_domain_authority_status(), json.loads(output.getvalue()))
 
 
 if __name__ == "__main__":

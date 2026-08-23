@@ -1,4 +1,9 @@
-"""Collect production failure-domain facts from the verified exact-D runtime."""
+"""Collect a local diagnostic facts file from the verified exact-D runtime.
+
+This command is not a failure-domain rotation producer and has no stdout capture
+mode.  A future authenticated integrated runner must use a separate module, new
+schema, and non-serializable capability before its observations can be formal.
+"""
 
 from __future__ import annotations
 
@@ -64,7 +69,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "status": "PASS",
+                "status": "DIAGNOSTIC_ONLY",
+                "authority": False,
                 "role": "production",
                 "facts_sha256": facts["facts_sha256"],
             },

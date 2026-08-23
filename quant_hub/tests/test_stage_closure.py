@@ -60,6 +60,13 @@ def task_xml(candidate: dict[str, object]) -> bytes:
 
 class StageClosureTests(unittest.TestCase):
     def setUp(self) -> None:
+        for target in (
+            "quant_hub.ops.stage_closure.require_failure_domain_authority",
+            "quant_hub.ops.state_only_backup.require_failure_domain_authority",
+        ):
+            authority = patch(target, return_value=None)
+            authority.start()
+            self.addCleanup(authority.stop)
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         token_patch = patch(
             "quant_hub.ops.state_only_backup._current_token_sid_sha256",

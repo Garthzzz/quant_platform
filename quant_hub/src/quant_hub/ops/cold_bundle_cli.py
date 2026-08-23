@@ -23,7 +23,7 @@ from .publish_adapters import (
     CommandResult,
     exact_production_root_parent_guard_script,
     verified_d_tooling_python_script,
-    subprocess_runner,
+    _subprocess_runner,
 )
 from .publish_runtime import (
     PublishRuntimeError,
@@ -31,6 +31,7 @@ from .publish_runtime import (
     RuntimePublishConfig,
     UnavailableRecoveryActions,
 )
+from .failure_domain_authority import require_failure_domain_authority
 from .recovery_bundle import RecoveryBundle, build_recovery_bundle, verify_recovery_bundle
 from .release_identity import (
     canonical_manifest_bytes,
@@ -60,7 +61,7 @@ class ColdBundleBuilder:
         self,
         config: RuntimePublishConfig,
         *,
-        command_runner: Callable[[Sequence[str]], CommandResult] = subprocess_runner,
+        command_runner: Callable[[Sequence[str]], CommandResult] = _subprocess_runner,
         preflight: Callable[[], None] | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -228,6 +229,7 @@ class ColdBundleBuilder:
             raise ColdBundleCLIError("VM checkpoint cleanup identity differs")
 
     def build(self, *, release_root: Path, bundle_id: str, state_source: str) -> ColdBundleBuildResult:
+        require_failure_domain_authority()
         if state_source not in {"legacy_c", "d_active"}:
             raise ColdBundleCLIError("state source must be legacy_c or d_active")
         if state_source == "legacy_c":
@@ -315,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bundle-id", required=True)
     parser.add_argument("--state-source", choices=("legacy_c", "d_active"), required=True)
     args = parser.parse_args(argv)
+    require_failure_domain_authority()
     config = RuntimePublishConfig.load(
         args.config, expected_project_root=args.project_root
     )

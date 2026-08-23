@@ -7,6 +7,7 @@ from pathlib import Path, PureWindowsPath
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from quant_hub.ops.publish_adapters import (
     ActivationAuthorization,
@@ -33,6 +34,18 @@ from quant_hub.ops.windows_service import quant_hub_package_inventory_sha256
 COMMIT = "1" * 40
 CANDIDATE_HASH = "2" * 64
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class AuthorityPatchedTestCase(unittest.TestCase):
+    """Historical downstream behavior below the closed product gate."""
+
+    def setUp(self) -> None:
+        authority = patch(
+            "quant_hub.ops.publish_adapters.require_failure_domain_authority",
+            return_value=None,
+        )
+        authority.start()
+        self.addCleanup(authority.stop)
 
 
 def config_value() -> dict[str, object]:
@@ -191,8 +204,9 @@ class MemoryVMBackend:
         self.contents[relative] = data
 
 
-class IncrementalTransportTests(unittest.TestCase):
+class IncrementalTransportTests(AuthorityPatchedTestCase):
     def setUp(self) -> None:
+        super().setUp()
         self.temporary = tempfile.TemporaryDirectory()
         self.source = Path(self.temporary.name).resolve()
         (self.source / "app").mkdir()
@@ -319,7 +333,7 @@ class FakeInvoker:
         }
 
 
-class VMDeploymentAdapterTests(unittest.TestCase):
+class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
     def test_powershell_inventory_matches_python_and_dependency_tamper_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / "quant_hub"
@@ -508,7 +522,7 @@ class VMDeploymentAdapterTests(unittest.TestCase):
         self.assertEqual(0, parsed.returncode, parsed.stderr)
 
 
-class OpenSSHVMBackendTests(unittest.TestCase):
+class OpenSSHVMBackendTests(AuthorityPatchedTestCase):
     @staticmethod
     def _script(call) -> str:
         return base64.b64decode(call[-1]).decode("utf-16le")

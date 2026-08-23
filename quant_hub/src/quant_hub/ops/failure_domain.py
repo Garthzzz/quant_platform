@@ -1,9 +1,9 @@
-"""Machine-verifiable recovery failure-domain facts and attestation.
+"""Legacy v1 failure-domain facts and diagnostic attestation reconstruction.
 
-The production and recovery probes run on their respective hosts.  The
-attestation accepts only a different host identity and storage authority, a
-non-reparse recovery root, and an independence probe that can verify retained
-bytes without consulting the production root.
+These pure functions preserve historical parsing and diagnostic replay.  They
+do not grant protection, qualification, Stage 5, Scheduler, publish, restore,
+or writer-handoff authority.  Formal consumers use ``failure_domain_authority``
+exclusively and currently fail closed until authenticated runner v2 exists.
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ class FailureDomainError(RuntimeError):
 class FailureDomainAttestation:
     payload: dict[str, object]
     sha256: str
+    status: str = "DIAGNOSTIC_ONLY"
+    authority: bool = False
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -146,6 +148,22 @@ def collect_host_facts(root: Path, *, role: str, tool_version: str) -> dict[str,
 
 
 def verify_host_facts(value: Mapping[str, object], *, expected_role: str) -> dict[str, object]:
+    required = {
+        "schema_version",
+        "role",
+        "host_name",
+        "machine_identity",
+        "canonical_path",
+        "path_kind",
+        "reparse_or_symlink",
+        "volume_identity",
+        "storage_backend",
+        "storage_authority",
+        "tool_version",
+        "facts_sha256",
+    }
+    if set(value) != required:
+        raise FailureDomainError("host facts shape is invalid")
     facts = dict(value)
     claimed = facts.pop("facts_sha256", None)
     if facts.get("schema_version") != FACTS_SCHEMA or facts.get("role") != expected_role:
@@ -162,6 +180,14 @@ def verify_host_facts(value: Mapping[str, object], *, expected_role: str) -> dic
     )
     if any(not isinstance(facts.get(field), str) or not facts[field] for field in required_text):
         raise FailureDomainError("host facts contain an empty identity field")
+    bounded_identity = (
+        "host_name", "machine_identity", "path_kind", "volume_identity",
+        "storage_backend", "storage_authority", "tool_version",
+    )
+    if any(len(str(facts[field])) > 1024 for field in bounded_identity):
+        raise FailureDomainError("host facts contain an overlong identity field")
+    if len(str(facts["canonical_path"])) > 32767:
+        raise FailureDomainError("host facts canonical path is overlong")
     if not isinstance(facts.get("reparse_or_symlink"), bool):
         raise FailureDomainError("host facts reparse flag is invalid")
     actual = hashlib.sha256(canonical_bytes(facts)).hexdigest()
@@ -315,6 +341,7 @@ def attest_failure_domain(
     independence_probe: Mapping[str, object],
     observed_at: str,
 ) -> FailureDomainAttestation:
+    """Rebuild a historical v1 document for diagnostic comparison only."""
     production = verify_host_facts(production_facts, expected_role="production")
     recovery = verify_host_facts(recovery_facts, expected_role="recovery")
     probe = verify_independence_probe(independence_probe)
@@ -344,6 +371,27 @@ def attest_failure_domain(
     )
 
 
+def rebuild_legacy_attestation_diagnostic(
+    *,
+    production_facts: Mapping[str, object],
+    recovery_facts: Mapping[str, object],
+    independence_probe: Mapping[str, object],
+    observed_at: str,
+) -> FailureDomainAttestation:
+    """Explicit compatibility wrapper for post-gate diagnostic unit tests.
+
+    The result carries ``status=DIAGNOSTIC_ONLY`` and ``authority=False``.  No
+    formal consumer may call this before the v2 authority gate.
+    """
+
+    return attest_failure_domain(
+        production_facts=production_facts,
+        recovery_facts=recovery_facts,
+        independence_probe=independence_probe,
+        observed_at=observed_at,
+    )
+
+
 __all__ = [
     "ATTESTATION_SCHEMA",
     "FACTS_SCHEMA",
@@ -354,6 +402,7 @@ __all__ = [
     "build_independence_probe",
     "canonical_bytes",
     "collect_host_facts",
+    "rebuild_legacy_attestation_diagnostic",
     "verify_host_facts",
     "verify_independence_probe",
 ]

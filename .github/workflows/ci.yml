@@ -60,6 +60,7 @@ jobs:
             "tests.test_stage_closure",
             "tests.test_failure_domain",
             "tests.test_failure_domain_cli",
+            "tests.test_failure_domain_rotation",
             "tests.test_production_host_facts_cli",
             "tests.test_vm_boundary",
             "tests.test_vm_bootstrap_cli",
@@ -248,6 +249,12 @@ jobs:
           if ($entries -notcontains "quant_hub/ops/stage_closure.py") {
             throw "wheel is missing the Stage 5/6 closure verifier"
           }
+          if ($entries -notcontains "quant_hub/ops/failure_domain_authority.py") {
+            throw "wheel is missing the failure-domain authority gate"
+          }
+          if ($entries -notcontains "quant_hub/ops/failure_domain_rotation.py") {
+            throw "wheel is missing the failure-domain rotation diagnostics"
+          }
           if ($entries -notcontains "quant_hub/ops/writer_handoff.py") {
             throw "wheel is missing the fixed C-to-D writer handoff"
           }
@@ -282,6 +289,9 @@ jobs:
           }
           if (($entryPoints -join "`n") -notmatch "qrh-production-host-facts = quant_hub\.ops\.production_host_facts_cli:main") {
             throw "wheel is missing the qrh-production-host-facts entrypoint"
+          }
+          if (($entryPoints -join "`n") -notmatch "qrh-failure-domain = quant_hub\.ops\.failure_domain_rotation:main") {
+            throw "wheel is missing the qrh-failure-domain entrypoint"
           }
           if (($entryPoints -join "`n") -notmatch "qrh-state-only-backup = quant_hub\.ops\.state_only_backup:main") {
             throw "wheel is missing the qrh-state-only-backup entrypoint"
