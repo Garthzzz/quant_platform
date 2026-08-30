@@ -100,10 +100,14 @@ class ArchiveCatalog:
             "archive": initialize_archive_database(self.settings),
         }
         # D-05 Python backfill is an explicit initialization/migration action,
-        # never a side effect of a homepage or history GET.
-        from quant_hub.collaboration.service import ArchiveCollaboration
+        # never a side effect of a homepage or history GET.  A sealed release
+        # is opened with immutable SQLite connections, so production viewer
+        # bootstrap must consume the already-published projection without
+        # attempting this writer-only historical repair.
+        if not self.settings.read_only_runtime:
+            from quant_hub.collaboration.service import ArchiveCollaboration
 
-        ArchiveCollaboration(self.settings).backfill_research_updates()
+            ArchiveCollaboration(self.settings).backfill_research_updates()
         return applied
 
     def _source_record(self, source_location_id: str) -> tuple[str, str]:

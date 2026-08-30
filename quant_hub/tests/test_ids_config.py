@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
+from quant_hub.archive.catalog import ArchiveCatalog
+from quant_hub.collaboration.service import ArchiveCollaboration
 from quant_hub.config import ConfigurationError, Settings
 from quant_hub.ids import new_public_id, object_id_for_sha256, stable_sha256, validate_public_id
 from tests.helpers import SettingsTestCase
@@ -105,6 +109,32 @@ class IdTests(SettingsTestCase):
         )
         self.assertFalse(settings.evidence_replay_root.exists())
         self.assertFalse(settings.paper_lab_asset_root.exists())
+
+    def test_read_only_catalog_initialization_skips_writer_only_backfill(self) -> None:
+        settings = replace(self.settings, read_only_runtime=True)
+        with mock.patch(
+            "quant_hub.archive.catalog.initialize_platform", return_value=[]
+        ), mock.patch(
+            "quant_hub.archive.catalog.initialize_archive_database", return_value=[]
+        ), mock.patch.object(
+            ArchiveCollaboration, "backfill_research_updates"
+        ) as backfill:
+            applied = ArchiveCatalog(settings).initialize()
+
+        self.assertEqual({"platform": [], "archive": []}, applied)
+        backfill.assert_not_called()
+
+    def test_writable_catalog_initialization_keeps_writer_backfill(self) -> None:
+        with mock.patch(
+            "quant_hub.archive.catalog.initialize_platform", return_value=[]
+        ), mock.patch(
+            "quant_hub.archive.catalog.initialize_archive_database", return_value=[]
+        ), mock.patch.object(
+            ArchiveCollaboration, "backfill_research_updates"
+        ) as backfill:
+            ArchiveCatalog(self.settings).initialize()
+
+        backfill.assert_called_once_with()
 
     def test_default_can_bind_an_explicit_frozen_migration_root(self) -> None:
         runtime = self.project / "quant_hub" / "frozen-runtime"

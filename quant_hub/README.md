@@ -2,6 +2,10 @@
 
 这里是统一量化研究平台的正式可写实现区。正式系统包含 Archive 研究主体、独立 Research Evidence 论文证据库，以及迁移后的外部论文精读与架构设计系统 Paper Lab。`spikes/` 只保留技术实测；正式代码位于 `src/quant_hub/`。
 
+研究员需要新增研究、抓取论文、运行 Paper Lab、调用 Web/API 或 MCP，以及定位全部数据库和数据文件时，统一从独立章节
+[`研究员数据抓取、导入、检索与存储位置指南`](../docs/runbooks/RESEARCHER_DATA_GUIDE.md)
+开始；该指南把日常操作与仅限授权运维的发布、VM 和回退接口明确分开。
+
 ## 写入边界与运行布局
 
 - `reference/**` 是只读来源，程序只读取并登记原始字节，不在其中写 sidecar、元数据或渲染结果。
