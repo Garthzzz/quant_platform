@@ -102,6 +102,14 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
         source = inspect.getsource(inspect.getmodule(ProductionWindowsDeploymentRuntime))
         self.assertNotIn("os.environ", source)
         self.assertNotIn("getenv", source)
+
+    def test_product_factory_translates_absent_exact_d_to_domain_error(self) -> None:
+        with patch.object(Path, "resolve", side_effect=FileNotFoundError("absent")):
+            with self.assertRaisesRegex(
+                LocalDeploymentRuntimeError,
+                "exact Windows D root",
+            ):
+                ProductionWindowsDeploymentRuntime.load_exact_d()
         with self.assertRaises(LocalDeploymentRuntimeError):
             RuntimeAdapter.for_test_only(  # type: ignore[arg-type]
                 str(self.root)

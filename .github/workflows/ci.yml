@@ -28,6 +28,43 @@ jobs:
       - name: Verify public Git boundary
         shell: pwsh
         run: python -B tools/release/git_guard.py gate --scope tracked
+      - name: Run Windows portability preflight
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONUTF8: "1"
+        run: |
+          $workspace = (Resolve-Path -LiteralPath $env:GITHUB_WORKSPACE).Path
+          $testPackageRoot = Join-Path $workspace "quant_hub"
+          $sourceRoot = Join-Path $testPackageRoot "src"
+          $env:PYTHONPATH = [string]::Join(
+            [System.IO.Path]::PathSeparator,
+            @($workspace, $testPackageRoot, $sourceRoot)
+          )
+          $preflightTests = @(
+            "tests.test_local_deployment_runtime.LocalDeploymentRuntimeTests.test_product_factory_is_no_arg_fixed_d_and_test_type_is_separate",
+            "tests.test_vm_deploy_cli.VMDeployCLITests.test_default_production_activation_calls_only_exact_v4_controller",
+            "tests.test_windows_service.WindowsServiceTopologyTests.test_exact_runtime_launch_uses_identity_argv_and_fresh_pycache",
+            "tests.test_windows_service.WindowsServiceTopologyTests.test_production_candidate_layout_is_pinned_and_cleaned_before_popen",
+            "tests.test_windows_service.WindowsServiceTopologyTests.test_project_package_dependency_tamper_blocks_service_and_candidate_before_popen",
+            "tests.test_writer_handoff.WriterHandoffTests.test_production_state_replace_keeps_fresh_files_pinned_through_move",
+            "tests.test_writer_handoff.WriterHandoffTests.test_fresh_finalize_restores_both_d_databases_after_partial_replace_crash",
+            "tests.test_local_exact_runtime_server.ExactRuntimeServerTests.test_mutable_state_guard_allows_write_but_blocks_replacement",
+            "tests.test_local_exact_runtime_server.ExactRuntimeServerTests.test_runtime_state_checkpoint_allows_same_database_file_but_not_replacement",
+            "tests.test_local_exact_runtime_server.ExactRuntimeServerTests.test_runtime_state_checkpoint_detects_protected_content_drift"
+          )
+          $PSNativeCommandUseErrorActionPreference = $false
+          $failed = 0
+          foreach ($testId in $preflightTests) {
+            & python -B -m unittest $testId -v
+            if ($LASTEXITCODE -ne 0) {
+              $failed += 1
+            }
+          }
+          if ($failed -ne 0) {
+            Write-Output "::error title=Windows portability preflight::$failed isolated test process(es) failed"
+            exit 1
+          }
       - name: Run public-safe unit tests
         shell: pwsh
         env:

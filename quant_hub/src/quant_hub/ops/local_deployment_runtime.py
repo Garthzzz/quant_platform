@@ -1552,13 +1552,18 @@ class ProductionWindowsDeploymentRuntime:
     def load_exact_d(cls) -> "ProductionWindowsDeploymentRuntime":
         project = Path(PRODUCTION_VM_ROOT_TEXT)
         migration_root = project / "quant_hub" / "migrations" / "research_workspace"
-        core = _RuntimeCore(
-            root=project,
-            migration_root=migration_root,
-            test_only=False,
-            allow_posix_test_only=False,
-            _construction_token=_CONSTRUCTION_TOKEN,
-        )
+        try:
+            core = _RuntimeCore(
+                root=project,
+                migration_root=migration_root,
+                test_only=False,
+                allow_posix_test_only=False,
+                _construction_token=_CONSTRUCTION_TOKEN,
+            )
+        except (OSError, ValueError) as error:
+            raise LocalDeploymentRuntimeError(
+                "产品 runtime exact Windows D root 不可用"
+            ) from error
         return cls(core, _construction_token=_CONSTRUCTION_TOKEN)
 
     def compatibility_manifest(self, **kwargs: object) -> SqliteCompatibilityManifest:

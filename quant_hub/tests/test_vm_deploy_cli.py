@@ -316,6 +316,9 @@ class VMDeployCLITests(unittest.TestCase):
             "quant_hub.ops.local_exact_deployment_controller."
             "ProductionExactDeploymentController.load_exact_d",
             return_value=exact,
+        ), mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_existing_vm_write_path",
+            return_value=Path(r"D:\quant\quant_platform"),
         ), mock.patch.object(
             WindowsServiceRuntime, "load", return_value=runtime,
         ), mock.patch(
