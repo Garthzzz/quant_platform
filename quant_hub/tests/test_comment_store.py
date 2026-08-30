@@ -7,6 +7,7 @@ from contextlib import closing
 from unittest.mock import Mock, patch
 
 from quant_hub.app import create_app
+from quant_hub.collaboration import comment_store as comment_store_module
 from quant_hub.archive.catalog import ArchiveCatalog
 from quant_hub.archive.contracts import (
     ActorInput,
@@ -16,11 +17,11 @@ from quant_hub.archive.contracts import (
     ManualTopicUpdateInput,
 )
 from quant_hub.collaboration.comment_store import (
-    backup_comment_store,
     comment_store_state,
     initialize_comment_store,
 )
 from quant_hub.collaboration.service import ArchiveCollaboration
+from quant_hub.research_workspace import store as workspace_store_module
 from tests.helpers import SettingsTestCase
 
 
@@ -82,7 +83,13 @@ class DurableCommentStoreTests(SettingsTestCase):
             legacy_archive_path=self.settings.archive_database_path,
         )
 
-    def test_external_comment_store_is_reopenable_idempotent_and_backup_safe(self) -> None:
+    def test_cancelled_state_backup_public_apis_are_absent(self) -> None:
+        self.assertFalse(hasattr(comment_store_module, "backup_comment_store"))
+        self.assertFalse(
+            hasattr(workspace_store_module, "backup_research_workspace_store")
+        )
+
+    def test_external_comment_store_is_reopenable_and_idempotent(self) -> None:
         service = ArchiveCollaboration(
             self.settings,
             comment_database_path=self.database_path,
@@ -111,15 +118,6 @@ class DurableCommentStoreTests(SettingsTestCase):
         comments = reopened.list_comments(self.research_id)
         self.assertEqual(1, len(comments))
         self.assertEqual("冻结发布包替换后仍需保留。", comments[0]["content"])
-
-        backup = backup_comment_store(
-            self.database_path,
-            self.project / "persistent-data" / "backups",
-        )
-        self.assertIsInstance(backup, Path)
-        assert backup is not None
-        self.assertTrue(backup.is_file())
-        self.assertEqual(1, comment_store_state(backup)["active_comments"])
 
     def test_application_factory_initializes_an_external_comment_store(self) -> None:
         database_path = self.project / "app-data" / "comments.sqlite3"

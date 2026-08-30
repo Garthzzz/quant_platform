@@ -22,12 +22,6 @@ import uuid
 
 from quant_hub.config import ensure_no_reparse_components
 
-from .failure_domain_authority import (
-    FailureDomainAuthorityNotReady,
-    require_failure_domain_authority,
-)
-
-
 PUBLISH_STATE_SCHEMA = "qrh-publish-state/v1"
 PUBLISH_EVENT_SCHEMA = "qrh-publish-audit-event/v1"
 PUBLISH_CANDIDATE_SCHEMA = "qrh-publish-candidate/v1"
@@ -247,7 +241,6 @@ class PublishPipeline:
         return result
 
     def execute(self, request: PublishRequest) -> PublishResult:
-        require_failure_domain_authority()
         expected_sha = _full_sha(request.commit_sha, "request.commit_sha")
         deployment_mode = _deployment_mode(request.deployment_mode)
         snapshot = self._call("inspect_git", self.actions.inspect_git, expected_sha)
@@ -487,7 +480,6 @@ class PublishQueue:
     def submit(self, request: PublishRequest) -> str:
         """提交 request；返回 ``running`` 或 ``pending``，绝不取消 running。"""
 
-        require_failure_domain_authority()
         self._materialize()
         with self._locked():
             state = self._load()
@@ -527,7 +519,6 @@ class PublishQueue:
     def finish(self, request_id: str, result: PublishResult | Exception) -> str | None:
         """结束 running 并提升最新 pending；失败也不会丢弃新的 pending。"""
 
-        require_failure_domain_authority()
         self._materialize()
         with self._locked():
             state = self._load()
@@ -566,7 +557,6 @@ class PublishQueue:
             return str(pending) if pending is not None else None
 
     def request(self, request_id: str) -> Mapping[str, object]:
-        require_failure_domain_authority()
         self._materialize()
         with self._locked():
             state = self._load()
@@ -577,7 +567,6 @@ class PublishQueue:
             return json.loads(json.dumps(requests[request_id]))
 
     def running_request(self) -> PublishRequest | None:
-        require_failure_domain_authority()
         self._materialize()
         with self._locked():
             state = self._load()
@@ -599,7 +588,6 @@ class PublishCoordinator:
         self.pipeline = pipeline
 
     def submit_and_drain(self, request: PublishRequest) -> Mapping[str, object]:
-        require_failure_domain_authority()
         disposition = self.queue.submit(request)
         if disposition == "pending":
             return self.queue.request(request.request_id)
@@ -698,11 +686,6 @@ def main(argv: list[str] | None = None) -> int:
         help="显式无生产切换候选演练；默认 publish 必须完成 activation",
     )
     args = parser.parse_args(argv)
-    try:
-        require_failure_domain_authority()
-    except FailureDomainAuthorityNotReady as error:
-        print(json.dumps(error.document(), ensure_ascii=False, sort_keys=True))
-        return 2
     if args.dry_run:
         result = dry_run_plan(
             args.project_root,

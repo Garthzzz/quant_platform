@@ -8,7 +8,7 @@
 - `D:\quant\industry_demo/**` 只作参考，不是本程序的运行目录。
 - 所有可变状态必须位于项目内、`reference/**` 外的 `--var-root`。
 - `${var_root}/db/platform.sqlite3` 保存对象、来源、运行和 release authority；`${var_root}/db/archive.sqlite3` 保存 Archive 研究、release、Dashboard 与评论。两库物理隔离，但一次 release 消费会交叉核对身份。
-- `${var_root}/objects/` 保存内容寻址的不可变原始字节和派生对象。备份或恢复时必须把两库与对象区视为同一个一致性单元。
+- `${var_root}/objects/` 保存内容寻址的不可变原始字节和派生对象。两库与对象区共同构成一个一致性状态单元，不得拆分改写或独立切换。
 - `${var_root}/db/research_papers.sqlite3` 与 `${var_root}/db/paper_lab.sqlite3` 分别保存 Archive 论文证据和外部论文精读，两者不与 Archive 业务表混库。
 
 以下变量和 CLI 示例只用于开发、验证或构建新的候选，不是 active delivery 的正式启动命令。命令从 `D:\quant\quant_platform` 运行，要求 Python 3.13 及 `pyproject.toml` 中的依赖已经安装：
@@ -46,7 +46,7 @@ python -B -m quant_hub.cli init `
   --project-root $Project --archive-root $Archive --var-root $Var
 ```
 
-迁移目录同时保留相配的 `.up.sql` 与 `.down.sql`，但当前没有面向操作者的 migration-down CLI。生产回退应切换到一致性备份或新的 `var-root`，不要手工只回退其中一个 SQLite 文件。
+迁移目录同时保留相配的 `.up.sql` 与 `.down.sql`，但当前没有面向操作者的 migration-down CLI。生产普通回退只交换 exact active/prior 版本并继续使用同一当前 D state；不得切换 `var-root`、替换 SQLite、恢复历史事件或执行 migration-down。
 
 ## Paper Lab：论文投递、精读与架构设计
 
@@ -250,8 +250,8 @@ python -B .\quant_hub\tools\replay_archive_b.py `
 - scan、迁移和 command receipt 均可重复执行。先保留相同 `var-root` 和相同 idempotency key 重试；不要通过改 key 掩盖未知结果。
 - release 在证书验证或事务提交前失败时不会切换 active pointer；可能留下可复用的不可变对象或 staging 记录。修正证据后重放同一候选即可，不要清理 `reference/**`。
 - completion 的业务回退使用 `research revoke-completion`；release 的业务回切必须为历史候选重新签发 snapshot，不能直接改 active 表或复用旧 snapshot。
-- schema 事故或介质恢复应先停止 Web／写进程，再从同一时点恢复整个 `var-root`，或把一致性备份复制到一个新的项目内 `var-root` 后切换启动参数。不得只恢复 `archive.sqlite3` 或只恢复 `platform.sqlite3`。
-- 若现有运行状态不可判定，保留原目录作为审计证据，选择新的空 `var-root`，重新执行 `archive init`、`archive scan` 和经审核的发布／回放链；验证通过后再决定旧目录的归档，不做就地破坏性重建。
+- 生产 VM 只使用 exact D 根内的当前 state 和 active/prior 两个版本。普通发布回退只允许交换 active/prior，并沿用同一当前 state；若当前 state 或 D 根无法完整验证，必须 fail closed，不能用旧 SQLite、目录副本或重建流程冒充回退成功。
+- 新的空 `var-root` 只允许用于隔离开发／replay，绝不能成为生产 VM 的替代 state。生产状态不可判定时保留现场、停止写入并形成 blocker，不做就地破坏性重建。
 
 ## 只读与回归验证
 

@@ -3,16 +3,15 @@
   "root": "D:\\quant\\quant_platform",
   "areas": [
     "audit",
-    "backups",
     "checkout",
     "control",
     "incoming",
+    "locks",
     "logs",
     "releases",
     "state",
     "tmp",
-    "tooling",
-    "tools"
+    "tooling"
   ],
   "legacy_read_only_sources": [
     "C:\\quant_platform_data\\comments.sqlite3",

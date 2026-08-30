@@ -22,7 +22,6 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from quant_hub.config import ensure_no_reparse_components
 
-from .failure_domain_authority import require_failure_domain_authority
 from .publish import (
     CIResult,
     PublishError,
@@ -34,6 +33,7 @@ from .release_identity import (
     manifest_sha256,
     validate_release_manifest,
 )
+from . import local_release_identity as local_identity
 from .vm_boundary import (
     PRODUCTION_VM_ROOT,
     VMBoundaryError,
@@ -51,6 +51,20 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 class PublishAdapterError(PublishError):
     pass
+
+
+def _validate_transport_release(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict) and value.get("schema_version") == (
+        local_identity.RELEASE_MANIFEST_SCHEMA
+    ):
+        return local_identity.validate_release_manifest(value)
+    return validate_release_manifest(value)
+
+
+def _transport_manifest_sha256(value: Mapping[str, object]) -> str:
+    if value.get("schema_version") == local_identity.RELEASE_MANIFEST_SCHEMA:
+        return local_identity.identity_sha256(value)
+    return manifest_sha256(value)
 
 
 class SecretValue:
@@ -164,7 +178,7 @@ class ProductionPublishConfig:
         if approved_root != PRODUCTION_VM_ROOT:
             raise PublishAdapterError(r"VM root must be exactly D:\quant\quant_platform")
         if vm["target_address"] != "10.5.1.240":
-            raise PublishAdapterError("production/recovery target must be 10.5.1.240")
+            raise PublishAdapterError("production VM target must be 10.5.1.240")
         return cls(
             github=GitHubCIConfig(
                 owner=_name(github["owner"], "github owner"),
@@ -381,7 +395,6 @@ class IncrementalVMTransport:
         )
 
     def __call__(self, candidate: Mapping[str, object]) -> TransferResult:
-        require_failure_domain_authority()
         release_id, release_hash, candidate_hash = self._candidate(candidate)
         material = self.material_resolver(release_id, release_hash)
         if material.release_id != release_id or material.release_manifest_sha256 != release_hash:
@@ -419,12 +432,18 @@ class IncrementalVMTransport:
             manifest_value = json.loads(
                 (source_root / "release_manifest.json").read_text(encoding="utf-8")
             )
-            semantic_manifest = validate_release_manifest(manifest_value)
-        except (OSError, UnicodeError, json.JSONDecodeError, IdentityContractError) as error:
+            semantic_manifest = _validate_transport_release(manifest_value)
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            IdentityContractError,
+            local_identity.LocalReleaseIdentityError,
+        ) as error:
             raise PublishAdapterError("release manifest material is invalid") from error
         if (
             semantic_manifest["release_id"] != release_id
-            or manifest_sha256(semantic_manifest) != release_hash
+            or _transport_manifest_sha256(semantic_manifest) != release_hash
         ):
             raise PublishAdapterError("release material does not contain the bound manifest")
 
@@ -520,10 +539,6 @@ _OPERATIONAL_MODULE_BINDINGS = {
         r"D:\quant\quant_platform\tooling\python\Lib\site-packages"
         r"\quant_hub\ops\vm_deploy_cli.py"
     ),
-    "publish_recovery_cli_module": (
-        r"D:\quant\quant_platform\tooling\python\Lib\site-packages"
-        r"\quant_hub\ops\publish_recovery_cli.py"
-    ),
 }
 
 
@@ -595,8 +610,7 @@ def verified_d_tooling_python_script(module_binding: str) -> str:
         "service_python_sha256", "service_host_module",
         "service_host_module_sha256", "service_entry_module",
         "service_entry_module_sha256", "deployment_cli_module",
-        "deployment_cli_module_sha256", "publish_recovery_cli_module",
-        "publish_recovery_cli_module_sha256", "access_gate_module",
+        "deployment_cli_module_sha256", "access_gate_module",
         "access_gate_module_sha256", "deployment_runtime",
         "deployment_runtime_sha256", "quant_hub_package_root",
         "quant_hub_package_inventory_sha256",
@@ -728,7 +742,6 @@ class OpenSSHVMBackend:
         )
 
     def ensure_directory(self, path: PureWindowsPath) -> None:
-        require_failure_domain_authority()
         approved = validate_production_vm_write_path(path, allow_root=False)
         self._ssh(self._ensure_directory_script(approved))
 
@@ -779,7 +792,6 @@ class OpenSSHVMBackend:
         return inventory
 
     def upload(self, local_path: Path, remote_path: PureWindowsPath) -> None:
-        require_failure_domain_authority()
         approved = validate_production_vm_write_path(remote_path, allow_root=False)
         self.ensure_directory(approved.parent)
         expected_bytes = local_path.stat().st_size
@@ -837,14 +849,12 @@ class DeploymentInvoker(Protocol):
         publish_candidate_sha256: str,
         deployment_mode: str,
         deployment_attempt_id: str | None,
-        recovery_protection_receipt_id: str | None,
     ) -> Mapping[str, object]: ...
 
 
 @dataclass(frozen=True)
 class ActivationAuthorization:
     deployment_attempt_id: str
-    recovery_protection_receipt_id: str
 
 
 ActivationAuthorizationResolver = Callable[
@@ -867,7 +877,6 @@ class VMDeploymentAdapter:
         self.activation_authorization_resolver = activation_authorization_resolver
 
     def __call__(self, candidate: Mapping[str, object]) -> VMDeployResult:
-        require_failure_domain_authority()
         release_id, release_hash, candidate_hash = IncrementalVMTransport._candidate(candidate)
         deployment_mode = candidate.get("deployment_mode")
         if deployment_mode not in {"activate", "candidate_only"}:
@@ -875,17 +884,13 @@ class VMDeploymentAdapter:
         authorization: ActivationAuthorization | None = None
         if deployment_mode == "activate":
             if self.activation_authorization_resolver is None:
-                raise PublishAdapterError("activation recovery protection is unavailable")
+                raise PublishAdapterError("activation authorization is unavailable")
             authorization = self.activation_authorization_resolver(
                 release_id, candidate_hash
             )
             if not isinstance(authorization, ActivationAuthorization):
                 raise PublishAdapterError("activation authorization schema is invalid")
             _name(authorization.deployment_attempt_id, "deployment_attempt_id")
-            _name(
-                authorization.recovery_protection_receipt_id,
-                "recovery_protection_receipt_id",
-            )
         root = validate_production_vm_write_path(self.config.root, allow_root=True)
         result = self.invoker.invoke(
             vm_root=root,
@@ -895,9 +900,6 @@ class VMDeploymentAdapter:
             deployment_mode=str(deployment_mode),
             deployment_attempt_id=(
                 authorization.deployment_attempt_id if authorization else None
-            ),
-            recovery_protection_receipt_id=(
-                authorization.recovery_protection_receipt_id if authorization else None
             ),
         )
         value = _closed(
@@ -947,9 +949,7 @@ class OpenSSHDeploymentInvoker:
         publish_candidate_sha256: str,
         deployment_mode: str,
         deployment_attempt_id: str | None,
-        recovery_protection_receipt_id: str | None,
     ) -> Mapping[str, object]:
-        require_failure_domain_authority()
         root = validate_production_vm_write_path(vm_root, allow_root=True)
         if deployment_mode not in {"activate", "candidate_only"}:
             raise PublishAdapterError("deployment_mode is invalid")
@@ -968,14 +968,9 @@ class OpenSSHDeploymentInvoker:
                 [
                     "--deployment-attempt-id",
                     _name(deployment_attempt_id, "deployment_attempt_id"),
-                    "--recovery-protection-receipt-id",
-                    _name(
-                        recovery_protection_receipt_id,
-                        "recovery_protection_receipt_id",
-                    ),
                 ]
             )
-        elif deployment_attempt_id is not None or recovery_protection_receipt_id is not None:
+        elif deployment_attempt_id is not None:
             raise PublishAdapterError("candidate_only cannot carry activation authorization")
         cli_arguments.append("--json")
         rendered_arguments = ",".join(_ps_literal(item) for item in cli_arguments)

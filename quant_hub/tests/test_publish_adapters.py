@@ -37,15 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class AuthorityPatchedTestCase(unittest.TestCase):
-    """Historical downstream behavior below the closed product gate."""
-
-    def setUp(self) -> None:
-        authority = patch(
-            "quant_hub.ops.publish_adapters.require_failure_domain_authority",
-            return_value=None,
-        )
-        authority.start()
-        self.addCleanup(authority.stop)
+    """Shared publish-adapter test base."""
 
 
 def config_value() -> dict[str, object]:
@@ -110,7 +102,7 @@ class ProductionConfigTests(unittest.TestCase):
             with self.subTest(root=forbidden), self.assertRaises(PublishAdapterError):
                 ProductionPublishConfig.parse(value)
 
-    def test_second_recovery_vm_is_rejected(self) -> None:
+    def test_non_production_vm_address_is_rejected(self) -> None:
         for forbidden in ("10.5.1.223", "10.5.1.235"):
             value = config_value()
             value["vm"]["target_address"] = forbidden
@@ -233,12 +225,6 @@ class IncrementalTransportTests(AuthorityPatchedTestCase):
                 "compatibility": {
                     "comments": {"read": [1], "write": [1]},
                     "workspace": {"read": [1], "write": [1]},
-                }
-            },
-            "recovery": {
-                "compatibility": {
-                    "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                    "restore_protocol_versions": ["qrh-restore/v1"],
                 }
             },
         }
@@ -415,7 +401,7 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
             config,
             invoker=invoker,
             activation_authorization_resolver=lambda *_: ActivationAuthorization(
-                "attempt-1", "protection-1"
+                "attempt-1"
             ),
         )(candidate)
         self.assertEqual("activated", result.status)
@@ -439,7 +425,7 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
                 config,
                 invoker=FakeInvoker(result_mode="candidate_only"),
                 activation_authorization_resolver=lambda *_: ActivationAuthorization(
-                    "attempt-1", "protection-1"
+                    "attempt-1"
                 ),
             )(default_candidate)
 
@@ -455,18 +441,18 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
                 config,
                 invoker=FakeInvoker("3" * 64),
                 activation_authorization_resolver=lambda *_: ActivationAuthorization(
-                    "attempt-1", "protection-1"
+                    "attempt-1"
                 ),
             )(candidate)
 
-    def test_default_activation_without_recovery_authorization_is_rejected(self) -> None:
+    def test_default_activation_without_authorization_is_rejected(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
         candidate = {
             "release": {"release_id": "release-1", "manifest_sha256": "a" * 64},
             "candidate_manifest_sha256": CANDIDATE_HASH,
             "deployment_mode": "activate",
         }
-        with self.assertRaisesRegex(PublishAdapterError, "protection is unavailable"):
+        with self.assertRaisesRegex(PublishAdapterError, "authorization is unavailable"):
             VMDeploymentAdapter(config, invoker=FakeInvoker())(candidate)
 
     def test_ssh_invoker_uses_fixed_module_and_argv_without_shell(self) -> None:
@@ -497,7 +483,6 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
             publish_candidate_sha256=CANDIDATE_HASH,
             deployment_mode="activate",
             deployment_attempt_id="attempt-1",
-            recovery_protection_receipt_id="protection-1",
         )
         self.assertEqual("release-1", value["release_id"])
         self.assertEqual("ssh", calls[0][0])

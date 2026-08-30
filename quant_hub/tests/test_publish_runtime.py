@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 from contextlib import closing
-import base64
 import hashlib
 import json
-from datetime import UTC, datetime
 from pathlib import Path, PureWindowsPath
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from quant_hub.knowledge.contracts import canonical_json
 from quant_hub.knowledge import ReferenceCompiler
@@ -20,29 +17,15 @@ from quant_hub.knowledge.semantic import (
     deprecate_item,
     extract_source_explicit,
 )
-from quant_hub.ops.publish_adapters import (
-    ActivationAuthorization,
-    CommandResult,
-    HTTPResponse,
-    ReleaseFile,
-)
+from quant_hub.ops.publish_adapters import HTTPResponse, ReleaseFile
 from quant_hub.ops.publish_runtime import (
     EnvironmentSecretProvider,
-    OpenSSHRecoveryActions,
     ProcessResult,
     ProductionPublishRuntime,
     PublishRuntimeError,
-    RecoveryProtectionCoordinator,
     RUNTIME_CONFIG_SCHEMA,
     RuntimeDependencies,
     RuntimePublishConfig,
-)
-from quant_hub.collaboration.checkpoint import create_sqlite_checkpoint
-from quant_hub.ops.failure_domain import (
-    FACTS_SCHEMA,
-    PROBE_SCHEMA,
-    attest_failure_domain,
-    canonical_bytes,
 )
 from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_builder import seal_release
@@ -103,61 +86,8 @@ class FakeInvoker:
         }
 
 
-class FakeProtector:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def preflight(self):
-        return None
-
-    def protect(self, **arguments):
-        self.calls.append(arguments)
-        return ActivationAuthorization("attempt-fixture", "protection-fixture")
-
-
-class LocalRecoveryActions:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.registered = []
-
-    def capture_checkpoint(self, *, material):
-        state = self.root / "state"
-        state.mkdir(exist_ok=True)
-        sources = {}
-        for logical_name in ("comments", "research_workspace"):
-            path = state / f"{logical_name}.sqlite3"
-            with closing(sqlite3.connect(path)) as connection:
-                connection.execute("CREATE TABLE fixture(id INTEGER PRIMARY KEY)")
-                connection.commit()
-            sources[logical_name] = path
-        created = create_sqlite_checkpoint(
-            sources=sources,
-            checkpoint_root=self.root / "checkpoints",
-            checkpoint_id=f"checkpoint-{material.release_manifest_sha256[:16]}",
-            state_authority_id="state-d-authority",
-            captured_under_release_id=material.release_id,
-            captured_under_manifest_sha256=material.release_manifest_sha256,
-        )
-        return created.root
-
-    def register_protection(self, **arguments):
-        self.registered.append(arguments)
-        return ActivationAuthorization("deploy-registered", "protection-registered")
-
-
 class PublishRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
-        # These historical tests exercise logic downstream of the product gate.
-        # Product NOT_READY behavior is covered unpatched in
-        # test_failure_domain_rotation, including a freshly installed wheel.
-        for target in (
-            "quant_hub.ops.publish_runtime.require_failure_domain_authority",
-            "quant_hub.ops.publish.require_failure_domain_authority",
-            "quant_hub.ops.publish_adapters.require_failure_domain_authority",
-        ):
-            authority = patch(target, return_value=None)
-            authority.start()
-            self.addCleanup(authority.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
@@ -246,12 +176,6 @@ class PublishRuntimeTests(unittest.TestCase):
             },
             "resources": {},
             "state": {"compatibility": {"comments": {"read": [1], "write": [1]}}},
-            "recovery": {
-                "compatibility": {
-                    "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                    "restore_protocol_versions": ["qrh-restore/v1"],
-                }
-            },
         }
         sealed_base = seal_release(
             candidate_root=self.runtime_base,
@@ -267,7 +191,6 @@ class PublishRuntimeTests(unittest.TestCase):
             "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py": b"service-host",
             "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py": b"service-entry",
             "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py": b"deploy-cli",
-            "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py": b"recovery-cli",
             "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py": b"access-gate",
             "control/deployment_runtime.json": canonical_json(
                 {"schema_version": "qrh-vm-deploy-runtime/v1", "fixture": True}
@@ -283,7 +206,6 @@ class PublishRuntimeTests(unittest.TestCase):
             "service_host_module": "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py",
             "service_entry_module": "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
             "deployment_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py",
-            "publish_recovery_cli_module": "tooling/python/Lib/site-packages/quant_hub/ops/publish_recovery_cli.py",
             "access_gate_module": "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py",
             "deployment_runtime": "control/deployment_runtime.json",
         }
@@ -356,15 +278,6 @@ class PublishRuntimeTests(unittest.TestCase):
                 "target_address": "10.5.1.240",
                 "root": r"D:\quant\quant_platform",
             },
-            "recovery": {
-                "root": str(self.protected / "recovery"),
-                "failure_domain_attestation": str(self.protected / "attestation.json"),
-                "attestation_max_age_seconds": 86400,
-                "state_authority_id": "state-d-authority",
-                "restore_tool": str(self.project / "app.py"),
-                "runbook": str(self.project / "app.py"),
-                "operational_root": str(self.operational),
-            },
         }
 
     def _seed_semantic_state(self, state_root: Path, mutator=None) -> None:
@@ -388,7 +301,7 @@ class PublishRuntimeTests(unittest.TestCase):
     def config(self):
         return RuntimePublishConfig.parse(self.config_value)
 
-    def dependencies(self, protector=None):
+    def dependencies(self):
         backend = MemoryBackend()
         invoker = FakeInvoker()
         process_calls = []
@@ -436,11 +349,10 @@ class PublishRuntimeTests(unittest.TestCase):
             http_get=http_get,
             vm_backend=backend,
             deployment_invoker=invoker,
-            recovery_protector=protector,
         )
         return deps, backend, invoker, process_calls
 
-    def test_candidate_only_assembles_full_fixed_pipeline_without_recovery(self) -> None:
+    def test_candidate_only_assembles_full_fixed_pipeline(self) -> None:
         local_ignored_overlay = (
             self.project / "quant_hub" / "src" / "quant_hub" / "presentation"
             / "citation_projection_overrides.json"
@@ -457,6 +369,34 @@ class PublishRuntimeTests(unittest.TestCase):
         self.assertEqual("candidate_only", result["result"]["deployment_mode"])
         self.assertEqual("candidate_only", invoker.calls[0]["deployment_mode"])
         self.assertTrue(any(call[:2] == ("git", "push") for call in process_calls))
+        self.assertIn(
+            (
+                sys.executable,
+                "-B",
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                "quant_hub/tests",
+                "-t",
+                "quant_hub",
+                "-p",
+                "test_*.py",
+                "-q",
+            ),
+            process_calls,
+        )
+        self.assertIn(
+            (
+                sys.executable,
+                "-B",
+                "tools/release/git_guard.py",
+                "gate",
+                "--scope",
+                "all",
+            ),
+            process_calls,
+        )
         self.assertEqual(
             semantic_hash_before,
             hashlib.sha256(semantic_path.read_bytes()).hexdigest(),
@@ -506,12 +446,15 @@ class PublishRuntimeTests(unittest.TestCase):
         manifest = json.loads((releases[0] / "release_manifest.json").read_text(encoding="utf-8"))
         serialized_manifest = canonical_json(manifest)
         self.assertTrue(manifest["content"]["snapshot_id"].startswith("ksnap_"))
-        self.assertEqual("partial", manifest["content"]["knowledge_enrichment"]["status"])
+        self.assertEqual("qrh-release-manifest/v2", manifest["schema_version"])
+        self.assertEqual(
+            "ready_set",
+            manifest["content"]["knowledge_enrichment"]["status"],
+        )
         self.assertTrue((self.protected / "publish-state" / "semantic_jobs.sqlite3").is_file())
         self.assertFalse((releases[0] / "semantic_jobs.sqlite3").exists())
         self.assertNotIn("checkpoint_id", serialized_manifest)
         self.assertNotIn("checkpoint_manifest_sha256", serialized_manifest)
-        self.assertNotIn("recovery_manifest_sha256", serialized_manifest)
 
     def test_semantic_only_change_creates_a_new_release_identity(self) -> None:
         first_deps, *_ = self.dependencies()
@@ -609,24 +552,34 @@ class PublishRuntimeTests(unittest.TestCase):
             second_runtime.publish(commit_sha=self.commit, candidate_only=True)
         self.assertEqual({}, second_runtime.freezer.materials)
 
-    def test_default_activate_requires_and_passes_real_authorization_object(self) -> None:
-        protector = FakeProtector()
-        deps, _backend, invoker, _calls = self.dependencies(protector)
+    def test_default_activate_passes_local_deployment_attempt(self) -> None:
+        deps, _backend, invoker, _calls = self.dependencies()
         result = ProductionPublishRuntime(self.config(), dependencies=deps).publish(
             commit_sha=self.commit
         )
         self.assertEqual("activated", result["result"]["status"])
-        self.assertEqual(1, len(protector.calls))
-        self.assertEqual("attempt-fixture", invoker.calls[0]["deployment_attempt_id"])
-        self.assertEqual("protection-fixture", invoker.calls[0]["recovery_protection_receipt_id"])
+        attempt = invoker.calls[0]["deployment_attempt_id"]
+        self.assertRegex(attempt, r"^deploy-[0-9a-f]{64}$")
 
-    def test_default_activate_fails_closed_before_vm_activation_without_protector(self) -> None:
-        deps, _backend, invoker, calls = self.dependencies()
-        runtime = ProductionPublishRuntime(self.config(), dependencies=deps)
-        with self.assertRaises(Exception):
-            runtime.publish(commit_sha=self.commit)
-        self.assertEqual([], invoker.calls)
-        self.assertFalse(any(call[:2] == ("git", "push") for call in calls))
+    def test_fresh_activate_retry_reuses_vm_deployment_attempt(self) -> None:
+        first_deps, *_first = self.dependencies()
+        first_runtime = ProductionPublishRuntime(
+            self.config(), dependencies=first_deps
+        )
+        first_runtime.publish(commit_sha=self.commit)
+        first_invoker = first_deps.deployment_invoker
+
+        second_deps, *_second = self.dependencies()
+        second_runtime = ProductionPublishRuntime(
+            self.config(), dependencies=second_deps
+        )
+        second_runtime.publish(commit_sha=self.commit)
+        second_invoker = second_deps.deployment_invoker
+
+        self.assertEqual(
+            first_invoker.calls[0]["deployment_attempt_id"],
+            second_invoker.calls[0]["deployment_attempt_id"],
+        )
 
     def test_missing_protected_github_secret_fails_before_push(self) -> None:
         deps, _backend, _invoker, calls = self.dependencies()
@@ -652,111 +605,6 @@ class PublishRuntimeTests(unittest.TestCase):
         inside.write_text(canonical_json(self.config_value), encoding="utf-8")
         with self.assertRaisesRegex(PublishRuntimeError, "outside"):
             RuntimePublishConfig.load(inside, expected_project_root=self.project)
-
-    def test_recovery_coordinator_builds_verified_c_rm_then_registers(self) -> None:
-        deps, _backend, _invoker, _calls = self.dependencies()
-        runtime = ProductionPublishRuntime(self.config(), dependencies=deps)
-        runtime.publish(commit_sha=self.commit, candidate_only=True)
-        material = next(iter(runtime.freezer.materials.values()))
-        recovery_root = Path(self.config_value["recovery"]["root"])
-        recovery_root.mkdir(parents=True)
-
-        def facts(role, machine, storage, path):
-            value = {
-                "schema_version": FACTS_SCHEMA,
-                "role": role,
-                "host_name": machine,
-                "machine_identity": machine,
-                "canonical_path": str(path),
-                "path_kind": "local",
-                "reparse_or_symlink": False,
-                "volume_identity": storage,
-                "storage_backend": storage,
-                "storage_authority": f"{machine}|{storage}",
-                "tool_version": "fixture/v1",
-            }
-            value["facts_sha256"] = hashlib.sha256(canonical_bytes(value)).hexdigest()
-            return value
-
-        probe = {
-            "schema_version": PROBE_SCHEMA,
-            "production_root_available": False,
-            "recovery_bundle_readable": True,
-            "closure_verified": True,
-            "empty_root_precondition": True,
-            "bundle_id": "bundle-fixture",
-            "release_id": "release-fixture",
-            "release_manifest_sha256": "c" * 64,
-            "bundle_inventory_sha256": "a" * 64,
-            "materialization_event_id": "cold-materialization-bundle-fixture",
-            "materialization_event_sha256": "d" * 64,
-            "probe_tool_sha256": "b" * 64,
-        }
-        observed = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        attested = attest_failure_domain(
-            production_facts=facts("production", "prod-host", "prod-volume", PureWindowsPath(r"D:\quant\quant_platform")),
-            recovery_facts=facts("recovery", "recovery-host", "recovery-volume", recovery_root.resolve()),
-            independence_probe=probe,
-            observed_at=observed,
-        )
-        attestation_path = Path(
-            self.config_value["recovery"]["failure_domain_attestation"]
-        )
-        attestation_path.write_text(
-            canonical_json({**attested.payload, "attestation_sha256": attested.sha256}),
-            encoding="utf-8",
-        )
-        actions = LocalRecoveryActions(self.protected)
-        coordinator = RecoveryProtectionCoordinator(
-            self.config().recovery, actions=actions
-        )
-        authorization = coordinator.protect(
-            material=material,
-            publish_candidate_sha256="d" * 64,
-        )
-        self.assertEqual("protection-registered", authorization.recovery_protection_receipt_id)
-        self.assertEqual(1, len(actions.registered))
-        bundle = Path(actions.registered[0]["bundle_root"])
-        recovery_manifest = json.loads(
-            (bundle / "recovery_manifest.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(material.release_manifest_sha256, recovery_manifest["release"]["manifest_sha256"])
-        self.assertIn("checkpoint", recovery_manifest)
-        release_manifest = json.loads(
-            (material.source_root / "release_manifest.json").read_text(encoding="utf-8")
-        )
-        self.assertNotIn("checkpoint_id", canonical_json(release_manifest))
-
-    def test_openssh_recovery_boundary_uses_fixed_module_and_d_only_temp(self) -> None:
-        calls = []
-
-        def runner(arguments):
-            calls.append(tuple(arguments))
-            return CommandResult(0, "{}")
-
-        actions = OpenSSHRecoveryActions(self.config(), command_runner=runner)
-        actions._remote(
-            (
-                "-B", "-m", "quant_hub.ops.publish_recovery_cli", "capture",
-                "--vm-root", r"D:\quant\quant_platform",
-                "--checkpoint-id", "checkpoint-fixture",
-                "--state-authority-id", "state-d-authority",
-            )
-        )
-        self.assertEqual("ssh", calls[0][0])
-        script = base64.b64decode(calls[0][-1]).decode("utf-16-le")
-        self.assertIn("quant_hub.ops.publish_recovery_cli", script)
-        self.assertIn(r"D:\quant\quant_platform\tooling\python\python.exe", script)
-        self.assertIn("publish_recovery_cli_module_sha256", script)
-        self.assertIn("package_inventory_hash_mismatch", script)
-        self.assertIn("& $python @a", script)
-        self.assertNotIn("& python", script)
-        self.assertIn("SSH_CONNECTION", script)
-        self.assertLess(script.index("SSH_CONNECTION"), script.index("New-Item"))
-        self.assertIn("PYTHONDONTWRITEBYTECODE", script)
-        self.assertIn(r"D:\quant\quant_platform\tmp\publish-recovery", script)
-        self.assertNotIn("C:\\", script)
-        self.assertNotIn(r"D:\quant\quant_platform_other", script)
 
     def test_prior_release_reuses_historical_source_objects_after_revision(self) -> None:
         first_deps, *_ = self.dependencies()
@@ -800,26 +648,6 @@ class PublishRuntimeTests(unittest.TestCase):
         document = next(iter(snapshot.documents.values()))
         self.assertEqual(2, len(document.version_ids))
 
-    def test_recovery_remote_entry_preflights_root_reparse_temp_and_bytecode(self) -> None:
-        calls = []
-
-        def runner(arguments):
-            calls.append(tuple(arguments))
-            return CommandResult(0, "{}")
-
-        actions = OpenSSHRecoveryActions(self.config(), command_runner=runner)
-        self.assertEqual({}, actions._remote(("-B", "-m", "fixed.module")))
-        self.assertEqual(1, len(calls))
-        script = base64.b64decode(calls[0][-1]).decode("utf-16-le")
-        lowered = script.casefold()
-        self.assertIn(r"d:\quant\quant_platform\tmp\publish-recovery", lowered)
-        self.assertIn("reparsepoint", lowered)
-        self.assertIn("resolve-path", lowered)
-        self.assertIn("pythondontwritebytecode", lowered)
-        self.assertIn("package_inventory_hash_mismatch", lowered)
-        self.assertIn("& $python @a", script)
-        self.assertNotIn("& python", script)
-        self.assertNotIn("c:\\", lowered)
 
 
 if __name__ == "__main__":

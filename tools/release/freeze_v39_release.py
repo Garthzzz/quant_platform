@@ -7,8 +7,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from quant_hub.ops.release_builder import seal_release
-from quant_hub.ops.release_identity import canonical_manifest_bytes
+from quant_hub.ops.release_builder import seal_exact_release
+from quant_hub.ops.local_release_identity import identity_sha256
 
 
 def _hash_file(path: Path) -> str:
@@ -20,7 +20,7 @@ def _hash_file(path: Path) -> str:
 
 
 def _semantic_hash(value: object) -> str:
-    return hashlib.sha256(canonical_manifest_bytes(value)).hexdigest()
+    return identity_sha256(value)
 
 
 def main() -> int:
@@ -66,19 +66,18 @@ def main() -> int:
         "platform_database": databases["platform.sqlite3"],
     }
     manifest = {
-        "schema_version": "qrh-release-manifest/v1",
+        "schema_version": "qrh-release-manifest/v2",
         "release_id": args.release_id,
         "built_at": package["built_at"],
         "application": {
             "source_kind": "legacy_broadcast",
-            "commit_sha": "0" * 40,
-            "tracked_tree_sha256": code_tree["tree_sha256"],
             "build_tool_version": "qrh-freeze-v39/v1",
             "source_archive_sha256": _hash_file(source_zip),
-            "source_package_manifest_sha256": hashlib.sha256(
-                package_bytes
-            ).hexdigest(),
             "legacy_deployment_id": deployment_id,
+            "provenance": {
+                "builder": "qrh-freeze-v39",
+                "labels": ["exact-local-active-prior", "legacy-v39-baseline"],
+            },
         },
         "content": {
             "snapshot_id": "v39-content-20260731-hotfix1",
@@ -86,16 +85,13 @@ def main() -> int:
             "ir_sha256": _semantic_hash(deterministic_render_binding),
             "knowledge_sha256": _semantic_hash(knowledge_binding),
             "search_sha256": _semantic_hash(search_binding),
-            "knowledge_enrichment": {
-                "status": "not_applicable",
-                "reason": "legacy_v39_baseline",
-            },
-            "component_bindings": {
-                "source": source_binding,
-                "deterministic_render": deterministic_render_binding,
-                "knowledge": knowledge_binding,
-                "search": search_binding,
-            },
+            "page_projection_sha256": None,
+            "mcp_sha256": None,
+            "active_membership_sha256": _semantic_hash(
+                {"legacy_deployment_id": deployment_id}
+            ),
+            "knowledge_enrichment": {"status": "not_applicable"},
+            "presentation": {"language": "zh-CN"},
         },
         "resources": {},
         "state": {
@@ -105,14 +101,8 @@ def main() -> int:
                 "rollback_policy": "expand_only_no_down_migration",
             }
         },
-        "recovery": {
-            "compatibility": {
-                "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                "restore_protocol_versions": ["qrh-restore/v1"],
-            }
-        },
     }
-    sealed = seal_release(
+    sealed = seal_exact_release(
         candidate_root=candidate, manifest_without_inventory=manifest
     )
     print(

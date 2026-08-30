@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -12,7 +13,6 @@ from unittest import mock
 from quant_hub.collaboration.checkpoint import (
     CheckpointError,
     create_sqlite_checkpoint,
-    verify_sqlite_checkpoint,
 )
 from quant_hub.ops.release_identity import canonical_manifest_bytes, manifest_sha256
 from quant_hub.ops.vm_service_cli import production_runtime_document
@@ -22,6 +22,7 @@ from quant_hub.ops.windows_service import (
 )
 from quant_hub.ops.writer_handoff import (
     FAILURE_SCHEMA,
+    ExactSuccessor,
     LEGACY_SERVER,
     PORT,
     SUCCESS_SCHEMA,
@@ -100,19 +101,13 @@ def _release(baseline: V39Baseline | None = None) -> dict[str, object]:
                 "rollback_policy": "expand_only_no_down_migration",
             }
         },
-        "recovery": {
-            "compatibility": {
-                "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                "restore_protocol_versions": ["qrh-restore/v1"],
-            }
-        },
         "inventory": inventory,
     }
 
 
 class Fixture:
     def __init__(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(dir=ROOT)
+        self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name) / "D-root"
         self.root.mkdir()
         release = _release()
@@ -145,69 +140,6 @@ class Fixture:
         self.legacy = Path(self.temporary.name) / "C-state"
         _database(self.legacy / "comments.sqlite3", "c-comments-final")
         _database(self.legacy / "research_workspace.sqlite3", "c-workspace-final")
-        self._recovery_evidence()
-
-    def _recovery_evidence(self) -> None:
-        _write_json(
-            self.root / "audit" / "events" / "cold-materialization-v39.json",
-            {
-                "schema_version": "qrh-recovery-materialization-event/v1",
-                "event_id": "cold-materialization-v39",
-                "kind": "cold_recovery_materialized",
-                "authority": "evidence_only",
-                "fields": {
-                    "bundle_id": "v39",
-                    "release_id": self.baseline.release_id,
-                    "manifest_sha256": self.baseline.manifest_sha256,
-                    "empty_root_precondition": True,
-                    "import_cleaned": True,
-                    "runtime_tmp_cleaned": True,
-                },
-            },
-        )
-        _write_json(
-            self.root / "audit" / "recovery-v39.json",
-            {
-                "schema_version": "qrh-recovery-receipt/v1",
-                "receipt_type": "recovery",
-                "receipt_id": "recovery-v39",
-                "recovery_attempt_id": "restore-v39",
-                "recorded_at": "2026-08-21T03:00:00Z",
-                "authority": "evidence_only",
-                "release_manifest_sha256": self.baseline.manifest_sha256,
-                "recovery_manifest_sha256": H["6"],
-                "checkpoint_manifest_sha256": H["7"],
-                "verdict": "recovered",
-                "restore_verification": {
-                    "closure": True,
-                    "state_restored": True,
-                    "service_started": True,
-                    "post_restore": True,
-                },
-            },
-        )
-        _write_json(
-            self.root / "audit" / "receipts" / "protection-v39.json",
-            {
-                "schema_version": "qrh-recovery-protection-receipt/v1",
-                "receipt_type": "recovery_protection",
-                "receipt_id": "protection-v39",
-                "deployment_attempt_id": "protect-v39",
-                "recorded_at": "2026-08-21T03:10:00Z",
-                "authority": "evidence_only",
-                "release_manifest_sha256": self.baseline.manifest_sha256,
-                "recovery_manifest_sha256": H["6"],
-                "checkpoint_manifest_sha256": H["7"],
-                "verdict": "protected",
-                "pre_activation_verification": {
-                    "closure": True,
-                    "compatibility": True,
-                    "failure_domain": True,
-                    "no_secret": True,
-                    "active_pointer_switched": False,
-                },
-            },
-        )
 
     @property
     def legacy_sources(self) -> dict[str, Path]:
@@ -246,11 +178,16 @@ class FakeRuntime:
         self.open = False
         self.toctou = False
         self.observe_calls = 0
+        self.d_external_open_calls = 0
         self.start_failure = ""
         self.probe_ok = True
         self.generate_session_key = True
         self.events: list[str] = []
         self.start_legacy_count = 0
+        self.bridge_attempts: tuple[str, str] | None = None
+        self.bridge_failure = False
+        self.pair_control_ok = True
+        self.pair_control_checks = 0
 
     def observe(self, port: int) -> RuntimeObservation:
         self.observe_calls += 1
@@ -313,12 +250,44 @@ class FakeRuntime:
         if self.start_failure == "after_open":
             raise RuntimeError("D opened then failed")
 
+    def activate_exact_pair(
+        self,
+        baseline: V39Baseline,
+        successor: ExactSuccessor,
+        bootstrap_attempt_id: str,
+        activation_attempt_id: str,
+    ) -> dict[str, object]:
+        self.events.append("bridge-r0-r1")
+        self.bridge_attempts = (bootstrap_attempt_id, activation_attempt_id)
+        if self.bridge_failure:
+            raise RuntimeError("exact bridge failed before ingress")
+        self.d_status = "running"
+        (self.root / "state" / "viewer_secret.key").write_text(
+            "b" * 64 + "\n", encoding="ascii"
+        )
+        self.open = True
+        return {
+            "schema_version": "qrh-v39-exact-pair-bridge-result/v1",
+            "status": "activated_pair",
+            "pair": {
+                "active": {
+                    "release_id": successor.release_id,
+                    "manifest_sha256": successor.manifest_sha256,
+                },
+                "prior": {
+                    "release_id": baseline.release_id,
+                    "manifest_sha256": baseline.manifest_sha256,
+                },
+            },
+        }
+
     def stop_d_service(self, service_name: str) -> None:
         self.events.append("stop-d")
         self.d_status = "stopped"
         self.open = False
 
     def d_external_open(self, port: int) -> bool:
+        self.d_external_open_calls += 1
         return self.open
 
     def probe_d(self, baseline: V39Baseline) -> dict[str, object]:
@@ -339,6 +308,28 @@ class FakeRuntime:
             value["api"] = False
         return value
 
+    def verify_exact_pair_control(
+        self, baseline: V39Baseline, successor: ExactSuccessor
+    ) -> dict[str, object]:
+        self.pair_control_checks += 1
+        if not self.pair_control_ok:
+            raise WriterHandoffError("fixture prior binding missing")
+        return {
+            "schema_version": "qrh-writer-handoff-exact-pair-proof/v1",
+            "pair": {
+                "active": {
+                    "release_id": successor.release_id,
+                    "manifest_sha256": successor.manifest_sha256,
+                },
+                "prior": {
+                    "release_id": baseline.release_id,
+                    "manifest_sha256": baseline.manifest_sha256,
+                },
+            },
+            "state_identity_sha256": "7" * 64,
+            "retention_aggregate_sha256": "8" * 64,
+        }
+
     def start_legacy(self, expected: LegacyProcess) -> None:
         self.events.append("start-c-exact-argv")
         self.start_legacy_count += 1
@@ -353,17 +344,68 @@ class FakeRuntime:
 
 class WriterHandoffTests(unittest.TestCase):
     def setUp(self) -> None:
-        authority = mock.patch(
-            "quant_hub.ops.writer_handoff.require_failure_domain_authority",
-            return_value=None,
-        )
-        authority.start()
-        self.addCleanup(authority.stop)
         self.fixture = Fixture()
         self.runtime = FakeRuntime(self.fixture.root)
 
     def tearDown(self) -> None:
         self.fixture.close()
+
+    def test_production_state_replace_keeps_fresh_files_pinned_through_move(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        checkpoint_root = (
+            self.fixture.root
+            / "tmp"
+            / "writer-handoff"
+            / "attempt-pin"
+            / "checkpoints"
+            / "checkpoint-pin"
+        )
+        checkpoint_root.mkdir(parents=True)
+        sources = {
+            "comments": self.fixture.legacy / "comments.sqlite3",
+            "research_workspace": self.fixture.legacy
+            / "research_workspace.sqlite3",
+        }
+        payloads = {name: path.read_bytes() for name, path in sources.items()}
+        with mock.patch.object(
+            module,
+            "PRODUCTION_VM_ROOT",
+            self.fixture.root,
+        ), mock.patch.object(
+            module,
+            "_read_production_sqlite_checkpoint_bytes",
+            return_value=payloads,
+        ) as read_checkpoint:
+            module._replace_d_state(
+                root=self.fixture.root,
+                checkpoint_root=checkpoint_root,
+                attempt_id="attempt-pin",
+                expected_manifest_sha256="a" * 64,
+                allow_test_root=False,
+            )
+        read_checkpoint.assert_called_once_with(
+            checkpoint_root,
+            attempt_id="attempt-pin",
+            expected_manifest_sha256="a" * 64,
+        )
+        self.assertEqual(
+            "c-comments-final",
+            _value(self.fixture.root / "state" / "comments.sqlite3"),
+        )
+        self.assertEqual(
+            "c-workspace-final",
+            _value(self.fixture.root / "state" / "research_workspace.sqlite3"),
+        )
+        self.assertFalse(
+            (
+                self.fixture.root
+                / "tmp"
+                / "writer-handoff"
+                / "attempt-pin"
+                / "state"
+            ).exists()
+        )
 
     def inspect(self) -> dict[str, object]:
         return dict(
@@ -395,18 +437,138 @@ class WriterHandoffTests(unittest.TestCase):
         arguments.update(changes)
         return apply_writer_handoff(**arguments)
 
-    def test_inspect_closes_v39_state_control_service_and_recovery_evidence(self) -> None:
+    @staticmethod
+    def production_runtime_shell():
+        from quant_hub.ops.writer_handoff import WindowsHandoffRuntime
+
+        runtime = object.__new__(WindowsHandoffRuntime)
+        runtime.root = Path(r"D:\quant\quant_platform")
+        return runtime
+
+    def test_production_inspect_rejects_fake_runtime_before_root_or_observe(self) -> None:
+        successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
+        with mock.patch(
+            "quant_hub.ops.writer_handoff._root",
+            side_effect=AssertionError("production root must remain untouched"),
+        ):
+            with self.assertRaisesRegex(
+                WriterHandoffError, "internally constructed"
+            ):
+                inspect_writer_handoff(
+                    vm_root=Path(r"D:\quant\quant_platform"),
+                    baseline=self.fixture.baseline,
+                    successor=successor,
+                    runtime=self.runtime,
+                    nonce=NONCE,
+                )
+        self.assertEqual(0, self.runtime.observe_calls)
+
+    def test_production_inspect_rejects_helper_shadowed_exact_runtime_before_root(self) -> None:
+        successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
+        runtime = self.production_runtime_shell()
+        runtime._powershell = lambda _script: "{}"
+        runtime._listener_pids = lambda _port: ()
+        with mock.patch(
+            "quant_hub.ops.writer_handoff._root",
+            side_effect=AssertionError("production root must remain untouched"),
+        ):
+            with self.assertRaisesRegex(
+                WriterHandoffError, "internally constructed"
+            ):
+                inspect_writer_handoff(
+                    vm_root=Path(r"D:\quant\quant_platform"),
+                    baseline=self.fixture.baseline,
+                    successor=successor,
+                    runtime=runtime,
+                    nonce=NONCE,
+                )
+
+    def test_production_inspect_rejects_injected_proofs_before_root(self) -> None:
+        successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
+        calls: list[str] = []
+
+        def fabricated_closure(_root: Path, _baseline: V39Baseline):
+            calls.append("closure")
+            return {}
+
+        with mock.patch(
+            "quant_hub.ops.writer_handoff._root",
+            side_effect=AssertionError("production root must remain untouched"),
+        ):
+            with self.assertRaisesRegex(
+                WriterHandoffError, "closure verifier is not injectable"
+            ):
+                inspect_writer_handoff(
+                    vm_root=Path(r"D:\quant\quant_platform"),
+                    baseline=self.fixture.baseline,
+                    successor=successor,
+                    nonce=NONCE,
+                    closure_verifier=fabricated_closure,
+                )
+        self.assertEqual([], calls)
+
+    def test_production_apply_and_finalize_reject_all_injected_seams_before_root(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
+        base = {
+            "vm_root": Path(r"D:\quant\quant_platform"),
+            "baseline": self.fixture.baseline,
+            "successor": successor,
+            "inspection_receipt": {},
+            "expected_inspection_sha256": "f" * 64,
+            "nonce": NONCE,
+        }
+        injected = (
+            {"runtime": self.runtime},
+            {"now": lambda: NOW},
+            {"id_factory": lambda: "a" * 32},
+            {"closure_verifier": lambda _root, _baseline: {}},
+            {"successor_verifier": lambda _root, _successor: {}},
+            {"checkpoint_builder": lambda **_arguments: None},
+            {"legacy_sources": {}},
+        )
+        with mock.patch.object(
+            module,
+            "_root",
+            side_effect=AssertionError("production root must remain untouched"),
+        ):
+            for change in injected:
+                with self.subTest(change=tuple(change)):
+                    with self.assertRaises(WriterHandoffError):
+                        apply_writer_handoff(**base, **change)
+            with self.assertRaisesRegex(
+                WriterHandoffError, "finalize clock is not injectable"
+            ):
+                finalize_writer_handoff(
+                    vm_root=base["vm_root"],
+                    baseline=self.fixture.baseline,
+                    successor=successor,
+                    attempt_id="handoff-production-seam-test",
+                    nonce=NONCE,
+                    now=lambda: NOW,
+                )
+            with self.assertRaisesRegex(
+                WriterHandoffError, "internally constructed"
+            ):
+                finalize_writer_handoff(
+                    vm_root=base["vm_root"],
+                    baseline=self.fixture.baseline,
+                    successor=successor,
+                    runtime=self.runtime,
+                    attempt_id="handoff-production-seam-test",
+                    nonce=NONCE,
+                )
+        self.assertEqual(0, self.runtime.observe_calls)
+
+    def test_inspect_closes_v39_state_control_and_service(self) -> None:
         receipt = self.inspect()
         observation = receipt["observation"]
         self.assertEqual("evidence_only", receipt["authority"])
         self.assertFalse(receipt["mutation_performed"])
         self.assertEqual(3901, observation["legacy_process"]["pid"])
         self.assertEqual(self.fixture.baseline.manifest_sha256, observation["v39"]["manifest_sha256"])
-        self.assertFalse(observation["d"]["recovery"]["failure_domain_accepted"])
-        self.assertEqual(
-            "unavailable-v2",
-            observation["d"]["recovery"]["failure_domain_attestation_schema"],
-        )
+        self.assertNotIn("recovery", observation["d"])
         self.assertEqual(
             "pending_first_production_start",
             observation["d"]["protected_session_key_status"],
@@ -437,15 +599,6 @@ class WriterHandoffTests(unittest.TestCase):
             self.inspect()
         self.assertTrue(self.runtime.legacy_running)
         self.assertEqual([], self.runtime.events)
-
-    def test_recovery_and_failure_domain_receipts_must_bind_same_rm_checkpoint(self) -> None:
-        path = self.fixture.root / "audit" / "receipts" / "protection-v39.json"
-        value = json.loads(path.read_text(encoding="utf-8"))
-        value["checkpoint_manifest_sha256"] = H["8"]
-        _write_json(path, value)
-        with self.assertRaises(WriterHandoffError):
-            self.inspect()
-        self.assertTrue(self.runtime.legacy_running)
 
     def test_hash_nonce_and_toctou_are_fail_closed_before_pid_stop(self) -> None:
         receipt = self.inspect()
@@ -502,6 +655,182 @@ class WriterHandoffTests(unittest.TestCase):
                     "manifest_sha256": self.fixture.baseline.manifest_sha256,
                 },
             )
+
+    def test_failed_terminal_cleanup_can_be_retried_and_resolved(self) -> None:
+        receipt = self.inspect()
+        self.runtime.start_failure = "before_open"
+        with mock.patch(
+            "quant_hub.ops.writer_handoff._cleanup_handoff_transients",
+            return_value=False,
+        ):
+            failed = self.apply(receipt)
+        self.assertEqual("handoff_transient_cleanup_failed", failed.error_code)
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        attempt_id = str(journal["attempt_id"])
+        self.assertTrue(
+            (self.fixture.root / "tmp" / "writer-handoff" / attempt_id).is_dir()
+        )
+
+        resolved = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=attempt_id,
+            nonce=NONCE,
+            allow_test_root=True,
+        )
+        self.assertFalse(resolved.succeeded)
+        self.assertFalse(journal_path.exists())
+        self.assertFalse(
+            (self.fixture.root / "tmp" / "writer-handoff" / attempt_id).exists()
+        )
+
+    def test_failure_terminal_is_durable_before_cleanup_crash(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        self.runtime.start_failure = "before_open"
+        original_cleanup = module._cleanup_handoff_transients
+
+        def cleanup_then_crash(**kwargs):
+            self.assertTrue(original_cleanup(**kwargs))
+            raise SystemExit("crash after failure cleanup returned")
+
+        with mock.patch.object(
+            module,
+            "_cleanup_handoff_transients",
+            side_effect=cleanup_then_crash,
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual("legacy_restored_fenced", journal["phase"])
+        self.assertIsInstance(journal["commit_evidence"], dict)
+        attempt_id = str(journal["attempt_id"])
+        self.assertFalse(
+            (self.fixture.root / "tmp" / "writer-handoff" / attempt_id).exists()
+        )
+        resolved = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=attempt_id,
+            nonce=NONCE,
+            allow_test_root=True,
+        )
+        self.assertFalse(resolved.succeeded)
+        self.assertTrue(resolved.legacy_rollback_succeeded)
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(
+            "d-comments-old",
+            _value(self.fixture.root / "state" / "comments.sqlite3"),
+        )
+
+    def test_fresh_finalize_reobserves_resigned_failure_before_clearing_fence(
+        self,
+    ) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        self.runtime.start_failure = "after_open"
+        original_write = module._write_journal
+
+        def crash_before_failure_binding(*args, **kwargs):
+            if kwargs.get("phase") in {
+                "legacy_restored_fenced",
+                "handoff_failed_fenced",
+            }:
+                raise SystemExit("crash after failure receipt before terminal journal")
+            return original_write(*args, **kwargs)
+
+        with mock.patch.object(
+            module,
+            "_write_journal",
+            side_effect=crash_before_failure_binding,
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertNotIn(
+            journal["phase"],
+            {"legacy_restored_fenced", "handoff_failed_fenced"},
+        )
+        failure_path = (
+            self.fixture.root
+            / "audit"
+            / "writer-handoff"
+            / "failure"
+            / f"writer-handoff-failure-{journal['attempt_id']}.json"
+        )
+        tampered = json.loads(failure_path.read_text(encoding="utf-8"))
+        tampered["d_external_open"] = False
+        tampered["legacy_rollback"] = {
+            "attempted": True,
+            "succeeded": True,
+            "d_state_restored": True,
+            "blocked": False,
+        }
+        tampered.pop("failure_receipt_sha256")
+        tampered["failure_receipt_sha256"] = manifest_sha256(tampered)
+        _write_json(failure_path, tampered)
+
+        before_observations = self.runtime.d_external_open_calls
+        resolved = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertFalse(resolved.succeeded)
+        self.assertGreater(
+            self.runtime.d_external_open_calls,
+            before_observations,
+        )
+        self.assertTrue(self.runtime.open)
+        self.assertFalse(self.runtime.legacy_running)
+        fenced = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual("handoff_failed_fenced", fenced["phase"])
+        self.assertEqual(
+            tampered["failure_receipt_sha256"],
+            fenced["commit_evidence"]["failure_receipt_sha256"],
+        )
+
+    def test_terminal_failure_journal_rejects_fully_resigned_receipt_tamper(
+        self,
+    ) -> None:
+        receipt = self.inspect()
+        self.runtime.start_failure = "before_open"
+        failed = self.apply(receipt)
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual("legacy_restored_fenced", journal["phase"])
+
+        tampered = json.loads(failed.receipt_path.read_text(encoding="utf-8"))
+        tampered["legacy_rollback"]["succeeded"] = False
+        tampered["legacy_rollback"]["blocked"] = True
+        tampered.pop("failure_receipt_sha256")
+        tampered["failure_receipt_sha256"] = manifest_sha256(tampered)
+        _write_json(failed.receipt_path, tampered)
+
+        before_observations = self.runtime.d_external_open_calls
+        with self.assertRaisesRegex(WriterHandoffError, "hash differs from journal"):
+            finalize_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                runtime=self.runtime,
+                attempt_id=str(journal["attempt_id"]),
+                nonce=NONCE,
+                now=lambda: NOW + timedelta(minutes=2),
+                allow_test_root=True,
+            )
+        self.assertEqual(before_observations, self.runtime.d_external_open_calls)
+        self.assertTrue(journal_path.exists())
 
     def test_d_restore_failure_still_recovers_c_while_journal_fences_d(self) -> None:
         receipt = self.inspect()
@@ -595,9 +924,10 @@ class WriterHandoffTests(unittest.TestCase):
         self.assertEqual(SUCCESS_SCHEMA, json.loads(result.receipt_path.read_text(encoding="utf-8"))["schema_version"])
         self.assertEqual("c-comments-final", _value(self.fixture.root / "state" / "comments.sqlite3"))
         self.assertEqual("c-workspace-final", _value(self.fixture.root / "state" / "research_workspace.sqlite3"))
-        for checkpoint_id in (result.final_checkpoint_id, result.prehandoff_checkpoint_id):
-            report = verify_sqlite_checkpoint(self.fixture.root / "backups" / "checkpoints" / str(checkpoint_id))
-            self.assertTrue(report.valid)
+        self.assertFalse((self.fixture.root / "backups").exists())
+        self.assertFalse(
+            (self.fixture.root / "tmp" / "writer-handoff" / "attempt-fixture").exists()
+        )
         self.assertFalse(self.runtime.legacy_running)
         self.assertTrue(self.runtime.open)
         self.assertEqual("running", self.runtime.d_status)
@@ -615,6 +945,124 @@ class WriterHandoffTests(unittest.TestCase):
             (self.fixture.root / "control" / "writer_handoff_pending.json").exists()
         )
         self.assertFalse(list((self.fixture.root / "audit" / "writer-handoff" / "failure").glob("*.json")))
+
+    def test_exact_product_shape_copies_state_then_bridges_r0_r1_before_probe(self) -> None:
+        successor = ExactSuccessor(
+            "release-r1", "e" * 64, "snapshot-r1"
+        )
+
+        def exact_closure(root: Path, baseline: V39Baseline):
+            value = self.fixture.closure(root, baseline)
+            value["authority_status"] = "v2_candidate_pending_bootstrap"
+            return value
+
+        def successor_proof(_root: Path, value: ExactSuccessor):
+            return {
+                "release_id": value.release_id,
+                "manifest_sha256": value.manifest_sha256,
+                "snapshot_id": value.snapshot_id,
+                "authority": "candidate_pending_activation",
+            }
+
+        receipt = dict(
+            inspect_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                successor=successor,
+                runtime=self.runtime,
+                nonce=NONCE,
+                inspected_at=NOW,
+                allow_test_root=True,
+                closure_verifier=exact_closure,
+                successor_verifier=successor_proof,
+            )
+        )
+        original_replace = __import__(
+            "quant_hub.ops.writer_handoff", fromlist=["_replace_d_state"]
+        )._replace_d_state
+
+        def observed_replace(**arguments):
+            self.runtime.events.append("copy-state")
+            return original_replace(**arguments)
+
+        with mock.patch(
+            "quant_hub.ops.writer_handoff._replace_d_state",
+            side_effect=observed_replace,
+        ):
+            result = self.apply(
+                receipt,
+                successor=successor,
+                closure_verifier=exact_closure,
+                successor_verifier=successor_proof,
+            )
+        self.assertTrue(result.succeeded)
+        self.assertLess(
+            self.runtime.events.index("stop-c"),
+            self.runtime.events.index("copy-state"),
+        )
+        self.assertLess(
+            self.runtime.events.index("copy-state"),
+            self.runtime.events.index("bridge-r0-r1"),
+        )
+        self.assertLess(
+            self.runtime.events.index("bridge-r0-r1"),
+            self.runtime.events.index("probe-d"),
+        )
+        self.assertNotIn("start-d", self.runtime.events)
+        success = json.loads(result.receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(successor.release_id, success["release_id"])
+        self.assertEqual(successor.manifest_sha256, success["release_manifest_sha256"])
+        self.assertTrue(success["active_authority_changed"])
+
+    def test_exact_bridge_failure_before_ingress_restores_c_and_d_state(self) -> None:
+        successor = ExactSuccessor(
+            "release-r1", "e" * 64, "snapshot-r1"
+        )
+
+        def exact_closure(root: Path, baseline: V39Baseline):
+            value = self.fixture.closure(root, baseline)
+            value["authority_status"] = "v2_candidate_pending_bootstrap"
+            return value
+
+        def successor_proof(_root: Path, value: ExactSuccessor):
+            return {
+                "release_id": value.release_id,
+                "manifest_sha256": value.manifest_sha256,
+                "snapshot_id": value.snapshot_id,
+                "authority": "candidate_pending_activation",
+            }
+
+        receipt = dict(
+            inspect_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                successor=successor,
+                runtime=self.runtime,
+                nonce=NONCE,
+                inspected_at=NOW,
+                allow_test_root=True,
+                closure_verifier=exact_closure,
+                successor_verifier=successor_proof,
+            )
+        )
+        self.runtime.bridge_failure = True
+        result = self.apply(
+            receipt,
+            successor=successor,
+            closure_verifier=exact_closure,
+            successor_verifier=successor_proof,
+        )
+        self.assertFalse(result.succeeded)
+        self.assertTrue(result.legacy_rollback_succeeded)
+        self.assertFalse(result.rollback_blocked)
+        self.assertTrue(self.runtime.legacy_running)
+        self.assertFalse(self.runtime.open)
+        self.assertEqual(
+            "d-comments-old",
+            _value(self.fixture.root / "state" / "comments.sqlite3"),
+        )
+        self.assertIn("bridge-r0-r1", self.runtime.events)
+        self.assertNotIn("start-d", self.runtime.events)
 
     def test_missing_session_key_after_d_start_fails_without_c_fallback(self) -> None:
         receipt = self.inspect()
@@ -716,6 +1164,340 @@ class WriterHandoffTests(unittest.TestCase):
         self.assertFalse(self.runtime.legacy_running)
         self.assertEqual(0, self.runtime.start_legacy_count)
 
+    def test_fresh_finalize_recovers_crash_immediately_after_legacy_stop(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        original = module._write_journal
+
+        def crash_before_stopped_phase(*args, **kwargs):
+            if kwargs.get("phase") == "legacy_stopped":
+                raise SystemExit("crash after legacy stop")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(
+            module, "_write_journal", side_effect=crash_before_stopped_phase
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+        journal = json.loads(
+            (self.fixture.root / "control" / "writer_handoff_pending.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("legacy_stop_pending", journal["phase"])
+        recovered = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertFalse(recovered.succeeded)
+        self.assertTrue(recovered.legacy_rollback_succeeded)
+        self.assertTrue(self.runtime.legacy_running)
+        self.assertNotIn("bridge-r0-r1", self.runtime.events)
+
+    def test_fresh_finalize_restores_both_d_databases_after_partial_replace_crash(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        original_replace = module.os.replace
+        replaced_first = False
+
+        def crash_after_first_database(source, destination):
+            nonlocal replaced_first
+            result = original_replace(source, destination)
+            if Path(destination) == self.fixture.root / "state" / "comments.sqlite3":
+                replaced_first = True
+                raise SystemExit("crash after first D database replace")
+            return result
+
+        with mock.patch.object(
+            module.os, "replace", side_effect=crash_after_first_database
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+        self.assertTrue(replaced_first)
+        journal = json.loads(
+            (self.fixture.root / "control" / "writer_handoff_pending.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("d_state_replace_pending", journal["phase"])
+        recovered = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertTrue(recovered.legacy_rollback_succeeded)
+        self.assertEqual(
+            "d-comments-old",
+            _value(self.fixture.root / "state" / "comments.sqlite3"),
+        )
+        self.assertEqual(
+            "d-workspace-old",
+            _value(self.fixture.root / "state" / "research_workspace.sqlite3"),
+        )
+
+    def test_fresh_finalize_rejects_self_consistent_checkpoint_aba(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        with mock.patch.object(
+            module,
+            "_replace_d_state",
+            side_effect=SystemExit("crash before D state replacement"),
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        self.assertEqual("d_state_replace_pending", journal["phase"])
+        progress = journal["commit_evidence"]
+        attempt_id = str(journal["attempt_id"])
+        checkpoint_id = str(progress["prehandoff_checkpoint_id"])
+        checkpoint_parent = (
+            self.fixture.root
+            / "tmp"
+            / "writer-handoff"
+            / attempt_id
+            / "checkpoints"
+        )
+        original = checkpoint_parent / checkpoint_id
+        shutil.rmtree(original)
+        replacement = create_sqlite_checkpoint(
+            sources=self.fixture.legacy_sources,
+            checkpoint_root=checkpoint_parent,
+            checkpoint_id=checkpoint_id,
+            state_authority_id="d-prehandoff",
+            captured_under_release_id=self.fixture.baseline.release_id,
+            captured_under_manifest_sha256=self.fixture.baseline.manifest_sha256,
+            captured_at=NOW + timedelta(minutes=1),
+            scratch_root=(
+                self.fixture.root
+                / "tmp"
+                / "writer-handoff"
+                / attempt_id
+                / "restore-proof"
+            ),
+            allow_test_root=True,
+        )
+        self.assertNotEqual(
+            progress["prehandoff_checkpoint_manifest_sha256"],
+            replacement.manifest_sha256,
+        )
+
+        with mock.patch.object(module, "_replace_d_state") as replace, self.assertRaises(
+            WriterHandoffError
+        ):
+            finalize_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                runtime=self.runtime,
+                attempt_id=attempt_id,
+                nonce=NONCE,
+                now=lambda: NOW + timedelta(minutes=2),
+                allow_test_root=True,
+            )
+        replace.assert_not_called()
+        self.assertTrue(journal_path.exists())
+
+    def _exact_crash_fixture(self):
+        successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
+
+        def exact_closure(root: Path, baseline: V39Baseline):
+            value = self.fixture.closure(root, baseline)
+            value["authority_status"] = "v2_candidate_pending_bootstrap"
+            return value
+
+        def successor_proof(_root: Path, value: ExactSuccessor):
+            return {
+                "release_id": value.release_id,
+                "manifest_sha256": value.manifest_sha256,
+                "snapshot_id": value.snapshot_id,
+                "authority": "candidate_pending_activation",
+            }
+
+        receipt = dict(
+            inspect_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                successor=successor,
+                runtime=self.runtime,
+                nonce=NONCE,
+                inspected_at=NOW,
+                allow_test_root=True,
+                closure_verifier=exact_closure,
+                successor_verifier=successor_proof,
+            )
+        )
+        return successor, exact_closure, successor_proof, receipt
+
+    def test_fresh_finalize_accepts_exact_r1_open_after_bridge_return_without_replay(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        successor, closure, successor_proof, receipt = self._exact_crash_fixture()
+        with mock.patch.object(
+            module,
+            "_verify_committed_surface",
+            side_effect=SystemExit("crash after exact bridge opened R1"),
+        ), self.assertRaises(SystemExit):
+            self.apply(
+                receipt,
+                successor=successor,
+                closure_verifier=closure,
+                successor_verifier=successor_proof,
+            )
+        journal = json.loads(
+            (self.fixture.root / "control" / "writer_handoff_pending.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual("d_bridge_pending", journal["phase"])
+        self.assertEqual(1, self.runtime.events.count("bridge-r0-r1"))
+        completed = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            successor=successor,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertTrue(completed.succeeded)
+        self.assertEqual(1, self.runtime.events.count("bridge-r0-r1"))
+        self.assertGreaterEqual(self.runtime.pair_control_checks, 1)
+
+    def test_fresh_finalize_rejects_open_r1_when_prior_pair_proof_is_missing(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        successor, closure, successor_proof, receipt = self._exact_crash_fixture()
+        with mock.patch.object(
+            module,
+            "_verify_committed_surface",
+            side_effect=SystemExit("crash before exact pair proof"),
+        ), self.assertRaises(SystemExit):
+            self.apply(
+                receipt,
+                successor=successor,
+                closure_verifier=closure,
+                successor_verifier=successor_proof,
+            )
+        journal = json.loads(
+            (self.fixture.root / "control" / "writer_handoff_pending.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.runtime.pair_control_ok = False
+        result = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            successor=successor,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertFalse(result.succeeded)
+        self.assertTrue(result.rollback_blocked)
+        self.assertFalse(self.runtime.legacy_running)
+        self.assertEqual(1, self.runtime.events.count("bridge-r0-r1"))
+
+    def test_fresh_finalize_recovers_closed_bridge_failure_without_forwarding(self) -> None:
+        successor, closure, successor_proof, receipt = self._exact_crash_fixture()
+        original_activate = self.runtime.activate_exact_pair
+        with mock.patch.object(
+            self.runtime,
+            "activate_exact_pair",
+            side_effect=SystemExit("child controller exited closed"),
+        ), self.assertRaises(SystemExit):
+            self.apply(
+                receipt,
+                successor=successor,
+                closure_verifier=closure,
+                successor_verifier=successor_proof,
+            )
+        journal = json.loads(
+            (self.fixture.root / "control" / "writer_handoff_pending.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.runtime.activate_exact_pair = original_activate
+        self.runtime.bridge_failure = True
+        recovered = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            successor=successor,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=2),
+            allow_test_root=True,
+        )
+        self.assertFalse(recovered.succeeded)
+        self.assertTrue(recovered.legacy_rollback_succeeded)
+        self.assertTrue(self.runtime.legacy_running)
+        self.assertFalse(self.runtime.open)
+
+    def test_recovery_crash_after_new_c_pid_does_not_start_second_legacy(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        receipt = self.inspect()
+        original_write = module._write_journal
+
+        def cut_after_stop(*args, **kwargs):
+            if kwargs.get("phase") == "legacy_stopped":
+                raise SystemExit("cut after stop")
+            return original_write(*args, **kwargs)
+
+        with mock.patch.object(
+            module, "_write_journal", side_effect=cut_after_stop
+        ), self.assertRaises(SystemExit):
+            self.apply(receipt)
+        journal_path = self.fixture.root / "control" / "writer_handoff_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        with mock.patch.object(
+            module,
+            "_failure_receipt",
+            side_effect=SystemExit("cut after C restart/verify"),
+        ), self.assertRaises(SystemExit):
+            finalize_writer_handoff(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                runtime=self.runtime,
+                attempt_id=str(journal["attempt_id"]),
+                nonce=NONCE,
+                now=lambda: NOW + timedelta(minutes=2),
+                allow_test_root=True,
+            )
+        self.assertEqual(1, self.runtime.start_legacy_count)
+        previous = self.runtime.process
+        self.runtime.process = LegacyProcess(
+            previous.pid + 100,
+            previous.executable,
+            previous.argv,
+            previous.executable_sha256,
+            previous.server_sha256,
+        )
+        recovered = finalize_writer_handoff(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            attempt_id=str(journal["attempt_id"]),
+            nonce=NONCE,
+            now=lambda: NOW + timedelta(minutes=3),
+            allow_test_root=True,
+        )
+        self.assertTrue(recovered.legacy_rollback_succeeded)
+        self.assertEqual(1, self.runtime.start_legacy_count)
+
     def test_service_start_allows_only_exact_post_state_install_journal_phase(self) -> None:
         path = self.fixture.root / "control" / "writer_handoff_pending.json"
         active = {
@@ -723,7 +1505,7 @@ class WriterHandoffTests(unittest.TestCase):
             "manifest_sha256": self.fixture.baseline.manifest_sha256,
         }
         blocked = {
-            "schema_version": "qrh-writer-handoff-pending/v2",
+            "schema_version": "qrh-writer-handoff-pending/v4",
             "attempt_id": "handoff-fixture",
             "nonce_sha256": "e" * 64,
             "inspection_sha256": "f" * 64,
@@ -732,11 +1514,18 @@ class WriterHandoffTests(unittest.TestCase):
             "phase": "legacy_stop_pending",
             "commit_evidence": None,
             "authority": "coordination_only",
+            "legacy_process": self.runtime.process.document(),
         }
         _write_json(path, blocked)
         with self.assertRaises(WindowsServiceError):
             authorize_writer_handoff_service_start(self.fixture.root, active)
-        blocked["phase"] = "d_start_authorized"
+        blocked["phase"] = "d_bridge_pending"
+        blocked["commit_evidence"] = {
+            "final_checkpoint_id": "handoff-final-fixture",
+            "final_checkpoint_manifest_sha256": "1" * 64,
+            "prehandoff_checkpoint_id": "handoff-pre-d-fixture",
+            "prehandoff_checkpoint_manifest_sha256": "2" * 64,
+        }
         _write_json(path, blocked)
         authorize_writer_handoff_service_start(self.fixture.root, active)
         blocked["phase"] = "handoff_committed_receipt_pending"

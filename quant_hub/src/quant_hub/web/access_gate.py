@@ -22,6 +22,9 @@ AUTH_FAILURE_LIMIT = 8
 AUTH_FAILURE_WINDOW_SECONDS = 300.0
 _AUTH_FAILURES: dict[str, deque[float]] = {}
 _AUTH_FAILURES_LOCK = Lock()
+_EXACT_UNAUTHENTICATED_PATHS = frozenset(
+    {"/deploymentz", "/deployment-canaryz"}
+)
 
 # This is the reviewed V39 login surface.  The application templates, CSS and
 # JavaScript behind it are supplied by the active immutable release unchanged.
@@ -143,6 +146,33 @@ class AccessGateError(RuntimeError):
     pass
 
 
+def _exact_raw_request_target(expected_path: str) -> bool:
+    """Accept only one exact ASCII origin-form path with no hidden query."""
+
+    if expected_path not in _EXACT_UNAUTHENTICATED_PATHS:
+        return False
+    environ = request.environ
+    raw_uri = environ.get("RAW_URI")
+    request_uri = environ.get("REQUEST_URI")
+    path_info = environ.get("PATH_INFO")
+    query_string = environ.get("QUERY_STRING")
+    server_protocol = environ.get("SERVER_PROTOCOL")
+    return (
+        type(raw_uri) is str
+        and type(request_uri) is str
+        and type(path_info) is str
+        and type(query_string) is str
+        and type(server_protocol) is str
+        and raw_uri == expected_path
+        and request_uri == expected_path
+        and path_info == expected_path
+        and query_string == ""
+        and server_protocol == "HTTP/1.1"
+        and request.path == expected_path
+        and request.query_string == b""
+    )
+
+
 def load_password_digest(path: Path) -> bytes:
     """Load a protected PBKDF2 digest; never fall back to a release constant."""
 
@@ -201,7 +231,11 @@ def install_access_gate(app, expected_digest: bytes) -> None:
 
     @app.before_request
     def require_broadcast_password():
-        if request.path == "/deploymentz" or request.endpoint in {
+        exact_probe = any(
+            _exact_raw_request_target(path)
+            for path in _EXACT_UNAUTHENTICATED_PATHS
+        )
+        if exact_probe or request.endpoint in {
             "broadcast_login", "broadcast_logout",
         }:
             return None

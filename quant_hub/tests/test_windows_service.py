@@ -3,14 +3,16 @@ from __future__ import annotations
 from contextlib import closing
 import hashlib
 import http.cookiejar
+import inspect
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -18,16 +20,32 @@ import urllib.parse
 import urllib.request
 
 from quant_hub.ops.release_identity import manifest_sha256
+from quant_hub.ops.local_windows_writer_lease_holder import (
+    ExactRuntimeLeaseIdentity,
+)
 from quant_hub.ops.service_entry import ServiceEntryError, _generic_release_root
 from quant_hub.ops.windows_service import (
+    QuantResearchHubWindowsService,
     SERVICE_CLASS,
     ServiceSupervisor,
     WindowsServiceError,
+    WindowsServiceStatusOwnerCrashRequired,
+    _requires_service_host_owner_crash,
     apply_install_candidate,
     build_install_candidate,
     parse_service_start_authorization,
     validate_service_control_binding,
     verify_installed_operational_bindings,
+)
+from quant_hub.ops import windows_service as windows_service_module
+from quant_hub.ops.local_service_transient_journal_start_fence import (
+    ServiceTransientJournalStartFenceOwnerCrashRequired,
+)
+from quant_hub.ops.local_windows_job_child_launcher import (
+    WindowsJobChildOwnerCrashRequired,
+)
+from quant_hub.ops.local_windows_exact_runtime_process_fence import (
+    WindowsExactRuntimeProcessFenceOwnerCrashRequired,
 )
 from quant_hub.ops.vm_service_cli import (
     production_runtime_document,
@@ -149,12 +167,296 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("servicemanager", source)
         self.assertNotIn("LogInfoMsg", source)
-        self.assertIn('root / "logs" / "quant-research-hub-service.log"', source)
+        owner = source[
+            source.index("class _ServiceHostDWriteOwner") :
+            source.index("def resolve_active_service_release")
+        ]
+        self.assertIn(
+            'physical / "logs" / "quant-research-hub-service.log"',
+            owner,
+        )
+        self.assertIn("_BoundDirectory(", owner)
+        self.assertIn("CreateFileW(", owner)
+        self.assertNotIn(".mkdir(parents=True", owner)
+        self.assertNotIn('.open("ab")', owner)
         constructor = source[source.index("class QuantResearchHubWindowsService") :]
         self.assertLess(
             constructor.index("verify_installed_operational_bindings(root)"),
             constructor.index("prepare_service_host_environment(root)"),
         )
+
+    def test_service_host_write_owner_pins_d_directories_and_log_for_lifetime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(
+                windows_service_module,
+                "PRODUCTION_VM_ROOT",
+                PureWindowsPath(str(root)),
+            ), mock.patch.object(
+                windows_service_module,
+                "validate_production_vm_write_path",
+                side_effect=lambda value, allow_root=False: PureWindowsPath(value),
+            ):
+                owner = windows_service_module.prepare_service_host_environment(root)
+                owner.append_status("host_failure_fixture")
+                self.assertFalse(owner._closed)
+                self.assertIsNotNone(owner._log_handle)
+                owner.close()
+                self.assertTrue(owner._closed)
+            self.assertEqual(
+                "host_failure_fixture\n",
+                (
+                    root / "logs" / "quant-research-hub-service.log"
+                ).read_text(encoding="ascii"),
+            )
+
+    def test_service_status_owner_overrides_base_run_and_interrogate(self) -> None:
+        source = (
+            Path(__file__).parents[1]
+            / "src" / "quant_hub" / "ops" / "windows_service.py"
+        ).read_text(encoding="utf-8")
+        constructor = source[source.index("class QuantResearchHubWindowsService") :]
+        svc_run = constructor[
+            constructor.index("        def SvcRun(self):") :
+            constructor.index("        def SvcInterrogate(self):")
+        ]
+        running_transition = constructor[
+            constructor.index("        def _report_running_unless_stopped(self):") :
+            constructor.index("        def SvcRun(self):")
+        ]
+        interrogate = constructor[
+            constructor.index("        def SvcInterrogate(self):") :
+            constructor.index("        def SvcStop(self):")
+        ]
+        self.assertNotIn("super().SvcRun", svc_run)
+        self.assertLess(
+            svc_run.index("SERVICE_START_PENDING"),
+            svc_run.index("begin_production_steady_start_pending"),
+        )
+        self.assertLess(
+            svc_run.index("begin_production_steady_start_pending"),
+            svc_run.index("_report_running_unless_stopped"),
+        )
+        self.assertLess(
+            svc_run.index("_report_running_unless_stopped"),
+            svc_run.index("complete_production_steady_after_running"),
+        )
+        self.assertIn("SERVICE_RUNNING", running_transition)
+        self.assertIn("self._stop_is_set()", running_transition)
+        self.assertIn("self.stop_event", constructor)
+        self.assertIn("self._tracked_service_state", interrogate)
+        self.assertNotIn("super().SvcInterrogate", interrogate)
+
+    def test_ordinary_production_start_cannot_reach_legacy_popen_path(self) -> None:
+        source = (
+            Path(__file__).parents[1]
+            / "src" / "quant_hub" / "ops" / "windows_service.py"
+        ).read_text(encoding="utf-8")
+        start = source[
+            source.index("    def start(self) -> ActiveServiceRelease:") :
+            source.index("    def stop(self, *, timeout: float = 15.0) -> None:")
+        ]
+        exact = start.index(
+            "if type(self.activation_authorization) is ExactRuntimeLeaseIdentity:"
+        )
+        steady_guard = start.index(
+            "ordinary production start must use the exact steady SvcRun path"
+        )
+        legacy_popen = start.index("self.process = self.popen_factory(")
+        self.assertLess(exact, steady_guard)
+        self.assertLess(steady_guard, legacy_popen)
+
+    def test_pending_v1_production_start_cannot_reach_legacy_popen_path(self) -> None:
+        supervisor = object.__new__(ServiceSupervisor)
+        supervisor.root = Path(r"D:\quant\quant_platform")
+        supervisor.popen_factory = mock.Mock()
+        supervisor.python_executable = None
+        supervisor.allow_test_root = False
+        supervisor.activation_authorization = (
+            "candidate",
+            "attempt-v1-rejected",
+            "a" * 48,
+        )
+        supervisor.process = None
+        supervisor._transient_lifetime = None
+        supervisor._steady_lifetime = None
+        with mock.patch.object(
+            windows_service_module,
+            "verify_installed_operational_bindings",
+            return_value={},
+        ):
+            with self.assertRaisesRegex(
+                WindowsServiceError, "legacy pending activation"
+            ):
+                supervisor.start()
+        supervisor.popen_factory.assert_not_called()
+
+    def test_owner_crash_is_detected_through_wrapped_cleanup_error(self) -> None:
+        try:
+            try:
+                raise WindowsJobChildOwnerCrashRequired("unknown close")
+            except WindowsJobChildOwnerCrashRequired as error:
+                raise RuntimeError("cleanup wrapper") from error
+        except RuntimeError as wrapped:
+            self.assertTrue(_requires_service_host_owner_crash(wrapped))
+        self.assertTrue(
+            _requires_service_host_owner_crash(
+                ServiceTransientJournalStartFenceOwnerCrashRequired(
+                    "unknown transient pin close"
+                )
+            )
+        )
+        self.assertTrue(
+            _requires_service_host_owner_crash(
+                WindowsServiceStatusOwnerCrashRequired("unknown SCM status")
+            )
+        )
+        self.assertTrue(
+            _requires_service_host_owner_crash(
+                WindowsExactRuntimeProcessFenceOwnerCrashRequired(
+                    "unknown process-fence close"
+                )
+            )
+        )
+        self.assertFalse(_requires_service_host_owner_crash(RuntimeError("ordinary")))
+
+    @unittest.skipUnless(sys.platform == "win32", "requires pywin32 service host")
+    def test_stop_and_running_reports_are_linearized_by_one_status_lock(self) -> None:
+        service = object.__new__(QuantResearchHubWindowsService)
+        service._status_lock = threading.RLock()
+        service._tracked_service_state = (
+            windows_service_module.win32service.SERVICE_START_PENDING
+        )
+        service._status_outcome_unknown = False
+        service.stop_event = windows_service_module.win32event.CreateEvent(
+            None, 0, 0, None
+        )
+        stop_requested = threading.Event()
+        service.supervisor = mock.Mock()
+        service.supervisor.request_production_steady_stop.side_effect = (
+            stop_requested.set
+        )
+        report_entered = threading.Event()
+        allow_running_report = threading.Event()
+        reports: list[int] = []
+
+        def report(_owner, state, waitHint=0):
+            del waitHint
+            if state == windows_service_module.win32service.SERVICE_RUNNING:
+                report_entered.set()
+                self.assertTrue(allow_running_report.wait(5))
+            reports.append(state)
+
+        failures: list[BaseException] = []
+
+        def run_running() -> None:
+            try:
+                self.assertTrue(service._report_running_unless_stopped())
+            except BaseException as error:
+                failures.append(error)
+
+        def run_stop() -> None:
+            try:
+                service.SvcStop()
+            except BaseException as error:
+                failures.append(error)
+
+        with mock.patch.object(
+            QuantResearchHubWindowsService,
+            "ReportServiceStatus",
+            new=report,
+        ):
+            running = threading.Thread(target=run_running)
+            stopping = threading.Thread(target=run_stop)
+            running.start()
+            self.assertTrue(report_entered.wait(5))
+            stopping.start()
+            self.assertFalse(stop_requested.wait(0.1))
+            allow_running_report.set()
+            running.join(5)
+            stopping.join(5)
+        self.assertFalse(running.is_alive())
+        self.assertFalse(stopping.is_alive())
+        self.assertEqual([], failures)
+        self.assertEqual(
+            [
+                windows_service_module.win32service.SERVICE_RUNNING,
+                windows_service_module.win32service.SERVICE_STOP_PENDING,
+            ],
+            reports,
+        )
+        self.assertTrue(stop_requested.is_set())
+
+    @unittest.skipUnless(sys.platform == "win32", "requires pywin32 service host")
+    def test_unknown_running_status_retires_status_authority(self) -> None:
+        service = object.__new__(QuantResearchHubWindowsService)
+        service._status_lock = threading.RLock()
+        service._tracked_service_state = (
+            windows_service_module.win32service.SERVICE_START_PENDING
+        )
+        service._status_outcome_unknown = False
+        service.stop_event = windows_service_module.win32event.CreateEvent(
+            None, 0, 0, None
+        )
+        calls: list[int] = []
+
+        def report(_owner, state, waitHint=0):
+            del waitHint
+            calls.append(state)
+            raise OSError("injected unknown SCM status outcome")
+
+        with mock.patch.object(
+            QuantResearchHubWindowsService,
+            "ReportServiceStatus",
+            new=report,
+        ):
+            with self.assertRaises(WindowsServiceStatusOwnerCrashRequired):
+                service._report_running_unless_stopped()
+            with self.assertRaises(WindowsServiceStatusOwnerCrashRequired):
+                service._report_tracked_status(
+                    windows_service_module.win32service.SERVICE_STOPPED
+                )
+        self.assertTrue(service._status_outcome_unknown)
+        self.assertEqual(
+            windows_service_module.win32service.SERVICE_START_PENDING,
+            service._tracked_service_state,
+        )
+        self.assertEqual(
+            [windows_service_module.win32service.SERVICE_RUNNING], calls
+        )
+
+    def test_scm_stop_only_signals_and_owner_thread_terminates_job(self) -> None:
+        source = (
+            Path(__file__).parents[1]
+            / "src" / "quant_hub" / "ops" / "windows_service.py"
+        ).read_text(encoding="utf-8")
+        constructor = source[source.index("class QuantResearchHubWindowsService") :]
+        stop = constructor[
+            constructor.index("        def SvcStop(self):") :
+            constructor.index("        def SvcDoRun(self):")
+        ]
+        run = constructor[
+            constructor.index("        def SvcRun(self):") :
+            constructor.index("        def SvcInterrogate(self):")
+        ]
+        wait = constructor[
+            constructor.index("        def SvcDoRun(self):") :
+            constructor.index("\nexcept ImportError")
+        ]
+        self.assertIn("SetEvent", stop)
+        self.assertIn("request_production_steady_stop", stop)
+        self.assertNotIn("supervisor.stop()", stop)
+        self.assertIn("_terminate_service_host_owner_crash", run)
+        self.assertIn("stop_production_transient_from_owner", wait)
+        self.assertIn("stop_production_steady_from_owner", wait)
+
+    def test_ordinary_production_start_uses_exact_steady_bootstrap_not_popen(self) -> None:
+        method = inspect.getsource(
+            ServiceSupervisor.begin_production_steady_start_pending
+        )
+        self.assertIn("ProductionSteadyServiceBootstrap.load_exact_d()", method)
+        self.assertNotIn("popen_factory", method)
+        self.assertNotIn("subprocess", method)
 
     def test_production_service_config_is_fixed_d_authority_without_credentials(self) -> None:
         document = production_runtime_document()
@@ -229,9 +531,6 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         )
         (tooling_package / "ops" / "vm_deploy_cli.py").write_bytes(
             (source / "ops" / "vm_deploy_cli.py").read_bytes()
-        )
-        (tooling_package / "ops" / "publish_recovery_cli.py").write_bytes(
-            (source / "ops" / "publish_recovery_cli.py").read_bytes()
         )
         (tooling_package / "ops" / "deployment.py").write_bytes(
             (source / "ops" / "deployment.py").read_bytes()
@@ -347,6 +646,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
             ("candidate", "attempt-1", "a" * 48),
             parse_service_start_authorization(valid),
         )
+        prior = ["QuantResearchHub", "pending-activation", "prior", "attempt-1", "b" * 48]
+        self.assertEqual(
+            ("prior", "attempt-1", "b" * 48),
+            parse_service_start_authorization(prior),
+        )
         self.assertIsNone(parse_service_start_authorization(["QuantResearchHub"]))
         for invalid in (
             valid[:-1],
@@ -355,6 +659,157 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         ):
             with self.assertRaises(WindowsServiceError):
                 parse_service_start_authorization(invalid)
+
+    def test_scm_exact_runtime_arguments_round_trip_the_hashed_start_plan(self) -> None:
+        identity = ExactRuntimeLeaseIdentity(
+            attempt_id="exact-service-attempt",
+            nonce="exact-service-deployment-nonce",
+            operation="activation",
+            role="candidate",
+            start_nonce="exact-service-start-nonce",
+            release_id="release-r2",
+            manifest_sha256="d" * 64,
+            state_identity_sha256="c" * 64,
+        )
+        parsed = parse_service_start_authorization(
+            ["QuantResearchHub", *identity.service_start_arguments]
+        )
+        self.assertIs(type(parsed), ExactRuntimeLeaseIdentity)
+        self.assertEqual(identity, parsed)
+        invalid = list(identity.service_start_arguments)
+        invalid[1], invalid[3] = invalid[3], invalid[1]
+        with self.assertRaisesRegex(WindowsServiceError, "not closed"):
+            parse_service_start_authorization(["QuantResearchHub", *invalid])
+        invalid_operation = list(identity.service_start_arguments)
+        invalid_operation[
+            invalid_operation.index("--deployment-operation") + 1
+        ] = "other"
+        with self.assertRaisesRegex(WindowsServiceError, "not closed"):
+            parse_service_start_authorization(
+                ["QuantResearchHub", *invalid_operation]
+            )
+
+    def test_exact_runtime_launch_rejects_reused_pycache_before_popen(self) -> None:
+        identity = ExactRuntimeLeaseIdentity(
+            attempt_id="exact-service-attempt",
+            nonce="exact-service-deployment-nonce",
+            operation="activation",
+            role="candidate",
+            start_nonce="exact-service-start-nonce",
+            release_id="release-r2",
+            manifest_sha256="d" * 64,
+            state_identity_sha256="c" * 64,
+        )
+        pycache = self.root / "tmp" / "service" / "pycache" / identity.start_nonce
+        pycache.mkdir(parents=True)
+        called = []
+        supervisor = ServiceSupervisor(
+            self.root,
+            popen_factory=lambda *args, **kwargs: called.append((args, kwargs)),
+            python_executable=Path(sys.executable),
+            allow_test_root=True,
+            activation_authorization=identity,
+        )
+        with self.assertRaisesRegex(WindowsServiceError, "must be absent"):
+            supervisor.start()
+        self.assertEqual([], called)
+
+    def test_exact_runtime_launch_uses_identity_argv_and_fresh_pycache(self) -> None:
+        identity = ExactRuntimeLeaseIdentity(
+            attempt_id="exact-service-attempt",
+            nonce="exact-service-deployment-nonce",
+            operation="activation",
+            role="candidate",
+            start_nonce="exact-service-fresh-start-nonce",
+            release_id="release-r2",
+            manifest_sha256="d" * 64,
+            state_identity_sha256="c" * 64,
+        )
+        observed = []
+
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self) -> None:
+                self.running = True
+
+            def poll(self):
+                return None if self.running else 0
+
+            def wait(self, timeout=None):
+                del timeout
+                self.running = False
+                return 0
+
+        def fake_popen(arguments, **kwargs):
+            observed.append((tuple(arguments), kwargs))
+            return FakeProcess()
+
+        supervisor = ServiceSupervisor(
+            self.root,
+            popen_factory=fake_popen,
+            python_executable=Path(sys.executable),
+            allow_test_root=True,
+            activation_authorization=identity,
+        )
+        active = supervisor.start()
+        self.assertEqual(identity.release_id, active.release_id)
+        self.assertEqual(identity.child_argv, observed[0][0])
+        self.assertEqual(
+            str(
+                self.root
+                / "tmp" / "service" / "pycache" / identity.start_nonce
+            ),
+            observed[0][1]["env"]["PYTHONPYCACHEPREFIX"],
+        )
+        pycache_sentinel = (
+            self.root / "tmp" / "service" / "pycache" / identity.start_nonce
+        )
+        self.assertTrue(pycache_sentinel.is_file())
+        self.assertIn(
+            identity.start_nonce,
+            pycache_sentinel.read_text(encoding="utf-8"),
+        )
+        child = json.loads(
+            (self.root / "state" / "service" / "child.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(identity.scm_identity_sha256, child["scm_identity_sha256"])
+        self.assertEqual(0, supervisor.wait())
+
+    def test_exact_runtime_popen_failure_closes_sentinel_guard_and_preserves_nonce(self) -> None:
+        identity = ExactRuntimeLeaseIdentity(
+            attempt_id="exact-service-attempt",
+            nonce="exact-service-deployment-nonce",
+            operation="activation",
+            role="candidate",
+            start_nonce="exact-service-failed-start-nonce",
+            release_id="release-r2",
+            manifest_sha256="d" * 64,
+            state_identity_sha256="c" * 64,
+        )
+
+        def fail_popen(*args, **kwargs):
+            del args, kwargs
+            raise OSError("injected Popen failure")
+
+        supervisor = ServiceSupervisor(
+            self.root,
+            popen_factory=fail_popen,
+            python_executable=Path(sys.executable),
+            allow_test_root=True,
+            activation_authorization=identity,
+        )
+        with self.assertRaisesRegex(OSError, "Popen failure"):
+            supervisor.start()
+        sentinel = (
+            self.root / "tmp" / "service" / "pycache" / identity.start_nonce
+        )
+        self.assertTrue(sentinel.is_file())
+        sentinel.write_bytes(sentinel.read_bytes())
+        with self.assertRaisesRegex(WindowsServiceError, "must be absent"):
+            supervisor.start()
 
     def test_candidate_python_injection_is_explicit_test_only_and_exact(self) -> None:
         self._write_install_binding()
@@ -384,6 +839,56 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                  "snapshot_id": release["content"]["snapshot_id"]},
             )
         self.assertEqual([], called)
+
+    def test_production_candidate_layout_is_pinned_and_cleaned_before_popen(self) -> None:
+        runtime = WindowsServiceRuntime(
+            root=self.root,
+            service_name="QuantResearchHub",
+            base_url="http://127.0.0.1:8765",
+            listen_host="0.0.0.0",
+            port=8765,
+            critical_paths=("/login", "/api/v1/research", "/api/v1/dashboard"),
+            writer_authority="D-active",
+            service_entry_relative_path=(
+                "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py"
+            ),
+            application_source_relative_path="runtime_contract/code/src",
+            archive_root_relative_path="reference/archive",
+            var_root_relative_path="runtime",
+            migration_root_relative_path="runtime_contract/migrations/platform",
+            access_password_digest_path="state/viewer_access_password.digest",
+            session_key_path="state/viewer_secret.key",
+            comment_database_path="state/comments.sqlite3",
+            workspace_database_path="state/research_workspace.sqlite3",
+            write_paths=(),
+        )
+        release = self.releases["release-r2"]
+        state_before = {
+            path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in (self.root / "state").glob("*.sqlite3")
+        }
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_installed_operational_bindings",
+            side_effect=WindowsServiceError("fixture tooling rejection"),
+        ), self.assertRaisesRegex(VMDeployCLIError, "operational tooling"):
+            runtime.candidate_probe(
+                self.root / "releases" / "release-r2",
+                {
+                    "release_id": "release-r2",
+                    "manifest_sha256": manifest_sha256(release),
+                    "snapshot_id": release["content"]["snapshot_id"],
+                },
+            )
+        self.assertEqual(
+            [], list((self.root / "tmp" / "candidate-probes").iterdir())
+        )
+        self.assertEqual(
+            state_before,
+            {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (self.root / "state").glob("*.sqlite3")
+            },
+        )
 
     def _activate(self, release_id: str) -> None:
         release = self.releases[release_id]

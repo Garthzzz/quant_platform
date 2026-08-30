@@ -6,7 +6,6 @@ from quant_hub.archive.database import initialize_archive_database
 from quant_hub.research_workspace import ResearchWorkspace
 from quant_hub.research_workspace.database import research_workspace_connection
 from quant_hub.research_workspace.store import (
-    backup_research_workspace_store,
     research_workspace_store_state,
 )
 from quant_hub.platform.db import connect_database
@@ -443,10 +442,3 @@ class ResearchWorkspaceTests(SettingsTestCase):
         # preserved even when the new release has not yet reconciled its subject ID.
         self.assertEqual(node_id, restored_node_id)
         self.assertEqual(1, len(service_after_update.list_comments(node_id)))
-        backup = backup_research_workspace_store(
-            self.settings,
-            self.project / "persistent_data" / "backups",
-            database_path=external,
-        )
-        self.assertIsNotNone(backup)
-        self.assertTrue(backup.is_file())

@@ -54,28 +54,56 @@ jobs:
             "tests.test_release_inventory",
             "tests.test_release_builder",
             "tests.test_release_identity",
+            "tests.test_local_release_identity",
+            "tests.test_local_runtime_evidence",
+            "tests.test_local_deployment_runtime",
+            "tests.test_local_exact_release_compatibility",
+            "tests.test_local_runtime_qualification",
+            "tests.test_local_runtime_qualification_evidence",
+            "tests.test_local_exact_runtime_tooling",
+            "tests.test_local_exact_runtime_tooling_scanner",
+            "tests.test_local_exact_runtime_import_closure",
+            "tests.test_local_exact_runtime_controller_tooling_observer",
+            "tests.test_local_exact_runtime_canary_input",
+            "tests.test_local_exact_runtime_canary_evidence",
+            "tests.test_local_exact_runtime_canary_observer",
+            "tests.test_local_exact_runtime_canary_live_observer",
+            "tests.test_local_exact_runtime_canary_runner",
+            "tests.test_local_exact_runtime_admission",
+            "tests.test_local_exact_runtime_entry",
+            "tests.test_local_exact_runtime_server",
+            "tests.test_local_exact_runtime_process",
+            "tests.test_local_windows_job_child_launcher",
+            "tests.test_local_windows_exact_runtime_process_fence",
+            "tests.test_local_windows_endpoint_evidence",
+            "tests.test_local_windows_endpoint_observer",
+            "tests.test_local_windows_scm_process_observer",
+            "tests.test_local_exact_deployment_controller",
+            "tests.test_local_service_transient_journal_start_fence",
+            "tests.test_local_windows_scm_process_evidence",
+            "tests.test_local_windows_writer_lease_holder",
+            "tests.test_local_windows_writer_lease_evidence",
+            "tests.test_local_windows_writer_lease_tracking",
+            "tests.test_local_windows_writer_lease_observer",
+            "tests.test_local_steady_runtime_identity",
+            "tests.test_local_steady_admission_authorization",
+            "tests.test_local_steady_exact_runtime_server",
+            "tests.test_local_steady_service_bootstrap",
+            "tests.test_local_steady_windows_writer_lease_holder",
+            "tests.test_local_steady_windows_writer_lease_evidence",
+            "tests.test_local_deployment_persistence",
+            "tests.test_local_product_surface",
+            "tests.test_wheel_build_clean",
             "tests.test_sqlite_checkpoint",
-            "tests.test_checkpoint_cli",
-            "tests.test_state_only_backup",
-            "tests.test_stage_closure",
-            "tests.test_failure_domain",
-            "tests.test_failure_domain_cli",
-            "tests.test_failure_domain_rotation",
-            "tests.test_production_host_facts_cli",
             "tests.test_vm_boundary",
             "tests.test_vm_bootstrap_cli",
-            "tests.test_recovery_bundle",
-            "tests.test_cold_bundle_cli",
-            "tests.test_cold_restore_cli",
             "tests.test_deployment_controller",
             "tests.test_publish_cli",
             "tests.test_publish_adapters",
             "tests.test_publish_runtime",
-            "tests.test_operational_source_cli",
             "tests.test_vm_deploy_cli",
             "tests.test_windows_service",
             "tests.test_writer_handoff",
-            "tests.test_writer_handoff_client",
             "tests.test_knowledge_reference_compiler",
             "tests.test_knowledge_semantic",
             "tests.test_knowledge_semantic_partition_provider",
@@ -237,29 +265,39 @@ jobs:
           if ($entries -notcontains "quant_hub/generic_research/static/generic-comments.js") {
             throw "wheel is missing the generic comment client"
           }
-          if ($entries -notcontains "quant_hub/ops/operational_source_cli.py") {
-            throw "wheel is missing the fixed operational source CLI"
-          }
-          if ($entries -notcontains "quant_hub/ops/production_host_facts_cli.py") {
-            throw "wheel is missing the fixed production host facts CLI"
-          }
-          if ($entries -notcontains "quant_hub/ops/state_only_backup.py") {
-            throw "wheel is missing the state-only recovery job"
-          }
-          if ($entries -notcontains "quant_hub/ops/stage_closure.py") {
-            throw "wheel is missing the Stage 5/6 closure verifier"
-          }
-          if ($entries -notcontains "quant_hub/ops/failure_domain_authority.py") {
-            throw "wheel is missing the failure-domain authority gate"
-          }
-          if ($entries -notcontains "quant_hub/ops/failure_domain_rotation.py") {
-            throw "wheel is missing the failure-domain rotation diagnostics"
-          }
           if ($entries -notcontains "quant_hub/ops/writer_handoff.py") {
             throw "wheel is missing the fixed C-to-D writer handoff"
           }
-          if ($entries -notcontains "quant_hub/ops/writer_handoff_client.py") {
-            throw "wheel is missing the off-host writer handoff client"
+          foreach ($requiredDeploymentModule in @(
+            "quant_hub/ops/local_exact_deployment_controller.py",
+            "quant_hub/ops/local_deployment_persistence.py",
+            "quant_hub/ops/local_deployment_runtime.py",
+            "quant_hub/ops/local_release_identity.py",
+            "quant_hub/ops/vm_bootstrap_cli.py",
+            "quant_hub/ops/vm_deploy_cli.py"
+          )) {
+            if ($entries -notcontains $requiredDeploymentModule) {
+              throw "wheel is missing exact deployment module: $requiredDeploymentModule"
+            }
+          }
+          $removedLeafModules = @(
+            "quant_hub/ops/cold_bundle_cli.py",
+            "quant_hub/ops/cold_restore_cli.py",
+            "quant_hub/ops/failure_domain.py",
+            "quant_hub/ops/failure_domain_authority.py",
+            "quant_hub/ops/failure_domain_rotation.py",
+            "quant_hub/ops/operational_source_cli.py",
+            "quant_hub/ops/publish_recovery_cli.py",
+            "quant_hub/ops/production_host_facts_cli.py",
+            "quant_hub/ops/recovery_bundle.py",
+            "quant_hub/ops/stage_closure.py",
+            "quant_hub/ops/state_only_backup.py",
+            "quant_hub/ops/writer_handoff_client.py"
+          )
+          foreach ($removedLeafModule in $removedLeafModules) {
+            if ($entries -contains $removedLeafModule) {
+              throw "wheel still contains a cancelled deployment leaf: $removedLeafModule"
+            }
           }
           if ($entries -notcontains "quant_hub/ops/semantic_authority.py") {
             throw "wheel is missing the semantic authority operator"
@@ -278,29 +316,25 @@ jobs:
           if (($entryPoints -join "`n") -notmatch "qrh-publish = quant_hub\.ops\.publish:main") {
             throw "wheel is missing the qrh-publish entrypoint"
           }
-          if (($entryPoints -join "`n") -notmatch "qrh-cold-bundle = quant_hub\.ops\.cold_bundle_cli:main") {
-            throw "wheel is missing the qrh-cold-bundle entrypoint"
-          }
-          if (($entryPoints -join "`n") -notmatch "qrh-cold-restore = quant_hub\.ops\.cold_restore_cli:main") {
-            throw "wheel is missing the qrh-cold-restore entrypoint"
-          }
-          if (($entryPoints -join "`n") -notmatch "qrh-operational-source = quant_hub\.ops\.operational_source_cli:main") {
-            throw "wheel is missing the qrh-operational-source entrypoint"
-          }
-          if (($entryPoints -join "`n") -notmatch "qrh-production-host-facts = quant_hub\.ops\.production_host_facts_cli:main") {
-            throw "wheel is missing the qrh-production-host-facts entrypoint"
-          }
-          if (($entryPoints -join "`n") -notmatch "qrh-failure-domain = quant_hub\.ops\.failure_domain_rotation:main") {
-            throw "wheel is missing the qrh-failure-domain entrypoint"
-          }
-          if (($entryPoints -join "`n") -notmatch "qrh-state-only-backup = quant_hub\.ops\.state_only_backup:main") {
-            throw "wheel is missing the qrh-state-only-backup entrypoint"
-          }
           if (($entryPoints -join "`n") -notmatch "qrh-writer-handoff = quant_hub\.ops\.writer_handoff:main") {
             throw "wheel is missing the qrh-writer-handoff entrypoint"
           }
-          if (($entryPoints -join "`n") -notmatch "qrh-writer-handoff-client = quant_hub\.ops\.writer_handoff_client:main") {
-            throw "wheel is missing the qrh-writer-handoff-client entrypoint"
+          if (($entryPoints -join "`n") -notmatch "qrh-vm-bootstrap = quant_hub\.ops\.vm_bootstrap_cli:main") {
+            throw "wheel is missing the qrh-vm-bootstrap entrypoint"
+          }
+          $removedEntryPoints = @(
+            "qrh-cold-bundle",
+            "qrh-cold-restore",
+            "qrh-production-host-facts",
+            "qrh-failure-domain",
+            "qrh-operational-source",
+            "qrh-state-only-backup",
+            "qrh-writer-handoff-client"
+          )
+          foreach ($removedEntryPoint in $removedEntryPoints) {
+            if (($entryPoints -join "`n") -match "(?m)^$([regex]::Escape($removedEntryPoint))\s*=") {
+              throw "wheel still exports a cancelled entrypoint: $removedEntryPoint"
+            }
           }
           if (($entryPoints -join "`n") -notmatch "qrh-semantic-authority = quant_hub\.ops\.semantic_authority:main") {
             throw "wheel is missing the qrh-semantic-authority entrypoint"
@@ -323,7 +357,7 @@ jobs:
           }
           foreach ($module in @(
             "quant_hub.ops.writer_handoff",
-            "quant_hub.ops.writer_handoff_client"
+            "quant_hub.ops.vm_bootstrap_cli"
           )) {
             & $venvPython -I -B -m $module --help | Out-Null
             if ($LASTEXITCODE -ne 0) {
@@ -332,7 +366,7 @@ jobs:
           }
           foreach ($entrypoint in @(
             "qrh-writer-handoff.exe",
-            "qrh-writer-handoff-client.exe"
+            "qrh-vm-bootstrap.exe"
           )) {
             $command = Join-Path $venvRoot "Scripts\$entrypoint"
             if (-not (Test-Path -LiteralPath $command -PathType Leaf)) {

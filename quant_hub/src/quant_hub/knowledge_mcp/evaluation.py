@@ -46,7 +46,7 @@ ACCEPTANCE_FAKE_DISPATCH_SCHEMA = "qrh-mcp-fake-dispatch-receipt/v1"
 class CodexToolTrace:
     """Sanitized projection of a real ``codex exec --json`` trace.
 
-    Full model output stays in ignored/off-host evidence.  The evaluator only
+    Full model output stays in ignored local evaluation evidence.  The evaluator only
     needs completed calls for the named server, completion state, and the final
     response; it never copies prompts or unrelated tool payloads into Git.
     """

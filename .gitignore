@@ -34,7 +34,7 @@
 *.tmp
 *.bak
 
-# Databases, sidecars, dumps and recovery material.
+# Databases, sidecars, dumps and transient runtime material.
 *.db
 *.db-*
 *.sqlite
@@ -77,4 +77,3 @@ Thumbs.db
 /content_store/
 /releases/
 /incoming/
-/recovery/

@@ -21,16 +21,12 @@ PRODUCTION_WRITE_AREAS = frozenset(
         "releases",
         "control",
         "state",
-        "backups",
         "audit",
+        "locks",
         "logs",
         "tmp",
         "checkout",
         "tooling",
-        # Cold recovery bundles historically name the immutable restore
-        # payload directory ``tools``.  It is retained as an explicit alias,
-        # not as an unrestricted top-level write namespace.
-        "tools",
     }
 )
 VM_WRITE_AUDIT_SCHEMA = "qrh-production-vm-write-audit/v1"
@@ -38,6 +34,39 @@ VM_WRITE_AUDIT_SCHEMA = "qrh-production-vm-write-audit/v1"
 
 class VMBoundaryError(RuntimeError):
     pass
+
+
+def reject_test_only_path_on_production_vm(
+    path: Path, *, label: str = "test-only path"
+) -> None:
+    """Fail before mutation when a test adapter resolves anywhere inside D root."""
+
+    raw = PureWindowsPath(os.path.normpath(str(path)))
+    candidates = [raw]
+    try:
+        candidates.append(
+            PureWindowsPath(os.path.normpath(str(path.resolve(strict=False))))
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            candidate.relative_to(PRODUCTION_VM_ROOT)
+        except ValueError:
+            continue
+        raise VMBoundaryError(
+            f"{label} cannot target production D root or a descendant/alias"
+        )
+    production = Path(str(PRODUCTION_VM_ROOT))
+    try:
+        if path.exists() and production.exists() and os.path.samefile(
+            path, production
+        ):
+            raise VMBoundaryError(
+                f"{label} cannot target production D root or a descendant/alias"
+            )
+    except OSError:
+        return
 
 
 def validate_production_vm_write_path(
@@ -100,7 +129,7 @@ def validate_vm_write_set(values: Iterable[str | PureWindowsPath]) -> tuple[str,
 def declared_production_vm_write_set() -> Mapping[str, str]:
     """Return the complete top-level production write namespace.
 
-    Individual release/checkpoint IDs remain dynamic, but no production code
+    Individual release and transient-attempt IDs remain dynamic, but no production code
     may introduce another top-level target without changing this reviewed
     contract and its tests.
     """
@@ -240,6 +269,7 @@ __all__ = [
     "capture_vm_write_snapshot",
     "declared_production_vm_write_set",
     "finalize_vm_write_audit",
+    "reject_test_only_path_on_production_vm",
     "validate_production_vm_write_path",
     "validate_vm_write_set",
     "verify_existing_vm_write_path",

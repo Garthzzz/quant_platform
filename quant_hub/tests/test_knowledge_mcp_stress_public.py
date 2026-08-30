@@ -67,12 +67,6 @@ def _release(release_id: str, snapshot_id: str, artifact: bytes) -> dict[str, ob
                 "workspace": {"read": [1], "write": [1]},
             }
         },
-        "recovery": {
-            "compatibility": {
-                "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                "restore_protocol_versions": ["qrh-restore/v1"],
-            }
-        },
     }
 
 

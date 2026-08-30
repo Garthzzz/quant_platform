@@ -42,6 +42,7 @@ from .release_identity import (
     manifest_sha256,
     validate_release_manifest,
 )
+from . import local_release_identity as local_identity
 
 
 INVENTORY_SCHEMA = "qrh-release-file-inventory/v1"
@@ -289,6 +290,14 @@ def seal_knowledge_release(
         citation_overlay_manifest_path=citation_overlay_manifest_path,
         evidence_migration_root=evidence_migration_root,
     )
+    if (
+        prepared.manifest_without_inventory.get("schema_version")
+        == local_identity.RELEASE_MANIFEST_SCHEMA
+    ):
+        return seal_exact_release(
+            candidate_root=prepared.root,
+            manifest_without_inventory=prepared.manifest_without_inventory,
+        )
     return seal_release(
         candidate_root=prepared.root,
         manifest_without_inventory=prepared.manifest_without_inventory,
@@ -310,6 +319,98 @@ def build_file_inventory(candidate_root: Path) -> dict[str, object]:
             for path, facts in sorted(state.items())
         ],
     }
+
+
+def build_exact_file_inventory(candidate_root: Path) -> dict[str, object]:
+    """Build the Windows-safe v2 inventory used by local active/prior."""
+
+    inventory = build_file_inventory(candidate_root)
+    inventory["schema_version"] = "qrh-release-file-inventory/v2"
+    return inventory
+
+
+def seal_exact_release(
+    *, candidate_root: Path, manifest_without_inventory: Mapping[str, object]
+) -> SealedRelease:
+    """Seal an immutable v2 release consumable by the exact VM controller."""
+
+    root = Path(candidate_root).resolve(strict=True)
+    manifest_path = root / "release_manifest.json"
+    if manifest_path.exists():
+        raise ReleaseBuildError("immutable release manifest already exists")
+    manifest = _manifest_copy(manifest_without_inventory)
+    if (
+        manifest.get("schema_version") != local_identity.RELEASE_MANIFEST_SCHEMA
+        or "inventory" in manifest
+    ):
+        raise ReleaseBuildError("exact manifest input must be inventory-free v2")
+    inventory = build_exact_file_inventory(root)
+    resources = manifest.get("resources")
+    content = manifest.get("content")
+    if not isinstance(resources, dict) or not isinstance(content, dict):
+        raise ReleaseBuildError("exact manifest resources/content must be objects")
+    inventory_hash = local_identity.identity_sha256(inventory)
+    if resources.get("inventory_sha256") not in {None, inventory_hash}:
+        raise ReleaseBuildError(
+            "caller resource hash differs from exact candidate inventory"
+        )
+    resources["inventory_sha256"] = inventory_hash
+    content_hash_fields = {
+        "source_inventory_sha256",
+        "ir_sha256",
+        "knowledge_sha256",
+        "search_sha256",
+    }
+    if any(type(content.get(field)) is not str for field in content_hash_fields):
+        raise ReleaseBuildError("exact knowledge component hashes are incomplete")
+    page_projection = local_identity.identity_sha256(
+        {
+            "schema_version": "qrh-page-projection-input/v1",
+            "snapshot_id": content.get("snapshot_id"),
+            "source_inventory_sha256": content["source_inventory_sha256"],
+            "ir_sha256": content["ir_sha256"],
+            "knowledge_sha256": content["knowledge_sha256"],
+            "presentation": content.get("presentation"),
+        }
+    )
+    if content.get("page_projection_sha256") not in {None, page_projection}:
+        raise ReleaseBuildError("page projection input identity differs")
+    content["page_projection_sha256"] = page_projection
+    if content.get("mcp_sha256") not in {None, content["search_sha256"]}:
+        raise ReleaseBuildError("MCP identity differs from the sealed search artifact")
+    content["mcp_sha256"] = content["search_sha256"]
+    manifest["inventory"] = inventory
+    try:
+        validated = local_identity.validate_release_manifest(manifest)
+    except (TypeError, ValueError) as error:
+        raise ReleaseBuildError(
+            "exact release manifest violates the v2 identity contract"
+        ) from error
+    payload = local_identity.canonical_bytes(validated)
+    temporary = root / f".release_manifest.partial-{uuid4().hex}"
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, manifest_path)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    confirmed = local_identity.validate_release_manifest(written)
+    if local_identity.canonical_bytes(confirmed) != payload:
+        raise ReleaseBuildError("exact release manifest changed while sealing")
+    files = inventory["files"]
+    assert isinstance(files, list)
+    return SealedRelease(
+        root=root,
+        release_id=str(confirmed["release_id"]),
+        manifest_sha256=local_identity.identity_sha256(confirmed),
+        file_count=len(files),
+        total_bytes=sum(int(item["bytes"]) for item in files),
+    )
 
 
 def seal_release(
@@ -396,7 +497,9 @@ __all__ = [
     "PreparedKnowledgeSearch",
     "SealedRelease",
     "build_file_inventory",
+    "build_exact_file_inventory",
     "prepare_knowledge_search",
     "seal_knowledge_release",
+    "seal_exact_release",
     "seal_release",
 ]

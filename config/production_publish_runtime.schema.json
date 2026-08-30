@@ -9,7 +9,7 @@
     "git_remote", "runtime_base", "runtime_base_manifest_sha256",
     "reference_archive_root", "code_source_relative_path", "code_overlay_relative_path",
     "launcher_relative_path", "required_runtime_paths", "resource_overlays",
-    "github", "vm", "recovery"
+    "github", "vm"
   ],
   "properties": {
     "schema_version": {"const": "qrh-production-publish-runtime/v1"},
@@ -75,20 +75,6 @@
         "ssh_alias": {"type": "string"},
         "target_address": {"const": "10.5.1.240"},
         "root": {"const": "D:\\quant\\quant_platform"}
-      }
-    },
-    "recovery": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["root", "failure_domain_attestation", "attestation_max_age_seconds", "state_authority_id", "restore_tool", "runbook", "operational_root"],
-      "properties": {
-        "root": {"type": "string"},
-        "failure_domain_attestation": {"type": "string"},
-        "attestation_max_age_seconds": {"type": "integer", "minimum": 60, "maximum": 2678400},
-        "state_authority_id": {"type": "string"},
-        "restore_tool": {"type": "string"},
-        "runbook": {"type": "string"},
-        "operational_root": {"type": "string"}
       }
     }
   }

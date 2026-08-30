@@ -51,12 +51,6 @@ def _manifest(snapshot_id: str) -> dict[str, object]:
         },
         "resources": {},
         "state": {"compatibility": {"comments": {"read": [2], "write": [2]}}},
-        "recovery": {
-            "compatibility": {
-                "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                "restore_protocol_versions": ["qrh-restore/v1"],
-            }
-        },
     }
 
 

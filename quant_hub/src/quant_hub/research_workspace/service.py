@@ -1996,13 +1996,15 @@ class ResearchWorkspace:
                 prior_revision = int(node["revision"])
                 next_revision = prior_revision
                 next_revision += 1
-                connection.execute(
+                node_updated = connection.execute(
                     """
                     UPDATE research_workspace_node SET updated_at=?,revision=?
-                    WHERE node_id=?
+                    WHERE node_id=? AND revision=?
                     """,
-                    (now, next_revision, node_id),
+                    (now, next_revision, node_id, prior_revision),
                 )
+                if type(node_updated.rowcount) is not int or node_updated.rowcount != 1:
+                    raise RuntimeError("研究节点 revision CAS 未更新恰一行")
                 self._event(
                     connection,
                     node_id=node_id,
@@ -2104,26 +2106,57 @@ class ResearchWorkspace:
                 old_hash = sha256_hex(str(row["body"]).encode("utf-8"))
                 next_comment_revision = expected_revision + 1
                 if delete:
-                    connection.execute(
+                    comment_updated = connection.execute(
                         """
                         UPDATE research_workspace_comment
-                        SET updated_at=?,revision=?,deleted_at=? WHERE comment_id=?
+                        SET updated_at=?,revision=?,deleted_at=?
+                        WHERE comment_id=? AND revision=? AND deleted_at IS NULL
                         """,
-                        (now, next_comment_revision, now, comment_id),
+                        (
+                            now,
+                            next_comment_revision,
+                            now,
+                            comment_id,
+                            expected_revision,
+                        ),
                     )
                     new_hash = None
                     event_type = "delete"
                 else:
                     assert normalized is not None
-                    connection.execute(
+                    comment_updated = connection.execute(
                         """
                         UPDATE research_workspace_comment
-                        SET body=?,updated_at=?,revision=? WHERE comment_id=?
+                        SET body=?,updated_at=?,revision=?
+                        WHERE comment_id=? AND revision=? AND deleted_at IS NULL
                         """,
-                        (normalized, now, next_comment_revision, comment_id),
+                        (
+                            normalized,
+                            now,
+                            next_comment_revision,
+                            comment_id,
+                            expected_revision,
+                        ),
                     )
                     new_hash = sha256_hex(normalized.encode("utf-8"))
                     event_type = "update"
+                if (
+                    type(comment_updated.rowcount) is not int
+                    or comment_updated.rowcount != 1
+                ):
+                    outcome = WorkspaceCommandOutcome(
+                        False,
+                        409,
+                        error_code="revision_conflict",
+                        error_message="评论已被其他写入更新，请刷新后重试。",
+                    )
+                    return self._record(
+                        connection,
+                        command=command,
+                        idempotency_key=idempotency_key,
+                        payload_hash=digest,
+                        outcome=outcome,
+                    )
                 connection.execute(
                     """
                     INSERT INTO research_workspace_comment_event(
@@ -2139,13 +2172,20 @@ class ResearchWorkspace:
                 prior_node_revision = int(node["revision"])
                 next_node_revision = prior_node_revision
                 next_node_revision += 1
-                connection.execute(
+                node_updated = connection.execute(
                     """
                     UPDATE research_workspace_node SET updated_at=?,revision=?
-                    WHERE node_id=?
+                    WHERE node_id=? AND revision=?
                     """,
-                    (now, next_node_revision, row["node_id"]),
+                    (
+                        now,
+                        next_node_revision,
+                        row["node_id"],
+                        prior_node_revision,
+                    ),
                 )
+                if type(node_updated.rowcount) is not int or node_updated.rowcount != 1:
+                    raise RuntimeError("研究节点 revision CAS 未更新恰一行")
                 self._event(
                     connection,
                     node_id=str(row["node_id"]),

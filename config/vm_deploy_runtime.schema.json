@@ -48,12 +48,12 @@
     "write_paths": {
       "description": "Closed production VM write namespace; runtime validation requires exact equality with production_vm_write_set.json.",
       "type": "array",
-      "minItems": 11,
-      "maxItems": 11,
+      "minItems": 10,
+      "maxItems": 10,
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "pattern": "^D:\\\\quant\\\\quant_platform\\\\(audit|backups|checkout|control|incoming|logs|releases|state|tmp|tooling|tools)$"
+        "pattern": "^D:\\\\quant\\\\quant_platform\\\\(audit|checkout|control|incoming|locks|logs|releases|state|tmp|tooling)$"
       }
     }
   }

@@ -4,7 +4,7 @@
 
 ## 1. 编译 workspace
 
-`qrh-knowledge-compile` 只处理 source/IR identity 发生变化且 `external_ai_allowed=true` 的版本。compiler workspace 必须位于 Git 外受保护状态根；API credential 只通过 keyring 或受保护环境变量在请求时注入，不进入命令行、日志、manifest、candidate 或 recovery bundle。
+`qrh-knowledge-compile` 只处理 source/IR identity 发生变化且 `external_ai_allowed=true` 的版本。compiler workspace 必须位于 Git 外受保护状态根；API credential 只通过 keyring 或受保护环境变量在请求时注入，不进入命令行、日志、manifest、candidate 或发布产物。
 
 常用操作依次为 `plan`、`execute-one`、`review`、`accept/reject` 和显式 `targeted`。所有 job 必须 terminal；整体 wall-clock deadline 由 immutable `part_count` 派生，provider/socket timeout 不能替代父进程 watchdog。
 

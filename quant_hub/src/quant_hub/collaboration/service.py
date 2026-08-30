@@ -717,20 +717,42 @@ class ArchiveCollaboration:
             next_revision = expected_revision + 1
             old_hash = sha256_hex(str(row["body"]).encode("utf-8"))
             if delete:
-                connection.execute(
-                    "UPDATE comment SET updated_at=?,revision=?,deleted_at=? WHERE comment_id=?",
-                    (now, next_revision, now, comment_id),
+                updated = connection.execute(
+                    """
+                    UPDATE comment SET updated_at=?,revision=?,deleted_at=?
+                    WHERE comment_id=? AND revision=? AND deleted_at IS NULL
+                    """,
+                    (now, next_revision, now, comment_id, expected_revision),
                 )
                 new_hash = None
                 event_type = "delete"
             else:
                 assert body is not None
-                connection.execute(
-                    "UPDATE comment SET body=?,updated_at=?,revision=? WHERE comment_id=?",
-                    (body, now, next_revision, comment_id),
+                updated = connection.execute(
+                    """
+                    UPDATE comment SET body=?,updated_at=?,revision=?
+                    WHERE comment_id=? AND revision=? AND deleted_at IS NULL
+                    """,
+                    (body, now, next_revision, comment_id, expected_revision),
                 )
                 new_hash = sha256_hex(body.encode("utf-8"))
                 event_type = "update"
+            if type(updated.rowcount) is not int or updated.rowcount != 1:
+                return self._record(
+                    connection,
+                    idempotency_key=idempotency_key,
+                    command_name=command,
+                    payload_hash=digest,
+                    request_payload=payload,
+                    aggregate_urn=f"qrh:comment:{comment_id}",
+                    actor_id=actor_id,
+                    outcome=CommandOutcome(
+                        False,
+                        409,
+                        error_code="revision_conflict",
+                        error_message="评论已被其他写入更新。",
+                    ),
+                )
             connection.execute(
                 """
                 INSERT INTO comment_event(

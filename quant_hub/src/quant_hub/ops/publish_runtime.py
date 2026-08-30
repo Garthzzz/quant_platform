@@ -18,6 +18,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Callable, Mapping, Protocol, Sequence
 from uuid import uuid4
 
@@ -29,7 +30,6 @@ from quant_hub.knowledge.semantic import (
     build_enriched_snapshot,
 )
 from quant_hub.runtime_seal import safe_tree_file_state
-from quant_hub.collaboration.checkpoint import verify_sqlite_checkpoint
 from quant_hub.generic_research.release import (
     KNOWLEDGE_ARTIFACT_PATH,
     SNAPSHOT_ARTIFACT_PATH,
@@ -72,11 +72,9 @@ from .publish_adapters import (
     verified_d_tooling_python_script,
     _subprocess_runner as _remote_subprocess_runner,
 )
-from .failure_domain_authority import require_failure_domain_authority
-from .failure_domain import rebuild_legacy_attestation_diagnostic
-from .recovery_bundle import build_recovery_bundle, verify_recovery_bundle
 from .release_builder import seal_knowledge_release
 from .release_identity import manifest_sha256, validate_release_manifest
+from . import local_release_identity as local_identity
 
 
 RUNTIME_CONFIG_SCHEMA = "qrh-production-publish-runtime/v1"
@@ -87,22 +85,31 @@ class PublishRuntimeError(PublishError):
     pass
 
 
+def _validate_candidate_release(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict) and value.get("schema_version") == (
+        local_identity.RELEASE_MANIFEST_SCHEMA
+    ):
+        return local_identity.validate_release_manifest(value)
+    return validate_release_manifest(value)
+
+
+def _candidate_manifest_sha256(value: Mapping[str, object]) -> str:
+    if value.get("schema_version") == local_identity.RELEASE_MANIFEST_SCHEMA:
+        return local_identity.identity_sha256(value)
+    return manifest_sha256(value)
+
+
+def _candidate_inventory_sha256(value: Mapping[str, object]) -> str:
+    if value.get("schema_version") == "qrh-release-file-inventory/v2":
+        return local_identity.identity_sha256(value)
+    return manifest_sha256(value)
+
+
 @dataclass(frozen=True)
 class ResourceOverlayConfig:
     logical_name: str
     source_path: Path
     target_relative_path: str
-
-
-@dataclass(frozen=True)
-class RecoveryRuntimeConfig:
-    recovery_root: Path
-    attestation_path: Path
-    attestation_max_age_seconds: int
-    state_authority_id: str
-    restore_tool: Path
-    runbook: Path
-    operational_root: Path
 
 
 @dataclass(frozen=True)
@@ -121,7 +128,6 @@ class RuntimePublishConfig:
     resource_overlays: tuple[ResourceOverlayConfig, ...]
     github: GitHubCIConfig
     vm: VMConfig
-    recovery: RecoveryRuntimeConfig
 
     @classmethod
     def parse(cls, value: object) -> "RuntimePublishConfig":
@@ -131,7 +137,7 @@ class RuntimePublishConfig:
             "reference_archive_root", "code_source_relative_path",
             "code_overlay_relative_path",
             "launcher_relative_path", "required_runtime_paths", "resource_overlays",
-            "github", "vm", "recovery",
+            "github", "vm",
         }
         if not isinstance(value, dict) or set(value) != fields:
             raise PublishRuntimeError("publish runtime config schema is not closed")
@@ -225,36 +231,18 @@ class RuntimePublishConfig:
                 "vm": value["vm"],
             }
         )
-        raw_recovery = value["recovery"]
-        recovery_fields = {
-            "root", "failure_domain_attestation", "attestation_max_age_seconds",
-            "state_authority_id", "restore_tool", "runbook", "operational_root",
-        }
-        if not isinstance(raw_recovery, dict) or set(raw_recovery) != recovery_fields:
-            raise PublishRuntimeError("recovery runtime config is not closed")
-        recovery_paths = {
-            key: Path(str(raw_recovery[key]))
-            for key in (
-                "root", "failure_domain_attestation", "restore_tool", "runbook",
-                "operational_root",
-            )
-        }
-        if any(not path.is_absolute() for path in recovery_paths.values()):
-            raise PublishRuntimeError("recovery paths must be absolute")
         project_resolved = paths["project_root"].resolve()
         mutable_roots = (
             paths["state_root"].resolve(),
             paths["candidate_root"].resolve(),
-            recovery_paths["root"].resolve(),
         )
         source_roots = (
             runtime_base.resolve(),
             archive_root.resolve(),
             *(source.source_path.resolve() for source in sources),
-            recovery_paths["operational_root"].resolve(),
         )
         if any(root == project_resolved or root.is_relative_to(project_resolved) for root in mutable_roots):
-            raise PublishRuntimeError("mutable publish/recovery roots must stay outside Git")
+            raise PublishRuntimeError("mutable publish roots must stay outside Git")
         if any(
             mutable == source
             or mutable.is_relative_to(source)
@@ -262,17 +250,7 @@ class RuntimePublishConfig:
             for mutable in mutable_roots
             for source in source_roots
         ):
-            raise PublishRuntimeError("mutable publish/recovery root overlaps a read-only source")
-        max_age = raw_recovery["attestation_max_age_seconds"]
-        authority = raw_recovery["state_authority_id"]
-        if (
-            not isinstance(max_age, int)
-            or isinstance(max_age, bool)
-            or not 60 <= max_age <= 31 * 86400
-            or not isinstance(authority, str)
-            or _NAME.fullmatch(authority) is None
-        ):
-            raise PublishRuntimeError("recovery policy is invalid")
+            raise PublishRuntimeError("mutable publish root overlaps a read-only source")
         return cls(
             project_root=paths["project_root"],
             state_root=paths["state_root"],
@@ -288,15 +266,6 @@ class RuntimePublishConfig:
             resource_overlays=tuple(sources),
             github=transport.github,
             vm=transport.vm,
-            recovery=RecoveryRuntimeConfig(
-                recovery_root=recovery_paths["root"],
-                attestation_path=recovery_paths["failure_domain_attestation"],
-                attestation_max_age_seconds=max_age,
-                state_authority_id=authority,
-                restore_tool=recovery_paths["restore_tool"],
-                runbook=recovery_paths["runbook"],
-                operational_root=recovery_paths["operational_root"],
-            ),
         )
 
     @classmethod
@@ -350,437 +319,6 @@ class EnvironmentSecretProvider:
         return SecretValue(value) if value else None
 
 
-class RecoveryProtector(Protocol):
-    def preflight(self) -> None: ...
-
-    def protect(
-        self,
-        *,
-        material: ReleaseMaterial,
-        publish_candidate_sha256: str,
-    ) -> ActivationAuthorization: ...
-
-
-class UnavailableRecoveryProtector:
-    """Fail closed when production recovery assembly was not supplied."""
-
-    def preflight(self) -> None:
-        raise PublishRuntimeError(
-            "activation recovery protector is unavailable; candidate_only remains permitted"
-        )
-
-    def protect(self, **_: object) -> ActivationAuthorization:
-        raise PublishRuntimeError(
-            "activation recovery protector is unavailable; candidate_only remains permitted"
-        )
-
-
-class RecoveryProtectionActions(Protocol):
-    def capture_checkpoint(self, *, material: ReleaseMaterial) -> Path: ...
-
-    def register_protection(
-        self,
-        *,
-        material: ReleaseMaterial,
-        publish_candidate_sha256: str,
-        bundle_root: Path,
-        recovery_manifest_sha256: str,
-        checkpoint_root: Path,
-    ) -> ActivationAuthorization: ...
-
-
-class UnavailableRecoveryActions:
-    def capture_checkpoint(self, **_: object) -> Path:
-        raise PublishRuntimeError("production checkpoint capture adapter is unavailable")
-
-    def register_protection(self, **_: object) -> ActivationAuthorization:
-        raise PublishRuntimeError("production recovery receipt registrar is unavailable")
-
-
-class OpenSSHRecoveryActions:
-    """Fixed OpenSSH/SCP C capture and protection-receipt registration."""
-
-    def __init__(
-        self,
-        runtime: RuntimePublishConfig,
-        *,
-        command_runner: Callable[[Sequence[str]], CommandResult] = _remote_subprocess_runner,
-        vm_backend: OpenSSHVMBackend | None = None,
-        deployment_invoker: OpenSSHDeploymentInvoker | None = None,
-    ) -> None:
-        self.runtime = runtime
-        self.command_runner = command_runner
-        self.vm_backend = vm_backend or OpenSSHVMBackend(
-            runtime.vm, command_runner=command_runner
-        )
-        self.deployment_invoker = deployment_invoker or OpenSSHDeploymentInvoker(
-            runtime.vm, command_runner=command_runner
-        )
-
-    def _remote(self, arguments: Sequence[str]) -> Mapping[str, object]:
-        temporary_path = self.runtime.vm.root / "tmp" / "publish-recovery"
-        temporary = str(temporary_path)
-        ps_literal = lambda value: "'" + str(value).replace("'", "''") + "'"
-        rendered = ",".join(ps_literal(value) for value in arguments)
-        # Arguments are identity/path validated by callers and JSON quoted into
-        # a fixed EncodedCommand, never interpreted as source instructions.
-        script = (
-            ssh_target_guard_script(self.runtime.vm.target_address)
-            + OpenSSHVMBackend._ensure_directory_script(temporary_path)
-            + verified_d_tooling_python_script("publish_recovery_cli_module")
-            +
-            f"$tmp={ps_literal(temporary)};"
-            "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
-            f"$a=@({rendered});$o=& $python @a;"
-            "if($LASTEXITCODE-ne 0){throw 'publish_recovery_cli_failed'};"
-            "$o|Write-Output"
-        )
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
-        result = self.command_runner(
-            (
-                "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
-                "--", self.runtime.vm.ssh_alias, "powershell.exe", "-NoProfile",
-                "-NonInteractive", "-EncodedCommand", encoded,
-            )
-        )
-        if result.returncode != 0:
-            raise PublishRuntimeError("fixed VM recovery command failed")
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as error:
-            raise PublishRuntimeError("fixed VM recovery result is invalid") from error
-        if not isinstance(value, dict):
-            raise PublishRuntimeError("fixed VM recovery result must be an object")
-        return value
-
-    def capture_checkpoint(self, *, material: ReleaseMaterial) -> Path:
-        require_failure_domain_authority()
-        checkpoint_id = f"checkpoint-{material.release_manifest_sha256[:20]}-{uuid4().hex[:12]}"
-        return self.capture_state_only_checkpoint(
-            release_id=material.release_id,
-            release_manifest_sha256=material.release_manifest_sha256,
-            checkpoint_id=checkpoint_id,
-        )
-
-    def read_active_identity(self) -> Mapping[str, str]:
-        require_failure_domain_authority()
-        value = self._remote(
-            (
-                "-B", "-m", "quant_hub.ops.publish_recovery_cli",
-                "identify-active", "--vm-root", str(self.runtime.vm.root),
-            )
-        )
-        release_id = value.get("release_id")
-        release_hash = value.get("release_manifest_sha256")
-        if (
-            value.get("schema_version") != "qrh-state-only-active-identity/v1"
-            or not isinstance(release_id, str)
-            or _NAME.fullmatch(release_id) is None
-            or not isinstance(release_hash, str)
-            or re.fullmatch(r"[0-9a-f]{64}", release_hash) is None
-        ):
-            raise PublishRuntimeError("VM active recovery identity is invalid")
-        return {
-            "release_id": release_id,
-            "release_manifest_sha256": release_hash,
-        }
-
-    def capture_state_only_checkpoint(
-        self,
-        *,
-        release_id: str,
-        release_manifest_sha256: str,
-        checkpoint_id: str,
-    ) -> Path:
-        require_failure_domain_authority()
-        if (
-            _NAME.fullmatch(release_id) is None
-            or _NAME.fullmatch(checkpoint_id) is None
-            or re.fullmatch(r"[0-9a-f]{64}", release_manifest_sha256) is None
-        ):
-            raise PublishRuntimeError("state-only capture identity is invalid")
-        value = self._remote(
-            (
-                "-B", "-m", "quant_hub.ops.publish_recovery_cli", "capture",
-                "--vm-root", str(self.runtime.vm.root),
-                "--checkpoint-id", checkpoint_id,
-                "--state-authority-id", self.runtime.recovery.state_authority_id,
-            )
-        )
-        expected_root = PureWindowsPath(self.runtime.vm.root) / "tmp" / "publish-recovery" / "checkpoints" / checkpoint_id
-        if (
-            value.get("schema_version") != "qrh-publish-checkpoint-result/v1"
-            or value.get("checkpoint_id") != checkpoint_id
-            or PureWindowsPath(str(value.get("checkpoint_root"))) != expected_root
-        ):
-            raise PublishRuntimeError("VM checkpoint result identity/path differs")
-        intake = self.runtime.recovery.recovery_root / "checkpoint-intake"
-        intake.mkdir(parents=True, exist_ok=True)
-        ensure_no_reparse_components(intake)
-        destination = intake / checkpoint_id
-        if destination.exists():
-            raise PublishRuntimeError("local checkpoint intake identity already exists")
-        remote_source = (
-            f"{self.runtime.vm.ssh_alias}:"
-            + str(expected_root).replace("\\", "/")
-        )
-        copied = self.command_runner(
-            (
-                "scp", "-q", "-r", "-o", "BatchMode=yes", "-o",
-                "ConnectTimeout=20", "--", remote_source, str(intake),
-            )
-        )
-        if copied.returncode != 0 or not destination.is_dir():
-            raise PublishRuntimeError("VM checkpoint download failed")
-        report = verify_sqlite_checkpoint(destination)
-        if (
-            not report.valid
-            or report.checkpoint_id != checkpoint_id
-            or report.manifest_sha256 != value.get("checkpoint_manifest_sha256")
-        ):
-            raise PublishRuntimeError("downloaded checkpoint identity differs")
-        return destination
-
-    def cleanup_state_only_capture(self, *, checkpoint_id: str) -> None:
-        require_failure_domain_authority()
-        if _NAME.fullmatch(checkpoint_id) is None:
-            raise PublishRuntimeError("state-only cleanup checkpoint identity is invalid")
-        value = self._remote(
-            (
-                "-B", "-m", "quant_hub.ops.publish_recovery_cli",
-                "cleanup-capture", "--vm-root", str(self.runtime.vm.root),
-                "--checkpoint-id", checkpoint_id,
-            )
-        )
-        if (
-            value.get("schema_version") != "qrh-publish-checkpoint-cleanup/v1"
-            or value.get("checkpoint_id") != checkpoint_id
-        ):
-            raise PublishRuntimeError("VM checkpoint cleanup identity differs")
-
-    def register_protection(
-        self,
-        *,
-        material: ReleaseMaterial,
-        publish_candidate_sha256: str,
-        bundle_root: Path,
-        recovery_manifest_sha256: str,
-        checkpoint_root: Path,
-    ) -> ActivationAuthorization:
-        require_failure_domain_authority()
-        attempt_id = f"deploy-{publish_candidate_sha256[:24]}"
-        finalized = self.deployment_invoker.invoke(
-            vm_root=self.runtime.vm.root,
-            release_id=material.release_id,
-            release_manifest_sha256=material.release_manifest_sha256,
-            publish_candidate_sha256=publish_candidate_sha256,
-            deployment_mode="candidate_only",
-            deployment_attempt_id=None,
-            recovery_protection_receipt_id=None,
-        )
-        if finalized.get("status") != "candidate_validated":
-            raise PublishRuntimeError("candidate could not be finalized before protection")
-        checkpoint_manifest = checkpoint_root / "checkpoint_manifest.json"
-        recovery_manifest = bundle_root / "recovery_manifest.json"
-        attestation = self._verified_attestation()
-        evidence = {
-            "schema_version": "qrh-publish-recovery-protection-evidence/v1",
-            "release_id": material.release_id,
-            "release_manifest_sha256": material.release_manifest_sha256,
-            "publish_candidate_sha256": publish_candidate_sha256,
-            "checkpoint_manifest_sha256": hashlib.sha256(
-                checkpoint_manifest.read_bytes()
-            ).hexdigest(),
-            "recovery_manifest_sha256": recovery_manifest_sha256,
-            "failure_domain_attestation": attestation,
-            "bundle_verification": {
-                "closure": True,
-                "compatibility": True,
-                "no_secret": True,
-                "failure_domain": True,
-            },
-        }
-        staging = self.runtime.recovery.recovery_root / f".registration-{uuid4().hex}"
-        staging.mkdir()
-        try:
-            files = {
-                "checkpoint_manifest.json": checkpoint_manifest,
-                "recovery_manifest.json": recovery_manifest,
-            }
-            evidence_path = staging / "protection_evidence.json"
-            evidence_path.write_text(canonical_json(evidence), encoding="utf-8")
-            files["protection_evidence.json"] = evidence_path
-            remote_root = self.runtime.vm.root / "tmp" / "publish-recovery" / "registration" / attempt_id
-            self.vm_backend.ensure_directory(remote_root)
-            for name, source in files.items():
-                self.vm_backend.upload(source, remote_root / name)
-            value = self._remote(
-                (
-                    "-B", "-m", "quant_hub.ops.publish_recovery_cli", "register",
-                    "--vm-root", str(self.runtime.vm.root),
-                    "--release-id", material.release_id,
-                    "--release-manifest-sha256", material.release_manifest_sha256,
-                    "--publish-candidate-sha256", publish_candidate_sha256,
-                    "--deployment-attempt-id", attempt_id,
-                    "--checkpoint-manifest", str(remote_root / "checkpoint_manifest.json"),
-                    "--recovery-manifest", str(remote_root / "recovery_manifest.json"),
-                    "--protection-evidence", str(remote_root / "protection_evidence.json"),
-                )
-            )
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-        if (
-            value.get("schema_version") != "qrh-publish-protection-result/v1"
-            or value.get("deployment_attempt_id") != attempt_id
-            or value.get("release_manifest_sha256") != material.release_manifest_sha256
-            or value.get("recovery_manifest_sha256") != recovery_manifest_sha256
-        ):
-            raise PublishRuntimeError("VM recovery protection registration differs")
-        receipt_id = value.get("recovery_protection_receipt_id")
-        if not isinstance(receipt_id, str) or _NAME.fullmatch(receipt_id) is None:
-            raise PublishRuntimeError("VM recovery protection receipt ID is invalid")
-        return ActivationAuthorization(attempt_id, receipt_id)
-
-    def _verified_attestation(self) -> Mapping[str, object]:
-        # Reuse the exact preflight implementation, including freshness and
-        # recovery-root binding, immediately before receipt registration.
-        return RecoveryProtectionCoordinator(
-            self.runtime.recovery, actions=self
-        )._attestation()
-
-
-class RecoveryProtectionCoordinator:
-    """Build C/RM closure and return only a registered protection authorization."""
-
-    def __init__(
-        self,
-        config: RecoveryRuntimeConfig,
-        *,
-        actions: RecoveryProtectionActions,
-        now: Callable[[], datetime] = lambda: datetime.now(UTC),
-    ) -> None:
-        self.config = config
-        self.actions = actions
-        self.now = now
-
-    def _attestation(self) -> Mapping[str, object]:
-        require_failure_domain_authority()
-        try:
-            value = json.loads(self.config.attestation_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise PublishRuntimeError("failure-domain attestation is unavailable") from error
-        if not isinstance(value, dict):
-            raise PublishRuntimeError("failure-domain attestation is invalid")
-        expected_attestation_fields = {
-            "schema_version", "observed_at", "production_host_facts_sha256",
-            "recovery_host_facts_sha256", "production", "recovery",
-            "independence_probe", "verdict", "attestation_sha256",
-        }
-        if set(value) != expected_attestation_fields:
-            raise PublishRuntimeError("failure-domain attestation schema is not closed")
-        claimed = value.get("attestation_sha256")
-        try:
-            rebuilt = rebuild_legacy_attestation_diagnostic(
-                production_facts=value["production"],
-                recovery_facts=value["recovery"],
-                independence_probe=value["independence_probe"],
-                observed_at=str(value["observed_at"]),
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise PublishRuntimeError("failure-domain attestation cannot be verified") from error
-        if rebuilt.authority or rebuilt.status != "DIAGNOSTIC_ONLY":
-            raise PublishRuntimeError("legacy attestation diagnostic marker differs")
-        if claimed != rebuilt.sha256 or any(
-            value.get(key) != rebuilt.payload.get(key) for key in rebuilt.payload
-        ):
-            raise PublishRuntimeError("failure-domain attestation identity differs")
-        recovery = rebuilt.payload["recovery"]
-        assert isinstance(recovery, Mapping)
-        if Path(str(recovery["canonical_path"])).resolve(strict=True) != self.config.recovery_root.resolve(strict=True):
-            raise PublishRuntimeError("attestation belongs to another recovery root")
-        try:
-            observed = datetime.fromisoformat(str(value["observed_at"]).replace("Z", "+00:00"))
-        except ValueError as error:
-            raise PublishRuntimeError("attestation timestamp is invalid") from error
-        if observed.tzinfo is None or observed.utcoffset() is None:
-            raise PublishRuntimeError("attestation timestamp must be timezone-aware")
-        age = (self.now().astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
-        if age < 0 or age > self.config.attestation_max_age_seconds:
-            raise PublishRuntimeError("failure-domain attestation is stale")
-        return value
-
-    def preflight_materials(self) -> None:
-        """Verify the off-host recovery material roots without claiming protection.
-
-        This is intentionally weaker than :meth:`preflight`: it exists only so
-        the initial legacy-C qualification bundle can be assembled before the
-        first real empty-D materialisation event exists.  It must never be used
-        to register a recovery-protection receipt.
-        """
-        require_failure_domain_authority()
-        root = self.config.recovery_root.resolve(strict=True)
-        ensure_no_reparse_components(root)
-        if not root.is_dir():
-            raise PublishRuntimeError("recovery root is unavailable")
-        for path in (self.config.restore_tool, self.config.runbook):
-            ensure_no_reparse_components(path)
-            if not path.resolve(strict=True).is_file():
-                raise PublishRuntimeError("recovery tool/runbook is unavailable")
-        operational = self.config.operational_root.resolve(strict=True)
-        ensure_no_reparse_components(operational)
-        if not operational.is_dir():
-            raise PublishRuntimeError("operational bootstrap root is unavailable")
-
-    def preflight(self) -> None:
-        require_failure_domain_authority()
-        self.preflight_materials()
-        self._attestation()
-
-    def protect(
-        self,
-        *,
-        material: ReleaseMaterial,
-        publish_candidate_sha256: str,
-    ) -> ActivationAuthorization:
-        require_failure_domain_authority()
-        self.preflight()
-        checkpoint_root = self.actions.capture_checkpoint(material=material).resolve(strict=True)
-        checkpoint = verify_sqlite_checkpoint(checkpoint_root)
-        if not checkpoint.valid or not checkpoint.manifest_sha256:
-            raise PublishRuntimeError("captured SQLite checkpoint is not restorable")
-        attempt_id = f"deploy-{publish_candidate_sha256[:24]}"
-        bundle = build_recovery_bundle(
-            release_root=material.source_root,
-            checkpoint_root=checkpoint_root,
-            recovery_root=self.config.recovery_root,
-            bundle_id=attempt_id,
-            created_at=self.now().astimezone(UTC).isoformat().replace("+00:00", "Z"),
-            restore_tool=self.config.restore_tool,
-            runbook=self.config.runbook,
-            operational_root=self.config.operational_root,
-            compatibility={"verdict": "compatible", "policy": "expand_only_no_down_migration"},
-        )
-        verification = verify_recovery_bundle(bundle.root)
-        if (
-            not verification.valid
-            or verification.release_id != material.release_id
-            or verification.release_manifest_sha256 != material.release_manifest_sha256
-            or verification.checkpoint_manifest_sha256 != checkpoint.manifest_sha256
-            or verification.recovery_manifest_sha256 != bundle.recovery_manifest_sha256
-        ):
-            raise PublishRuntimeError("cold recovery bundle identity/closure verification failed")
-        authorization = self.actions.register_protection(
-            material=material,
-            publish_candidate_sha256=publish_candidate_sha256,
-            bundle_root=bundle.root,
-            recovery_manifest_sha256=bundle.recovery_manifest_sha256,
-            checkpoint_root=checkpoint_root,
-        )
-        if not isinstance(authorization, ActivationAuthorization):
-            raise PublishRuntimeError("recovery registrar returned invalid authorization")
-        return authorization
-
-
 class ProductionSourceFreezer:
     """Freeze tracked code plus read-only external sources, then seal with R."""
 
@@ -814,12 +352,15 @@ class ProductionSourceFreezer:
         ensure_no_reparse_components(base)
         manifest_path = base / "release_manifest.json"
         try:
-            manifest = validate_release_manifest(
+            manifest = _validate_candidate_release(
                 json.loads(manifest_path.read_text(encoding="utf-8"))
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
             raise PublishRuntimeError("runtime base release manifest is invalid") from error
-        if manifest_sha256(manifest) != self.config.runtime_base_manifest_sha256:
+        if (
+            _candidate_manifest_sha256(manifest)
+            != self.config.runtime_base_manifest_sha256
+        ):
             raise PublishRuntimeError("runtime base manifest identity differs")
         actual = safe_tree_file_state(base)
         actual.pop("release_manifest.json", None)
@@ -918,7 +459,7 @@ class ProductionSourceFreezer:
         manifest_path = physical / "release_manifest.json"
         try:
             manifest_bytes = manifest_path.read_bytes()
-            manifest = validate_release_manifest(
+            manifest = _validate_candidate_release(
                 json.loads(manifest_bytes.decode("utf-8"))
             )
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as error:
@@ -945,7 +486,9 @@ class ProductionSourceFreezer:
         }
         if actual != expected:
             raise PublishRuntimeError("existing immutable candidate tree differs from inventory")
-        if manifest["resources"].get("inventory_sha256") != manifest_sha256(inventory):
+        if manifest["resources"].get(
+            "inventory_sha256"
+        ) != _candidate_inventory_sha256(inventory):
             raise PublishRuntimeError("existing immutable candidate inventory binding differs")
         return manifest, actual
 
@@ -972,7 +515,6 @@ class ProductionSourceFreezer:
         return existing_manifest, existing_tree
 
     def __call__(self, snapshot: GitSnapshot) -> FrozenSources:
-        require_failure_domain_authority()
         candidate_parent = self.config.candidate_root.resolve()
         candidate_parent.mkdir(parents=True, exist_ok=True)
         ensure_no_reparse_components(candidate_parent)
@@ -1095,14 +637,6 @@ class ProductionSourceFreezer:
                 generation.generation_id for generation in selected_generations
             } != selected_generation_ids:
                 raise PublishRuntimeError("selected semantic generation closure is incomplete")
-            status_counts: dict[str, int] = {}
-            for status in enriched.knowledge_status_membership.values():
-                status_counts[status] = status_counts.get(status, 0) + 1
-            enrichment_status = (
-                "ready"
-                if set(status_counts).issubset({"ready", "blocked_policy"})
-                else "partial"
-            )
             semantic_identity = hashlib.sha256(
                 (
                     snapshot.tracked_tree_sha256
@@ -1114,22 +648,53 @@ class ProductionSourceFreezer:
                 f"release-{snapshot.commit_sha[:12]}-{semantic_identity[:12]}"
             )
             manifest = {
-                "schema_version": "qrh-release-manifest/v1",
+                "schema_version": local_identity.RELEASE_MANIFEST_SCHEMA,
                 "release_id": release_id,
                 "built_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "application": {
                     "source_kind": "git",
                     "commit_sha": snapshot.commit_sha,
                     "tracked_tree_sha256": snapshot.tracked_tree_sha256,
-                    "build_tool_version": "qrh-production-publish-runtime/v1",
+                    "build_tool_version": "qrh-production-publish-runtime/v2",
+                    "provenance": {
+                        "builder": "qrh-production-source-freezer",
+                        "labels": ["exact-local-active-prior", "public-source"],
+                    },
                 },
                 "content": {
                     "snapshot_id": enriched.snapshot_id,
+                    "source_inventory_sha256": None,
+                    "ir_sha256": None,
+                    "knowledge_sha256": None,
+                    "search_sha256": None,
+                    "page_projection_sha256": None,
+                    "mcp_sha256": None,
+                    "active_membership_sha256": local_identity.identity_sha256(
+                        dict(sorted(knowledge_snapshot.active_membership.items()))
+                    ),
                     "knowledge_enrichment": {
-                        "status": enrichment_status,
-                        "base_snapshot_id": knowledge_snapshot.snapshot_id,
-                        "status_counts": dict(sorted(status_counts.items())),
+                        "status": "ready_set",
+                        "generation_membership_sha256": (
+                            local_identity.identity_sha256(
+                                dict(sorted(enriched.generation_membership.items()))
+                            )
+                        ),
+                        "status_membership_sha256": (
+                            local_identity.identity_sha256(
+                                dict(
+                                    sorted(
+                                        enriched.knowledge_status_membership.items()
+                                    )
+                                )
+                            )
+                        ),
+                        "semantic_authority_sha256": (
+                            local_identity.identity_sha256(
+                                semantic_receipt.to_dict()
+                            )
+                        ),
                     },
+                    "presentation": {"language": "zh-CN"},
                 },
                 "resources": {},
                 "state": {
@@ -1139,12 +704,6 @@ class ProductionSourceFreezer:
                             "read": [1, 2, 3], "write": [1, 2, 3]
                         },
                         "rollback_policy": "expand_only_no_down_migration",
-                    }
-                },
-                "recovery": {
-                    "compatibility": {
-                        "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                        "restore_protocol_versions": ["qrh-restore/v1"],
                     }
                 },
             }
@@ -1213,7 +772,7 @@ class ProductionSourceFreezer:
                 release, _ = self._validated_candidate(
                     final, expected_release_id=sealed.release_id
                 )
-            effective_manifest_sha256 = manifest_sha256(release)
+            effective_manifest_sha256 = _candidate_manifest_sha256(release)
             files = tuple(
                 ReleaseFile(str(item["path"]), int(item["bytes"]), str(item["sha256"]))
                 for item in release["inventory"]["files"]
@@ -1265,8 +824,8 @@ class FixedLocalGates:
             "local-tests-v1",
             snapshot,
             (
-                "python", "-B", "-m", "unittest", "discover", "-s",
-                "quant_hub/tests", "-p", "test_*.py", "-q",
+                sys.executable, "-B", "-m", "unittest", "discover", "-s",
+                "quant_hub/tests", "-t", "quant_hub", "-p", "test_*.py", "-q",
             ),
         )
 
@@ -1274,7 +833,14 @@ class FixedLocalGates:
         return self._run(
             "public-git-guard-v1",
             snapshot,
-            ("python", "-B", "tools/release/git_guard.py", "gate", "--scope", "all"),
+            (
+                sys.executable,
+                "-B",
+                "tools/release/git_guard.py",
+                "gate",
+                "--scope",
+                "all",
+            ),
         )
 
 
@@ -1284,7 +850,6 @@ class ExactGitPush:
         self.runner = runner
 
     def __call__(self, commit_sha: str) -> PushResult:
-        require_failure_domain_authority()
         push = self.runner(
             (
                 "git", "push", "--porcelain", self.config.git_remote,
@@ -1311,8 +876,6 @@ class RuntimeDependencies:
     http_get: Callable | None = None
     vm_backend: object | None = None
     deployment_invoker: object | None = None
-    recovery_protector: RecoveryProtector | None = None
-    recovery_actions: RecoveryProtectionActions | None = None
     remote_command_runner: Callable[[Sequence[str]], CommandResult] | None = None
 
 
@@ -1323,7 +886,6 @@ class ProductionPublishRuntime:
         *,
         dependencies: RuntimeDependencies | None = None,
     ) -> None:
-        require_failure_domain_authority()
         deps = dependencies or RuntimeDependencies()
         secret_provider = deps.secret_provider or EnvironmentSecretProvider()
         freezer = ProductionSourceFreezer(config, process_runner=deps.process_runner)
@@ -1344,27 +906,20 @@ class ProductionPublishRuntime:
         transport = IncrementalVMTransport(
             config.vm, material_resolver=freezer.material, backend=vm_backend
         )
-        protector = deps.recovery_protector or RecoveryProtectionCoordinator(
-            config.recovery,
-            actions=deps.recovery_actions
-            or OpenSSHRecoveryActions(
-                config,
-                command_runner=remote_runner,
-                vm_backend=vm_backend,
-                deployment_invoker=invoker,
-            ),
-        )
-
         def deploy(candidate: Mapping[str, object]):
             mode = candidate.get("deployment_mode")
 
             def authorize(release_id: str, candidate_hash: str) -> ActivationAuthorization:
                 release = candidate.get("release")
                 assert isinstance(release, Mapping)
-                material = freezer.material(release_id, str(release["manifest_sha256"]))
-                return protector.protect(
-                    material=material,
-                    publish_candidate_sha256=candidate_hash,
+                manifest_sha256 = str(release["manifest_sha256"])
+                freezer.material(release_id, manifest_sha256)
+                return ActivationAuthorization(
+                    # The VM journal is the crash-replay authority.  A fresh
+                    # publisher process must address the same journal for the
+                    # same immutable publish candidate instead of minting a
+                    # second attempt after an unknown remote outcome.
+                    deployment_attempt_id=f"deploy-{manifest_sha256}"
                 )
 
             return VMDeploymentAdapter(
@@ -1375,7 +930,6 @@ class ProductionPublishRuntime:
 
         self.config = config
         self.freezer = freezer
-        self.protector = protector
         self.secret_provider = secret_provider
         self.pipeline = PublishPipeline(
             PublishActions(
@@ -1392,12 +946,9 @@ class ProductionPublishRuntime:
         self.coordinator = PublishCoordinator(PublishQueue(config.state_root), self.pipeline)
 
     def publish(self, *, commit_sha: str, candidate_only: bool = False) -> Mapping[str, object]:
-        require_failure_domain_authority()
         target = self.config.github.credential_target
         if target is not None and not isinstance(self.secret_provider(target), SecretValue):
             raise PublishRuntimeError("protected GitHub credential is unavailable")
-        if not candidate_only:
-            self.protector.preflight()
         request = PublishRequest.create(
             commit_sha,
             deployment_mode="candidate_only" if candidate_only else "activate",
@@ -1410,14 +961,9 @@ __all__ = [
     "ResourceOverlayConfig",
     "FixedLocalGates",
     "ProcessResult",
-    "OpenSSHRecoveryActions",
     "ProductionPublishRuntime",
     "ProductionSourceFreezer",
     "PublishRuntimeError",
-    "RecoveryProtector",
-    "RecoveryProtectionActions",
-    "RecoveryProtectionCoordinator",
-    "RecoveryRuntimeConfig",
     "RUNTIME_CONFIG_SCHEMA",
     "RuntimeDependencies",
     "RuntimePublishConfig",

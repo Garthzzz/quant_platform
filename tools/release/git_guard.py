@@ -1,8 +1,8 @@
 """Public Git boundary gate for Quant Research Hub.
 
 The gate only reads files selected by the explicit policy. It never follows
-symlinks/reparse points and never prints matched secret values. Runtime data,
-research content and recovery artifacts remain outside Git.
+symlinks/reparse points and never prints matched secret values. Runtime authority
+data and research content remain outside Git.
 """
 
 from __future__ import annotations

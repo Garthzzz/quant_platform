@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -15,7 +14,6 @@ import stat
 import sys
 from typing import Any, Mapping
 
-
 sys.dont_write_bytecode = True
 PRODUCTION_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
 RUNTIME_SCHEMA = "qrh-vm-deploy-runtime/v1"
@@ -23,6 +21,26 @@ RUNTIME_SCHEMA = "qrh-vm-deploy-runtime/v1"
 
 class ServiceEntryError(RuntimeError):
     pass
+
+
+def _reject_test_root_on_production_vm(path: Path) -> None:
+    """Keep the minimal copied service entry independent and fail before I/O."""
+
+    candidates = [PureWindowsPath(os.path.normpath(str(path)))]
+    try:
+        candidates.append(
+            PureWindowsPath(os.path.normpath(str(path.resolve(strict=False))))
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        try:
+            candidate.relative_to(PRODUCTION_ROOT)
+        except ValueError:
+            continue
+        raise ServiceEntryError(
+            "test-only service root cannot target production D root or a descendant/alias"
+        )
 
 
 def _canonical_hash(value: object) -> str:
@@ -102,12 +120,26 @@ def resolve_context(
     expected_manifest_sha256: str,
     allow_test_root: bool = False,
     candidate_probe: bool = False,
+    candidate_release_root: Path | None = None,
 ) -> tuple[Path, Mapping[str, object], Mapping[str, object], Mapping[str, object]]:
+    if allow_test_root:
+        _reject_test_root_on_production_vm(vm_root)
     root = _regular(vm_root, directory=True)
     if not allow_test_root and PureWindowsPath(str(root)) != PRODUCTION_ROOT:
         raise ServiceEntryError(r"service root must be exactly D:\quant\quant_platform")
-    release = _regular(root / "releases" / expected_release_id, directory=True)
     if candidate_probe:
+        if candidate_release_root is None:
+            raise ServiceEntryError("candidate release root is required")
+        release = _regular(candidate_release_root, directory=True)
+        finalized = root / "releases" / expected_release_id
+        incoming = root / "incoming" / f"{expected_release_id}.partial"
+        if release not in {
+            finalized.resolve(strict=False),
+            incoming.resolve(strict=False),
+        }:
+            raise ServiceEntryError(
+                "candidate release root is outside exact finalized/incoming paths"
+            )
         # Evidence-only candidate probing deliberately does not read, write, or
         # impersonate the production active pointer.
         active: Mapping[str, object] = {
@@ -117,6 +149,11 @@ def resolve_context(
             "manifest_sha256": expected_manifest_sha256,
         }
     else:
+        if candidate_release_root is not None:
+            raise ServiceEntryError(
+                "ordinary service cannot carry a candidate release root"
+            )
+        release = _regular(root / "releases" / expected_release_id, directory=True)
         active = _json(_regular(root / "control" / "active_release.json"))
         if set(active) != {"schema_version", "release_id", "release_path", "manifest_sha256"}:
             raise ServiceEntryError("active pointer schema is not closed")
@@ -186,10 +223,24 @@ def serve(
     allow_test_root: bool = False,
     candidate_probe_root: Path | None = None,
     candidate_port: int | None = None,
+    candidate_release_root: Path | None = None,
 ) -> None:
-    candidate_probe = candidate_probe_root is not None or candidate_port is not None
-    if candidate_probe and (candidate_probe_root is None or candidate_port is None):
-        raise ServiceEntryError("candidate probe root and port must be supplied together")
+    candidate_probe = any(
+        value is not None
+        for value in (
+            candidate_probe_root,
+            candidate_port,
+            candidate_release_root,
+        )
+    )
+    if candidate_probe and (
+        candidate_probe_root is None
+        or candidate_port is None
+        or candidate_release_root is None
+    ):
+        raise ServiceEntryError(
+            "candidate probe root, port and release root must be supplied together"
+        )
     if candidate_probe and not 1024 <= int(candidate_port) <= 65535:
         raise ServiceEntryError("candidate probe port is invalid")
     release, _active, manifest, runtime = resolve_context(
@@ -198,6 +249,7 @@ def serve(
         expected_manifest_sha256=manifest_sha256,
         allow_test_root=allow_test_root,
         candidate_probe=candidate_probe,
+        candidate_release_root=candidate_release_root,
     )
     required_runtime_fields = {
         "schema_version", "service_name", "base_url", "listen_host", "port",
@@ -264,18 +316,25 @@ def serve(
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     os.environ["QUANT_HUB_READ_ONLY_DATABASE_ROOT"] = str(database_root)
 
-    access_gate_path = _regular(entry.parent.parent / "web" / "access_gate.py")
-    access_spec = importlib.util.spec_from_file_location(
-        "_qrh_reviewed_access_gate", access_gate_path
-    )
-    if access_spec is None or access_spec.loader is None:
-        raise ServiceEntryError("reviewed D-tooling access gate cannot be loaded")
-    access_gate = importlib.util.module_from_spec(access_spec)
-    access_spec.loader.exec_module(access_gate)
     sys.path.insert(0, str(source))
 
     from quant_hub.app import create_app  # noqa: PLC0415
     from quant_hub.config import Settings  # noqa: PLC0415
+    import quant_hub as application_package  # noqa: PLC0415
+
+    tooling_package = _regular(entry.parent.parent, directory=True)
+    if str(tooling_package) not in application_package.__path__:
+        application_package.__path__.insert(0, str(tooling_package))
+    from quant_hub import web as application_web  # noqa: PLC0415
+
+    tooling_web = _regular(tooling_package / "web", directory=True)
+    if str(tooling_web) not in application_web.__path__:
+        application_web.__path__.insert(0, str(tooling_web))
+    from quant_hub.web import access_gate  # noqa: PLC0415
+
+    access_gate_path = _regular(tooling_web / "access_gate.py")
+    if _regular(Path(access_gate.__file__)) != access_gate_path:
+        raise ServiceEntryError("reviewed D-tooling access gate import identity differs")
 
     def state_path(key: str) -> Path:
         raw = runtime[key]
@@ -372,6 +431,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-root", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--candidate-probe-root", type=Path)
     parser.add_argument("--candidate-port", type=int)
+    parser.add_argument("--candidate-release-root", type=Path)
     args = parser.parse_args(argv)
     if args.test_root and os.environ.get("QRH_TEST_ONLY_ALLOW_NONPRODUCTION_ROOT") != "1":
         parser.error("--test-root requires the explicit test-only environment marker")
@@ -382,6 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_test_root=args.test_root,
         candidate_probe_root=args.candidate_probe_root,
         candidate_port=args.candidate_port,
+        candidate_release_root=args.candidate_release_root,
     )
     return 0
 

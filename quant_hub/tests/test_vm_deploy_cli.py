@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import ExitStack, closing
+from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -9,6 +11,13 @@ import unittest
 from unittest import mock
 
 from quant_hub.ops.deployment import CandidateValidationError, DeploymentFailed
+from quant_hub.ops import local_release_identity as local_identity
+from quant_hub.ops.local_deployment_persistence import (
+    LocalDeploymentPersistence,
+    _SafeRoot,
+)
+from quant_hub.ops import vm_deploy_cli as vm_deploy_module
+from quant_hub.ops.service_entry import ServiceEntryError, resolve_context
 from quant_hub.ops.release_identity import manifest_sha256
 from quant_hub.ops.vm_deploy_cli import (
     VMDeployCLIError,
@@ -23,6 +32,12 @@ from tests.test_deployment_controller import (
     DeploymentFixture,
     write_partial,
 )
+from tests.test_local_deployment_persistence import (
+    history_to as local_history_to,
+    journal as local_journal,
+    migration_bytes as local_migration_bytes,
+    release as local_release,
+)
 
 
 CANDIDATE_HASH = "9" * 64
@@ -33,7 +48,32 @@ ENVIRONMENT = {
 }
 
 
+def windows_runtime(root: Path) -> WindowsServiceRuntime:
+    return WindowsServiceRuntime(
+        root=root,
+        service_name="QuantResearchHub",
+        base_url="http://127.0.0.1:8765",
+        listen_host="0.0.0.0",
+        port=8765,
+        critical_paths=("/login",),
+        writer_authority="D-active",
+        service_entry_relative_path=(
+            "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py"
+        ),
+        application_source_relative_path="runtime_contract/code/src",
+        archive_root_relative_path="reference/archive",
+        var_root_relative_path="runtime",
+        migration_root_relative_path="runtime_contract/migrations/platform",
+        access_password_digest_path="state/viewer_access_password.digest",
+        session_key_path="state/viewer_secret.key",
+        comment_database_path="state/comments.sqlite3",
+        workspace_database_path="state/research_workspace.sqlite3",
+    )
+
+
 class Hooks:
+    allow_legacy_deployment_test_only = True
+
     def __init__(
         self,
         *,
@@ -87,13 +127,315 @@ class Hooks:
 
 
 class VMDeployCLITests(unittest.TestCase):
-    def test_real_start_callback_passes_exact_candidate_and_prior_journal_authorization(self) -> None:
+    def test_candidate_live_sqlite_pin_blocks_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "comments.sqlite3"
+            replacement = root / "replacement.sqlite3"
+            source.write_bytes(b"source")
+            replacement.write_bytes(b"replacement")
+            with vm_deploy_module._pin_live_candidate_sqlite_members(source):
+                with self.assertRaises(PermissionError):
+                    os.replace(replacement, source)
+            os.replace(replacement, source)
+            self.assertEqual(b"replacement", source.read_bytes())
+
+    def test_candidate_live_sqlite_pin_rejects_new_absent_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "comments.sqlite3"
+            source.write_bytes(b"source")
+            with self.assertRaisesRegex(Exception, "namespace changed"):
+                with vm_deploy_module._pin_live_candidate_sqlite_members(source):
+                    Path(str(source) + "-wal").write_bytes(b"new-sidecar")
+
+    def test_candidate_tree_members_remain_pinned_for_child_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            tree = root / "candidate"
+            tree.mkdir()
+            member = tree / "entry.py"
+            member.write_bytes(b"print('fixed')\n")
+            replacement = root / "replacement.py"
+            replacement.write_bytes(b"print('replacement')\n")
+            safe_root = _SafeRoot(root, allow_posix_test_only=True)
+            with ExitStack() as stack:
+                pinned = vm_deploy_module._pin_candidate_tree(
+                    stack,
+                    safe_root=safe_root,
+                    tree_root=tree,
+                )
+                self.assertEqual((member,), pinned)
+                with self.assertRaises(PermissionError):
+                    os.replace(replacement, member)
+            os.replace(replacement, member)
+            self.assertIn(b"replacement", member.read_bytes())
+
+    def test_test_service_root_rejects_production_d_aliases_before_read(self) -> None:
+        aliases = (
+            Path(r"D:\quant\quant_platform"),
+            Path(r"D:\quant\quant_platform\."),
+            Path(r"D:\quant\quant_platform\child\.."),
+            Path(r"d:/QUANT/quant_PLATFORM"),
+        )
+        with mock.patch(
+            "quant_hub.ops.service_entry._regular",
+            side_effect=AssertionError("service filesystem read must not run"),
+        ):
+            for alias in aliases:
+                with self.subTest(alias=str(alias)), self.assertRaisesRegex(
+                    ServiceEntryError, "cannot target production D root"
+                ):
+                    resolve_context(
+                        alias,
+                        expected_release_id="release-r1",
+                        expected_manifest_sha256="a" * 64,
+                        allow_test_root=True,
+                    )
+
+    def test_foreign_hooks_cannot_reach_legacy_controller_on_production_d(self) -> None:
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.DeploymentController"
+        ) as legacy:
+            with self.assertRaisesRegex(
+                VMDeployCLIError, "internally constructed"
+            ):
+                apply_publish(
+                    vm_root=Path(r"D:\quant\quant_platform"),
+                    release_id="release-escape",
+                    release_manifest_sha256="a" * 64,
+                    publish_candidate_sha256=CANDIDATE_HASH,
+                    deployment_mode="activate",
+                    deployment_attempt_id="escape-attempt",
+                    hooks=Hooks(),
+                    root_verifier=lambda _path: Path(
+                        r"D:\quant\quant_platform"
+                    ),
+                    environment=ENVIRONMENT,
+                )
+        legacy.assert_not_called()
+
+    def test_production_candidate_rejects_shadowed_or_custom_runtime_before_root(self) -> None:
+        runtime = windows_runtime(self.fixture.root)
+        with self.assertRaises(AttributeError):
+            object.__setattr__(
+                runtime,
+                "candidate_probe",
+                lambda *_args, **_kwargs: {
+                    "schema_version": "qrh-candidate-probe-evidence/v1"
+                },
+            )
+        custom_popen = replace(
+            windows_runtime(self.fixture.root),
+            candidate_popen_factory=lambda *_args, **_kwargs: object(),
+        )
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_production_root",
+            side_effect=AssertionError("production root must remain untouched"),
+        ), mock.patch(
+            "quant_hub.ops.local_deployment_persistence."
+            "LocalDeploymentPersistence.production",
+            side_effect=AssertionError("persistence must remain untouched"),
+        ):
+            aliases = (
+                Path(r"D:\quant\quant_platform"),
+                Path(r"D:\quant\quant_platform\."),
+                Path(r"D:\quant\quant_platform\child\.."),
+                Path(r"d:/QUANT/quant_PLATFORM"),
+            )
+            for injected in (runtime, custom_popen):
+                for alias in aliases:
+                    with self.subTest(
+                        injected=injected, alias=str(alias)
+                    ), self.assertRaisesRegex(
+                        VMDeployCLIError, "internally constructed"
+                    ):
+                        apply_publish(
+                            vm_root=alias,
+                            release_id="release-shadowed-candidate",
+                            release_manifest_sha256="a" * 64,
+                            publish_candidate_sha256=CANDIDATE_HASH,
+                            deployment_mode="candidate_only",
+                            hooks=injected,
+                        )
+
+    @unittest.skipUnless(os.name == "nt", "production provenance is Windows-only")
+    def test_product_windows_runtime_method_shadow_is_structurally_impossible(self) -> None:
+        document = {
+            "schema_version": "qrh-vm-deploy-runtime/v1",
+            "service_name": "QuantResearchHub",
+            "base_url": "http://127.0.0.1:8765",
+            "listen_host": "0.0.0.0",
+            "port": 8765,
+            "critical_paths": [
+                "/login", "/api/v1/research", "/api/v1/dashboard"
+            ],
+            "writer_authority": "D-active",
+            "service_entry_relative_path": "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py",
+            "application_source_relative_path": "runtime_contract/code/src",
+            "archive_root_relative_path": "reference/archive",
+            "var_root_relative_path": "runtime",
+            "migration_root_relative_path": "runtime_contract/migrations/platform",
+            "access_password_digest_path": "state/viewer_access_password.digest",
+            "session_key_path": "state/viewer_secret.key",
+            "comment_database_path": "state/comments.sqlite3",
+            "workspace_database_path": "state/research_workspace.sqlite3",
+            "write_paths": list(declared_production_vm_write_set().values()),
+        }
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.read_json", return_value=document
+        ):
+            runtime = WindowsServiceRuntime.load(Path(r"D:\quant\quant_platform"))
+        for method_name in (
+            "stop_exact_transient",
+            "ensure_steady_exact",
+            "observe_bootstrap_boundary",
+            "candidate_probe",
+        ):
+            with self.subTest(method_name=method_name), self.assertRaises(AttributeError):
+                object.__setattr__(
+                    runtime,
+                    method_name,
+                    lambda *_args, **_kwargs: None,
+                )
+        with self.assertRaises(AttributeError):
+            _ = runtime.__dict__
+        WindowsServiceRuntime._assert_production_provenance(runtime)
+
+    def test_default_production_activation_calls_only_exact_v4_controller(self) -> None:
+        runtime = windows_runtime(self.fixture.root)
+        exact = mock.Mock()
+        exact.activate_successor.return_value = {
+            "schema_version": "qrh-vm-deploy-result/v2",
+            "status": "activated",
+            "release_id": "release-exact-r1",
+            "release_manifest_sha256": "a" * 64,
+            "activation_receipt_id": "activation-exact-attempt",
+        }
+        with mock.patch(
+            "quant_hub.ops.local_exact_deployment_controller."
+            "ProductionExactDeploymentController.load_exact_d",
+            return_value=exact,
+        ), mock.patch.object(
+            WindowsServiceRuntime, "load", return_value=runtime,
+        ), mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_runtime_environment",
+        ), mock.patch(
+            "quant_hub.ops.vm_deploy_cli.DeploymentController",
+        ) as legacy:
+            result = apply_publish(
+                vm_root=Path(r"D:\quant\quant_platform"),
+                release_id="release-exact-r1",
+                release_manifest_sha256="a" * 64,
+                publish_candidate_sha256=CANDIDATE_HASH,
+                deployment_mode="activate",
+                deployment_attempt_id="exact-attempt",
+                hooks=None,
+            )
+        legacy.assert_not_called()
+        exact.activate_successor.assert_called_once_with(
+            release_id="release-exact-r1",
+            expected_manifest_sha256="a" * 64,
+            attempt_id="exact-attempt",
+        )
+        self.assertEqual("activation-exact-attempt", result["evidence_id"])
+
+    def test_exact_stop_and_steady_start_require_observed_terminal_states(self) -> None:
+        runtime = windows_runtime(self.fixture.root)
+        with mock.patch.object(
+            WindowsServiceRuntime, "_service", autospec=True, return_value=True
+        ) as service, mock.patch.object(
+            WindowsServiceRuntime,
+            "_query_service_state",
+            autospec=True,
+            side_effect=["STOP_PENDING", "STOPPED"],
+        ), mock.patch("quant_hub.ops.vm_deploy_cli.time.sleep"):
+            runtime.stop_exact_transient()
+        service.assert_called_once_with(runtime, "stop", allow_failure=True)
+
+        with mock.patch.object(
+            WindowsServiceRuntime, "_service", autospec=True, return_value=True
+        ) as service, mock.patch.object(
+            WindowsServiceRuntime,
+            "_query_service_state",
+            autospec=True,
+            return_value="RUNNING",
+        ), mock.patch.object(
+            WindowsServiceRuntime,
+            "_get",
+            autospec=True,
+            return_value=(200, b"ready"),
+        ):
+            self.assertTrue(runtime.start_steady_exact())
+        service.assert_called_once_with(runtime, "start")
+
+    def test_exact_steady_ensure_reuses_only_matching_running_identity(self) -> None:
+        runtime = windows_runtime(self.fixture.root)
+        manifest = self.fixture.finalize(
+            "release-steady", commit_character="d"
+        )
+        final = self.fixture.controller.release_path("release-steady")
+        release = {
+            "release_id": "release-steady",
+            "release_path": str(final),
+            "manifest_sha256": manifest_sha256(manifest),
+        }
+        with mock.patch.object(
+            WindowsServiceRuntime,
+            "_query_service_state",
+            autospec=True,
+            return_value="RUNNING",
+        ), mock.patch.object(
+            WindowsServiceRuntime,
+            "_deployment_identity",
+            autospec=True,
+            return_value=(True, True),
+        ) as observed, mock.patch.object(
+            WindowsServiceRuntime, "_service", autospec=True
+        ) as service:
+            self.assertTrue(runtime.ensure_steady_exact(release))
+        service.assert_not_called()
+        observed.assert_called_once()
+
+    def test_exact_steady_ensure_restarts_wrong_running_identity(self) -> None:
+        runtime = windows_runtime(self.fixture.root)
+        manifest = self.fixture.finalize(
+            "release-steady-restart", commit_character="e"
+        )
+        final = self.fixture.controller.release_path("release-steady-restart")
+        release = {
+            "release_id": "release-steady-restart",
+            "release_path": str(final),
+            "manifest_sha256": manifest_sha256(manifest),
+        }
+        with mock.patch.object(
+            WindowsServiceRuntime,
+            "_query_service_state",
+            autospec=True,
+            side_effect=["RUNNING", "RUNNING", "STOPPED", "RUNNING"],
+        ), mock.patch.object(
+            WindowsServiceRuntime,
+            "_deployment_identity",
+            autospec=True,
+            side_effect=[(False, False), (True, True)],
+        ), mock.patch.object(
+            WindowsServiceRuntime,
+            "_service",
+            autospec=True,
+            return_value=True,
+        ) as service, mock.patch.object(
+            WindowsServiceRuntime,
+            "start_steady_exact",
+            autospec=True,
+            return_value=True,
+        ), mock.patch("quant_hub.ops.vm_deploy_cli.time.sleep"):
+            self.assertTrue(runtime.ensure_steady_exact(release))
+        service.assert_called_once_with(runtime, "stop", allow_failure=True)
+
+    def test_legacy_start_callback_is_sealed_before_scm(self) -> None:
         prior = self.fixture.finalize("release-prior", commit_character="a")
         candidate = self.fixture.finalize("release-next", commit_character="b")
         self.fixture.seed_prior(prior)
-        protection = self.fixture.protect(
-            prior, candidate, attempt_id="runtime-start-auth"
-        )
         runtime = WindowsServiceRuntime(
             root=self.fixture.root, service_name="QuantResearchHub",
             base_url="http://127.0.0.1:8765", listen_host="0.0.0.0", port=8765,
@@ -113,29 +455,110 @@ class VMDeployCLITests(unittest.TestCase):
                 starts.append(start_authorization)
             return True
 
-        with mock.patch.object(WindowsServiceRuntime, "_service", autospec=True, side_effect=service), mock.patch.object(
-            WindowsServiceRuntime, "_get", autospec=True, return_value=(0, b"")
-        ), mock.patch.object(
-            WindowsServiceRuntime, "_deployment_identity", autospec=True,
-            return_value=(True, True),
+        with mock.patch.object(
+            WindowsServiceRuntime, "_service", autospec=True, side_effect=service
         ):
             with self.assertRaises(DeploymentFailed):
                 self.fixture.controller.activate(
                     candidate_release_id="release-next",
                     deployment_attempt_id="runtime-start-auth",
-                    recovery_protection_receipt_id=str(protection["receipt_id"]),
                     start_release=runtime.start_release,
                     stop_release=runtime.stop_release,
                     post_activation_probe=lambda _path, _active: {
                         "health": False, "critical_functions": True, "writer_fence": True,
                     },
                 )
-        self.assertEqual(
-            ["candidate", "prior_recovery"],
-            [authorization[0] for authorization in starts],
-        )
-        self.assertTrue(all(auth[1] == "runtime-start-auth" for auth in starts))
-        self.assertTrue(all(len(auth[2]) == 48 for auth in starts))
+        self.assertEqual([], starts)
+
+    def test_exact_transient_start_consumes_live_v4_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            persistence = LocalDeploymentPersistence.for_test_only(
+                Path(temporary).resolve(), allow_posix_test_only=True
+            )
+            candidate = local_release("release-exact-r1", b"candidate", "a")
+            first = local_journal(
+                None,
+                candidate,
+                operation="bootstrap_first_pair",
+                attempt="exact-start-attempt",
+                nonce="exact-start-deployment-nonce",
+            )
+            history = local_history_to(first, "candidate_start_authorized")
+            lock = persistence.global_lock()
+            lock.acquire()
+            workspace = None
+            try:
+                for revision in history:
+                    persistence.journals.append(revision, lock=lock)
+                workspace = persistence.bind_attempt_workspace(
+                    lock,
+                    "exact-start-attempt",
+                    "exact-start-deployment-nonce",
+                )
+                authorization = (
+                    persistence.lock_exact_transient_start_authorization(
+                        lock, workspace, "baseline"
+                    )
+                )
+                runtime = WindowsServiceRuntime(
+                    root=Path(temporary).resolve(),
+                    service_name="QuantResearchHub",
+                    base_url="http://127.0.0.1:8765",
+                    listen_host="0.0.0.0",
+                    port=8765,
+                    critical_paths=("/login",),
+                    writer_authority="D-active",
+                    service_entry_relative_path=(
+                        "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py"
+                    ),
+                    application_source_relative_path="runtime_contract/code/src",
+                    archive_root_relative_path="reference/archive",
+                    var_root_relative_path="runtime",
+                    migration_root_relative_path=(
+                        "runtime_contract/migrations/platform"
+                    ),
+                    access_password_digest_path=(
+                        "state/viewer_access_password.digest"
+                    ),
+                    session_key_path="state/viewer_secret.key",
+                    comment_database_path="state/comments.sqlite3",
+                    workspace_database_path="state/research_workspace.sqlite3",
+                )
+                calls: list[tuple[str, object, object]] = []
+
+                def service(
+                    _runtime,
+                    action,
+                    *,
+                    allow_failure=False,
+                    start_authorization=None,
+                    exact_start_arguments=None,
+                ):
+                    calls.append(
+                        (action, start_authorization, exact_start_arguments)
+                    )
+                    return True
+
+                with mock.patch.object(
+                    WindowsServiceRuntime,
+                    "_service",
+                    autospec=True,
+                    side_effect=service,
+                ):
+                    self.assertTrue(runtime.start_exact_transient(authorization))
+                self.assertEqual("stop", calls[0][0])
+                self.assertEqual("start", calls[1][0])
+                self.assertIsNone(calls[1][1])
+                exact_arguments = calls[1][2]
+                self.assertIsInstance(exact_arguments, tuple)
+                self.assertEqual("exact-runtime", exact_arguments[0])
+                self.assertIn("exact-start-attempt", exact_arguments)
+                self.assertNotIn("pending-activation", exact_arguments)
+            finally:
+                if workspace is not None:
+                    workspace.close()
+                if lock.held:
+                    lock.release()
 
     def setUp(self) -> None:
         self.fixture = DeploymentFixture()
@@ -144,7 +567,7 @@ class VMDeployCLITests(unittest.TestCase):
 
     def apply(self, **arguments):
         return apply_publish(
-            vm_root=Path(r"D:\quant\quant_platform"),
+            vm_root=self.fixture.root,
             publish_candidate_sha256=CANDIDATE_HASH,
             hooks=arguments.pop("hooks", Hooks()),
             root_verifier=self.verify_root,
@@ -210,20 +633,107 @@ class VMDeployCLITests(unittest.TestCase):
             )
         ))
 
-    def test_activation_requires_real_protection_and_returns_activation_receipt(self) -> None:
+    def test_exact_v2_candidate_only_probes_incoming_without_finalizing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            persistence = LocalDeploymentPersistence.for_test_only(root)
+            manifest = local_release(
+                "release-v2-candidate",
+                b"candidate-v2",
+                "a",
+                include_migrations=True,
+            )
+            partial = (
+                persistence.layout.incoming
+                / "release-v2-candidate.partial"
+            )
+            for item in manifest["inventory"]["files"]:
+                relative = str(item["path"])
+                target = partial.joinpath(*relative.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(
+                    b"candidate-v2"
+                    if relative == "app/payload.bin"
+                    else local_migration_bytes(
+                        "release-v2-candidate", relative
+                    )
+                )
+            (partial / "release_manifest.json").write_bytes(
+                local_identity.canonical_bytes(manifest)
+            )
+            runtime = replace(
+                windows_runtime(root),
+                allow_test_root=True,
+            )
+            manifest_hash = local_identity.identity_sha256(manifest)
+            (
+                persistence.layout.control / "deployment_runtime.json"
+            ).write_text("{}\n", encoding="utf-8")
+            resolved_release, _active, resolved_manifest, _runtime = (
+                resolve_context(
+                    root,
+                    expected_release_id="release-v2-candidate",
+                    expected_manifest_sha256=manifest_hash,
+                    allow_test_root=True,
+                    candidate_probe=True,
+                    candidate_release_root=partial,
+                )
+            )
+            self.assertEqual(partial.resolve(), resolved_release)
+            self.assertEqual(manifest, resolved_manifest)
+            probe = {
+                "schema_version": "qrh-candidate-probe-evidence/v1",
+                "release_id": "release-v2-candidate",
+                "manifest_sha256": manifest_hash,
+                "snapshot_id": manifest["content"]["snapshot_id"],
+                "transport": "loopback_isolated",
+                "writer_authority": "candidate-checkpoint-isolated",
+                "health": True,
+                "browser": True,
+                "api": True,
+                "resource": True,
+                "state_isolated": True,
+                "active_unchanged": True,
+                "cleaned": True,
+            }
+            with mock.patch.object(
+                WindowsServiceRuntime,
+                "candidate_probe",
+                autospec=True,
+                return_value=probe,
+            ) as candidate_probe:
+                result = apply_publish(
+                    vm_root=root,
+                    release_id="release-v2-candidate",
+                    release_manifest_sha256=manifest_hash,
+                    publish_candidate_sha256=CANDIDATE_HASH,
+                    deployment_mode="candidate_only",
+                    hooks=runtime,
+                    root_verifier=lambda _path: root,
+                    environment=ENVIRONMENT,
+                )
+            self.assertEqual("candidate_validated", result["status"])
+            candidate_probe.assert_called_once()
+            self.assertEqual(partial, candidate_probe.call_args.args[1])
+            self.assertTrue(partial.is_dir())
+            self.assertFalse(
+                (persistence.layout.releases / "release-v2-candidate").exists()
+            )
+            self.assertIsNone(persistence.read_active_release())
+            self.assertEqual((), persistence.read_local_receipts())
+            event = persistence.layout.events / f"{result['evidence_id']}.json"
+            self.assertTrue(event.is_file())
+
+    def test_activation_returns_local_pair_receipt(self) -> None:
         prior = self.fixture.finalize("release-prior", commit_character="a")
         candidate = self.fixture.finalize("release-next", commit_character="b")
         self.fixture.seed_prior(prior)
-        protection = self.fixture.protect(
-            prior, candidate, attempt_id="publish-activate"
-        )
         hooks = Hooks()
         result = self.apply(
             release_id="release-next",
             release_manifest_sha256=manifest_sha256(candidate),
             deployment_mode="activate",
             deployment_attempt_id="publish-activate",
-            recovery_protection_receipt_id=str(protection["receipt_id"]),
             hooks=hooks,
         )
         self.assertEqual("activated", result["status"])
@@ -239,14 +749,12 @@ class VMDeployCLITests(unittest.TestCase):
         prior = self.fixture.finalize("release-prior", commit_character="a")
         candidate = self.fixture.finalize("release-next", commit_character="b")
         self.fixture.seed_prior(prior)
-        protection = self.fixture.protect(prior, candidate, attempt_id="publish-fail")
         with self.assertRaises(DeploymentFailed) as caught:
             self.apply(
                 release_id="release-next",
                 release_manifest_sha256=manifest_sha256(candidate),
                 deployment_mode="activate",
                 deployment_attempt_id="publish-fail",
-                recovery_protection_receipt_id=str(protection["receipt_id"]),
                 hooks=Hooks(health=False),
             )
         failure = read_json(
@@ -258,7 +766,7 @@ class VMDeployCLITests(unittest.TestCase):
             read_json(path)["receipt_type"]
             for path in self.fixture.controller.layout.audit_receipts.glob("*.json")
         ]
-        self.assertEqual({"recovery_protection", "failure"}, set(receipts))
+        self.assertEqual(["failure"], receipts)
         active, _ = self.fixture.controller.read_active()
         self.assertEqual("release-prior", active["release_id"])
 
@@ -266,14 +774,12 @@ class VMDeployCLITests(unittest.TestCase):
         prior = self.fixture.finalize("release-prior", commit_character="a")
         candidate = self.fixture.finalize("release-next", commit_character="b")
         self.fixture.seed_prior(prior)
-        self.fixture.protect(prior, candidate, attempt_id="publish-wrong-hash")
         with self.assertRaisesRegex(CandidateValidationError, "manifest hash differs"):
             self.apply(
                 release_id="release-next",
                 release_manifest_sha256="8" * 64,
                 deployment_mode="activate",
                 deployment_attempt_id="publish-wrong-hash",
-                recovery_protection_receipt_id="protection-publish-wrong-hash",
             )
         active, _ = self.fixture.controller.read_active()
         self.assertEqual("release-prior", active["release_id"])
@@ -281,7 +787,7 @@ class VMDeployCLITests(unittest.TestCase):
             read_json(path)["receipt_type"]
             for path in self.fixture.controller.layout.audit_receipts.glob("*.json")
         ]
-        self.assertEqual(["recovery_protection"], receipts)
+        self.assertEqual([], receipts)
 
     def test_candidate_only_rejects_activation_authorization(self) -> None:
         release = self.fixture.finalize("release-candidate", commit_character="c")
@@ -291,7 +797,6 @@ class VMDeployCLITests(unittest.TestCase):
                 release_manifest_sha256=manifest_sha256(release),
                 deployment_mode="candidate_only",
                 deployment_attempt_id="attempt-not-allowed",
-                recovery_protection_receipt_id="protection-not-allowed",
             )
 
     def test_runtime_environment_rejects_c_temp_or_bytecode(self) -> None:

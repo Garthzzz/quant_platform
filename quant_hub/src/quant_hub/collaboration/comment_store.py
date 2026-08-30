@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -891,32 +890,10 @@ def comment_store_state(database_path: Path) -> dict[str, Any]:
         connection.close()
 
 
-def backup_comment_store(database_path: Path, backup_root: Path) -> Path | None:
-    if not database_path.is_file():
-        return None
-    backup_root.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S_%fZ")
-    destination = backup_root / f"comments-{stamp}.sqlite3"
-    temporary = destination.with_suffix(".tmp")
-    source = _readonly(database_path)
-    target = sqlite3.connect(temporary, timeout=10)
-    try:
-        source.backup(target)
-        target.commit()
-        if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-            raise RuntimeError("评论备份完整性检查失败")
-    finally:
-        target.close()
-        source.close()
-    os.replace(temporary, destination)
-    return destination
-
-
 __all__ = [
     "COMMENT_DATABASE_NAME",
     "COMMENT_STORE_SCHEMA_VERSION",
     "COMMENT_TARGET_SCHEMA_VERSION",
-    "backup_comment_store",
     "comment_connection",
     "comment_store_state",
     "initialize_comment_store",

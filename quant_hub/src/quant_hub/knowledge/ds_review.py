@@ -1457,7 +1457,7 @@ class CampaignLedger:
             type(manifest_sha256) is not str
             or not _SHA256.fullmatch(manifest_sha256)
         ):
-            raise CampaignStateError("claim recovery manifest binding is invalid")
+            raise CampaignStateError("claim replay manifest binding is invalid")
         supervisor_hash = _supervisor_nonce_sha256(supervisor_nonce)
         connection = self._connect()
         try:

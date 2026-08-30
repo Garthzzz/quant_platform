@@ -1,7 +1,7 @@
 # Quant Research Hub：VM 安全部署、版本化知识编译与 MCP 总体设计
 
-<!-- authoritative_revision: implementation-semantic-release-closure-r5 -->
-<!-- as_of: 2026-08-21T18:30:00+08:00 -->
+<!-- authoritative_revision: implementation-local-prior-r6 -->
+<!-- as_of: 2026-08-26T00:00:00+08:00 -->
 
 ## 1. 决策摘要
 
@@ -18,9 +18,9 @@
 7. 检索先使用结构化过滤 + lexical/CJK/短词 fallback + 确定性重排；向量不是本版前置依赖。
 8. MCP 以客户端机器上由 Codex 拉起的 stdio 进程运行；它只读经 VM active identity 校验的本地 immutable mirror，并提供可安装到其他量化研究项目的客户端 profile。Streamable HTTP 等到有命名消费者和认证 owner 再实现。
 9. 推荐发布触发方式为受控本地 `publish` CLI：内部执行一次 Git push、等待精确 SHA 的 GitHub CI，再调用 VM 固定 deploy CLI。它比常驻 self-hosted runner 更适合冻结不进入 Git 的 reference 和大对象。
-10. 版本身份收敛为一个 immutable `release_manifest.json` 和一个 `active_release.json`；release 只声明 state/recovery compatibility，不引用具体 recovery manifest 或 checkpoint。`recovery_manifest.json` 单向引用 release hash 与一个 immutable checkpoint；activation/recovery receipt 只是审计证据，不是另一套 current/version authority。
+10. 版本身份收敛为一个 immutable `release_manifest.json` 和一个 `active_release.json`；release 只声明 state compatibility。`local_prior_binding.json` 只绑定当前 active 与恰一 prior；activation/rollback receipt 绑定结果 pair，failure receipt 绑定原 pair 与 candidate，cleanup receipt 绑定保留 pair 与精确移除目标。它们只是审计证据，不是另一套 current/version authority。
 11. `deepseek-v4-pro` 是本版正式的增量知识编译器，只消费发生变化且允许外部 AI 的确定性 IR；每个 generation 同时绑定请求 alias、官方确认的实际模型修订和 API 返回身份，alias 漂移不得混入旧 generation。失败不阻塞确定性页面和 lexical search 发布，也不能污染 active knowledge。
-12. 发布系统自动生成不含 secret 的 cold recovery bundle；最终 `RECOVERY_ROOT` 必须实测位于生产 VM 整机之外的独立故障域，同一 VM 的 C/D/E 或映射回本机的其他盘符一律不合格。V39 cold bundle 从真实空 D 路径恢复成功前不得首次生产切换，也不得清理任何旧恢复材料。
+12. 发布系统只维护生产 VM 精确 `D:\quant\quant_platform` 内的 active 与恰一 prior；成功激活后原 active 成为 prior，更早 prior 与终态 candidate 经审计清理。普通回退交换两者角色并沿用当前 D state。本版不建设 D 根之外的项目恢复存储，不设置周期性状态副本任务，也不声明整机、D 根、对象库或 state 整体丢失后的重建能力。
 13. GitHub 在开发、迁移和 Stage 5 验收期间固定保持 Public；Stage 5 release certificate 后才转 Private，并在 Private 状态完成 CI 与无生产切换候选演练后关闭项目。
 
 ## 2. 真实状态与证据边界
@@ -51,7 +51,7 @@
 
 ### 2.4 当前能力缺口
 
-- VM 唯一根 `D:\quant\quant_platform` 已有 checkpoint 与 bootstrap 上传暂存件，但没有 active/candidate/writer；首次 bootstrap、单一 writer fence 和完整资产迁移闭环仍未完成。
+- VM 唯一根 `D:\quant\quant_platform` 已有 bootstrap 上传暂存件，但没有 active/candidate/writer；首次 bootstrap、单一 writer fence 和完整资产迁移闭环仍未完成。旧暂存身份不构成新 active/prior 合同证据。
 - GitHub 已有 Public 源码与 exact-SHA CI；单命令生产 publish、真实 D candidate/activation 与 Private closure 尚未完成。
 - 现有搜索偏简单匹配；没有版本一致的结构化知识索引和 MCP server。
 - 现有 parser 可复用，但尚未形成通用“新增研究无需手工页面”的稳定契约。
@@ -66,9 +66,9 @@
 - reference 新增/修订自动发现、版本化、解析、失败保旧、索引和通用展示。
 - 结构化知识形成、混合检索、独立 qrels/holdout 和真实 agent 工作流评测。
 - 可用的只读 MCP server、客户端本地 stdio、可跨项目安装的 Codex profile、调用规则和引用追踪。
-- comment 与所有其他线上可变状态跨 release 生存，并完成备份/恢复演练。
+- comment 与所有其他线上可变状态跨 release 生存，并完成候选隔离副本、schema compatibility 与本地 prior 回退演练。
 - `deepseek-v4-pro` 对变更且获准外发的研究执行可追溯语义候选编译，确定性页面可在增强 pending 时独立发布。
-- 自动维护跨 VM/D 盘故障域的 cold recovery bundle，并从空 `D:\quant\quant_platform` 实际恢复。
+- 在生产 VM 精确 D 根内维持 active + 恰一 prior 的严格保留集合，并证明普通回退继续使用同一当前 D state。
 - Stage 5 后执行 Public→Private 可见性切换复验，作为项目最终关闭门禁。
 
 ### 3.2 本版不做
@@ -95,7 +95,7 @@ reference/** (read-only)             GitHub (code/config/rebuildable)
         ┌──────────────────┴──────────────────┐
         │                                     │
 one active release                       fixed state root
-Web / Search / MCP                 comments / workspace / backups
+Web / Search / MCP                 comments / workspace / isolation
         │                                     │
 release_manifest.json                 single fenced writer
 ```
@@ -124,7 +124,7 @@ D:\quant\quant_platform\
     comments.sqlite3
     research_workspace.sqlite3
     locks\
-  backups\
+  isolation\                     # 仅候选验证的瞬态 SQLite 副本
   audit\                         # append-only receipt/event/write-set 证据，不是 pointer
   logs\
   tmp\                           # TEMP/TMP/上传/部署临时件
@@ -132,32 +132,32 @@ D:\quant\quant_platform\
 ```
 
 以上是生产 VM 的**闭合写入命名空间**，不是示意性建议。代码 checkout、Python
-bytecode、`TEMP`/`TMP`、上传中间件、service 日志、锁、审计、checkpoint 和部署工具均
+bytecode、`TEMP`/`TMP`、上传中间件、service 日志、锁、审计、隔离副本和部署工具均
 只能写入这个根的已声明子目录；不得在 VM 的 `D:\`、`D:\quant`、任何 sibling/parent
 或 C 盘产生项目文件。旧 `C:\quant_platform`、`C:\quant_platform_data` 只允许在 writer
 handoff 前作为明确的只读来源。生产入口必须在执行前验证 Windows canonical path 与每个
 既存组件不存在 reparse/junction 逃逸，执行后记录声明写入集合及实际 D-root delta；任一
-路径无法证明时 fail closed。独立 `RECOVERY_ROOT` 位于另一主机，不因本规则迁入生产 VM。
+路径无法证明时 fail closed。所有发布、回退、状态、审计和临时产物都受同一精确 D 根写入边界约束。
 
 ### 5.3 首次 bootstrap
 
 首次迁移以现网 V39 为默认兼容基线，分四步完成：
 
 1. **冻结清单**：对 V39 的 templates/CSS/JS/code、四个只读内容库、PDF、图片、对象库、Paper Lab、研究工作区种子和运行合同生成逐文件 path/size/SHA-256 inventory；同时记录代表性页面与 API 响应基线。
-2. **全量搬运**：从本地已核验 V39 ZIP/解压树向 D 盘 `incoming` 复制完整 immutable payload。Git 只保存部署代码和 inventory schema，不承载 700+ MB 资产。
+2. **全量搬运**：从本地已核验 V39 ZIP/解压树向 D 盘 `incoming` 复制完整 immutable payload。Git 只保存部署代码和 inventory schema，不承载 700+ MB 资产。冻结 inventory 只形成一棵 canonical immutable V39 baseline `R0`；不得为了填充 prior 槽复制内容等价 release 或伪造新的 manifest identity。
 3. **隔离候选**：候选使用 C 状态库的 SQLite online backup 副本，在隔离端口、不可见 probe 对象和只读内容下验证；不得访问或写入线上 C 状态。
-4. **首次 authority handoff**：预先在 D 建好并以状态副本验证一个 exact-V39 `bootstrap-baseline` release。正式 handoff 时先关闭外部流量和旧 C writer，取得最终一致备份并校验后落入 D `state`，再在仍无外部写入的 fence 内启动 D baseline。若它失败，证明 D 未接受外部写入后丢弃 D 副本并恢复原 C writer；若它通过，才开放 D 流量、宣布 D state 成为 authority，并禁用旧 C 服务、写入 superseded 标记和收紧 ACL。
+4. **首次 authority handoff**：预先在 D 建好并以状态副本验证 `R0`，同时准备一棵具有真实不同 manifest/release identity 的 successor candidate `R1`。正式 handoff 时先关闭外部流量和旧 C writer，取得最终一致副本并校验后落入 D `state`；在仍无外部写入的 fence 内先以最终 D state 建立尚未对外的 `R0` active，再按正常激活协议把 `R1` 切为 active、让 `R0` 成为 prior。若任一步失败，证明 D 未接受外部写入后丢弃 D 副本并恢复原 C writer；只有真实 `R1/R0` pair、binding 和 post-activation 验证通过后，才开放 D 流量、宣布 D state 成为 authority，并禁用旧 C 服务、写入 superseded 标记和收紧 ACL。
 
-首次 handoff 不能虚构一个尚不存在的 D prior；它的安全回退窗口只存在于“D 尚未接收任何外部写入”阶段。D baseline 一旦通过并开放流量，旧 C 盘只保留为只读恢复证据；此后每次发布都必须先锁定 **D 盘 prior release + 同一 D state**，不得重新启用 C 状态。
+首次 handoff 的 prior 必须来自真实的前一版本 `R0`，successor `R1` 必须具有真实不同的 immutable manifest/release identity；不得用目录别名、同一路径、内容复制或空 prior 占位伪造。D pair 通过并开放流量后，旧 C 盘只保留为 C→D 过渡核验材料；此后每次发布都先锁定 **D 盘 prior release + 同一 D state**，不得重新启用 C 状态。
 
-现有 V39 ZIP、C 盘最终状态备份、旧服务启动/停止材料及校验记录必须继续保留，直到 D active、D prior 原地回退、跨故障域 cold recovery bundle 和空 D 盘恢复演练四项全部通过。此前任何清理任务均不得删除这些首次迁移恢复材料。
+现有 V39 ZIP、C 盘最终状态迁移副本、旧服务启动/停止材料及校验记录必须继续保留到 C→D writer handoff、首个 D active、首个可启动 D prior 和同一 D state 回退全部通过。之后只能按精确清理清单移除 C→D 过渡材料；它们不得继续作为产品级回退权威。
 
 ### 5.4 后续增量
 
 - 新 candidate 以 manifest 对比 active inventory，只传缺失或 hash 变化对象；已存在对象按 hash 复用。
 - 任何 `.partial` 都不能成为 release；传输完成、hash 全通过后才原子重命名。
 - 发布包不再由人手制作、复制或解压；构建与传输均由 publish/deploy CLI 完成。
-- 资源垃圾回收不是本版关键路径；仅保留 active、明确 prior 和未过审计保留期的 release。
+- 终态生产 release 保留集合严格为 active 与恰一 prior；只有带合法 attempt journal 的运行中 candidate 可暂时额外存在。更早 prior、completed candidate、incoming/partial 与不再被两棵 manifest closure 引用的对象在终态审计后清理。
 
 ## 6. GitHub→VM 触发与安全比较
 
@@ -208,24 +208,22 @@ handoff 前作为明确的只读来源。生产入口必须在执行前验证 Wi
 - `content.knowledge_enrichment`：每个文档的 `not_applicable/pending/ready/failed_retryable/blocked_policy`、knowledge generation IDs、请求 model alias、官方确认的 provider model revision、model-identity evidence hash、API 返回 `model`/`system_fingerprint` 及 prompt/schema 版本；
 - `resources.inventory_hash` 与逐树摘要；
 - `state.compatibility`：comment/workspace 的 read/write schema 范围和 rollback compatibility；
-- `recovery.compatibility`：可接受的 recovery/checkpoint schema、restore protocol、state schema 范围与所需恢复能力；
 - 验证证据摘要与完整文件 hash inventory。
 
-`release_manifest.json` **不得**记录具体 `recovery_manifest`、bundle 或 checkpoint 的 ID/hash/time，也不得因每日 state-only backup 改写。commit、content snapshot 和 index 是 release 的组成，不是三套 active 身份。
+`release_manifest.json` **不得**记录具体 prior、`local_prior_binding`、receipt、切换 attempt、时间或动态控制信息。commit、content snapshot 和 index 是 release 的组成，不是三套 active 身份。
 
 依赖方向固定为：
 
 ```text
 active_release.json ───────────────► release_manifest.json (R, immutable)
-checkpoint_manifest.json (C) ─────► captured_under_active_release = R0
-recovery_manifest.json (RM) ───────► release_manifest = R
-                                 └─► checkpoint = C
-recovery_protection_receipt ──────► R + RM + C + pre-activation verdict
-activation_receipt ───────────────► R + RM + successful switch/verification result
-failure_receipt ──────────────────► candidate R + prior R + failed phase/rollback result
+local_prior_binding.json ─────────► active R + prior R
+activation_receipt ───────────────► active R + prior R + successful switch/verification result
+failure_receipt ──────────────────► original active/prior + candidate R + failed phase/result
+rollback_receipt ─────────────────► active R + prior R + switch/verification result
+cleanup_receipt ──────────────────► active R + prior R + exact removed targets/result
 ```
 
-箭头只允许从可变 pointer/后生成证据指向已确定的 immutable 对象；`R` 不反向引用 `RM` 或 `C`，因此不存在 manifest hash 循环。candidate `R` 可以用在 prior active `R0` 下取得、且经 compatibility gate 验证的 `C` 形成 `RM`；激活后新的 state-only checkpoint 则记录当时 current `R`。任何 checkpoint、recovery protection／activation／failure receipt 的产生都不得改变 `R`、`active_release.json` 或触发代码重新发布。
+箭头只允许从可变 pointer、pair binding 或后生成证据指向已确定的 immutable release；`R` 不反向引用 active、binding 或 receipt，因此不存在 manifest hash 循环。`local_prior_binding` 必须恰好绑定 `R_active/R_prior`，其 active hash 必须与 `active_release.json` exact 一致；不一致时当前 active 读取可继续，但新激活、回退和清理全部 fail closed。任何 receipt 的产生都不得改变 `R`，也不能取代 active pointer。
 
 ### 7.2 唯一 active authority
 
@@ -242,9 +240,16 @@ failure_receipt ──────────────────► candid
 
 它通过同卷临时文件 + atomic replace 更新。Web、Search、MCP 都从该 release 解析自己的只读 artifact，并在诊断端点返回 `release_id` 与 `manifest_sha256`。
 
-Archive catalog 的 document active mapping 是 release 内部只读数据；构建时必须和 manifest 一致，但它不是另一个部署 pointer。所有 receipt 和失败报告只证明事件，不参与当前身份解析。激活前完成 `RM→R/C` closure、独立故障域、状态兼容与 no-secret 校验后生成 `recovery_protection_receipt`；它只证明 candidate 当时具备恢复保护，不证明已经切换。只有 `active_release.json` 原子切换成功、candidate 启动且切换后 health/关键功能/writer fence 验证全部通过，才可生成成功 `activation_receipt` 并绑定已激活 `R`、此前验证的 `RM` 与验证结果。任一切换步骤失败只能生成 `failure_receipt`，绑定 candidate/prior、失败阶段、错误与回退结果，严禁写入或伪装成功 activation receipt。灾难恢复另生成绑定明确 `R/RM/C` 与恢复结果的 `recovery_receipt`。这些证据均不能被读取为 active pointer。
+Archive catalog 的 document active mapping 是 release 内部只读数据；构建时必须和 manifest 一致，但它不是另一个部署 pointer。所有 receipt 和失败报告只证明事件，不参与当前身份解析。激活前必须证明 candidate 与当前 active 均兼容同一当前 D state，并证明当前 active 可成为唯一 prior。只有 `active_release.json` 原子切换成功、candidate 启动、切换后 health/关键功能/writer fence 和新 `local_prior_binding` 全部验证通过，才可生成成功 `activation_receipt`。任一切换步骤失败只能生成 `failure_receipt`，绑定原 pair、candidate、失败阶段与结果，严禁写入或伪装成功 activation receipt。
 
-为关闭 pointer 切换与终态 receipt 之间的崩溃窗口，controller 在 pointer 切换前先写入 `recovery_coordination_only` 的 durable pending-activation journal，其中预选互斥的 activation/failure receipt ID；它不是 authority，也不改变 `R`。pending 期间 candidate 或 prior-recovery 服务只接受 SCM 临时传入且与 role/attempt/phase/nonce 完全一致的启动授权，普通 reboot/手工 start 必须拒绝。崩溃重放若已存在合法 activation receipt，只验证 candidate pointer 并清 journal；否则恢复明确 prior、生成或复用唯一 failure receipt 后清 journal。任一身份不符、journal 损坏或 prior 启动失败均 fail closed 并保留 journal 供显式恢复。
+为关闭 pointer、binding 与终态 receipt 之间的崩溃窗口，controller 在 pointer 切换前先写入 `activation_coordination_only` 的 durable pending-activation journal，其中预选互斥的 activation/failure receipt ID；它不是 authority，也不改变 `R`。pending 期间 candidate 或 prior 服务只接受 SCM 临时传入且与 role/attempt/phase/nonce 完全一致的启动授权，普通 reboot/手工 start 必须拒绝。崩溃重放机械判断是完成新 pair 还是恢复原 pair，并最终只留下一个终态 receipt；任一身份不符、journal 损坏或 prior 启动失败均 fail closed 并保留 journal 供显式处置。
+
+### 7.3 本地 prior 的保留与能力边界
+
+- 成功激活后，新 active 与旧 active 构成唯一 pair；更早 prior 仅在新 active、binding、receipt、hash、启动和 state compatibility 全部验证后清理。
+- 普通回退交换 pair 角色：旧 prior 成为 active，旧 active 成为新的恰一 prior。回退始终使用当前 D state，不替换 SQLite 文件、不倒退事件、不做 down-migration。
+- 运行中的 candidate 只有在存在合法 attempt journal 时可暂时作为第三棵树；终态后 completed candidate、incoming/partial 与更早 prior 必须审计清理。
+- 本版能力只覆盖生产 VM、精确 D 根、两棵 release closure 与当前 state 均完整可读时的最近一代版本切换。VM、D 根、对象库或 state 整体丢失超出本 change 的可恢复承诺，任何 certificate 或 receipt 都不得扩大该结论。
 
 ## 8. 前端兼容与渐进展示
 
@@ -343,7 +348,7 @@ generation_id = sha256(
 - 自动队列只为 **source bytes 发生变化** 且 `external_ai_allowed` 的文档创建 job；普通代码发布或重复 publish 不全量重跑未变化文档。
 - 模型、官方 revision、identity contract、prompt 或 schema 升级不会静默重写历史。它们只有在显式、可审计的 targeted recompile campaign 中才为选定 source versions 创建新 generation；旧 generation 永久保留。
 - 每次调用记录请求 alias、官方确认的 provider revision、identity evidence URL/hash/observed-at、API 返回 `model`、`system_fingerprint`、response ID/created、prompt/schema 版本、IR/source 输入 hash、job key、开始/结束状态和输出对象 hash，不记录 API key 或 Authorization header。
-- API key 从现有受保护凭据注入 compiler 进程，不进入 Git、日志、manifest、candidate、cold recovery bundle 或回退材料。
+- API key 从现有受保护凭据注入 compiler 进程，不进入 Git、日志、manifest、candidate、active/prior binding、receipt、D-root audit 或回退材料。
 - `private/no_external_ai`、敏感命中或外发许可不确定的内容不得构造 API 请求；状态记录为 `blocked_policy`，不是失败重试。
 - API 超时、失败、非法 JSON/schema、未知字段、越界 span 或证据无法定位均产生可审计 `failed_retryable/invalid_evidence`，不得改变当前 active knowledge。
 
@@ -389,7 +394,7 @@ compiler 启动与每个 campaign 开始时必须验证 identity contract。若�
 ### 11.5 核心存储
 
 - 原始 Markdown、IR JSON、DeepSeek 原始输出、验证结果和大对象进入 content-addressed object store；不同 generation 不覆盖。
-- Git 外受保护的本地 compiler workspace 保存 `semantic_job`、全部 `knowledge_generation`、待审核 candidate、decision audit 与正式 knowledge item；全体 job terminal 后通过 SQLite consistent backup 提升为带 immutable promotion receipt 的发布 authority。发布、holdout 与 artifact builder 只能以严格 read-only/immutable store 消费该 authority，禁止 `journal_mode` 切换、DDL、backfill 或 sidecar 创建；任何后续写入必须在新的 workspace 中完成并形成新 promotion。workspace/authority 本体不进入 Git、VM active state、release 或 cold bundle。
+- Git 外受保护的本地 compiler workspace 保存 `semantic_job`、全部 `knowledge_generation`、待审核 candidate、decision audit 与正式 knowledge item；全体 job terminal 后通过 SQLite consistent backup 提升为带 immutable promotion receipt 的发布 authority。发布、holdout 与 artifact builder 只能以严格 read-only/immutable store 消费该 authority，禁止 `journal_mode` 切换、DDL、backfill 或 sidecar 创建；任何后续写入必须在新的 workspace 中完成并形成新 promotion。workspace/authority 本体不进入 Git、VM active state、release、prior binding 或回退材料。
 - release 内只读 SQLite/JSON snapshot 保存 document/version/block/source_span/citation/evidence、当前正式 knowledge projection、被选中成功 generation 的必要 provenance 和 active membership；Web/Search/MCP 只读取这一密封投影。
 - FTS5/辅助 token 表用于文本召回；结构化列用于市场、频率、数据、目标、假设、状态和版本过滤。
 - 评论、Dashboard、workspace 不进入知识 snapshot，也不污染来源。
@@ -517,7 +522,7 @@ tool-choice fixture 必须同时包含应调用、不应调用、调用过早/�
 - `D:\quant\quant_platform\state\research_workspace.sqlite3`：Workspace node/observation/event/comment 等现有可变状态。
 - release manifest 只声明兼容 schema 范围，不把具体数据库 hash 或“comment authority version”纳入 release identity。
 
-候选验证使用 online backup 副本；不得对 active 数据做探测写。跨 release、升级、回退、进程重启和故障恢复都必须验证两族 comment 及所有非 comment 状态不丢失。
+候选验证使用 D-root 内的 online backup 隔离副本；不得对 active 数据做探测写。跨 release、升级、回退和进程重启都必须验证两族 comment 及所有非 comment 状态不丢失。隔离副本在候选终态后清理，不能作为可选状态版本。
 
 ### 14.2 稳定目标、锚点与跨版本可见性
 
@@ -531,20 +536,20 @@ tool-choice fixture 必须同时包含应调用、不应调用、调用过早/�
 
 非空端到端 fixture 固定执行：在 source v1 写入一条 document comment、一个可唯一重定位的 block comment 和一个将在 v2 被改写的 span comment；发布新代码，执行同路径修订与纯移动，确认前两类在正确位置可见、改写项进入 unresolved/history；再回退到 D prior release 并读取。浏览器和 SQLite 查询必须共同证明所有 comment 的 current/event/revision/actor/created_at/updated_at 未被发布、修订、renderer 或回退改写，且没有错误自动挂接。
 
-### 14.3 备份与恢复
+### 14.3 候选隔离副本与状态完整性
 
-- 切换前和按运维节奏使用 SQLite online backup；停止 writer 后再取得最终一致副本。
-- 每份备份验证 integrity、foreign key、schema、核心表计数和逻辑摘要。
-- 恢复先到 staging 路径校验，再以 writer fence + atomic replace 切权威文件。
-- WAL/SHM 不作为备份复制协议；禁止把 release 内 seed 覆盖非空外置库。
+- candidate 验证需要写入 fixture 时，只能以 SQLite online backup 在 D-root isolation 目录生成瞬态副本；active 数据只做不改变物理 bytes 的读取与完整性检查。
+- 每份隔离副本验证 integrity、foreign key、schema、核心表计数和逻辑摘要；候选成功或失败后均清理数据库、WAL/SHM 和工作目录。
+- 首次 C→D writer handoff 在写入 fence 内取得最终一致副本并落为新的 D state authority；D 开放外部写入后，任何普通回退都不得再替换 state 文件。
+- release 内 seed 禁止覆盖非空外置库。本版不建立周期性状态副本、状态时间点选择器或 D 根之外的项目状态存储。
 
 ### 14.4 SQLite schema 前向兼容与回退
 
 - 每个 release manifest 声明 comment/workspace schema 的 `read_min/read_max/write_min/write_max`，激活前同时验证 candidate 与已锁定 D prior。
 - 正常 schema 升级采用 expand/compatible/contract：先添加旧 release 可忽略的表、列或索引；在 prior 仍处于回退窗口时禁止 destructive rename/drop 或改变旧写入语义。
 - 候选若升级 state schema，必须用升级后的真实 fixture 证明 D prior 仍可启动、读写和保持事件/CAS 语义；否则在激活前提供兼容 adapter/prior release，无法做到则拒绝升级。
-- 普通代码回退只切 D prior，继续使用当前已升级 D state，不做 down-migration、不恢复旧状态备份。contract 清理必须等所有 retained prior 和 recovery manifest 都不再要求旧 schema 后另行放行。
-- 状态库损坏不属于普通代码回退；只有灾难恢复流程在明确授权、选择恢复点并报告潜在数据损失后才能替换 active state。
+- 普通代码回退只切 D prior，继续使用当前已升级 D state，不做 down-migration、不替换当前 SQLite 文件。contract 清理必须等 active 与恰一 prior 都不再要求旧 schema 后另行放行。
+- 状态库损坏或整体丢失不属于普通代码回退；本 change 对该场景不提供状态替换或系统重建承诺，控制器必须 fail closed 并明确报告能力边界。
 
 ### 14.5 PostgreSQL 触发条件
 
@@ -553,63 +558,49 @@ tool-choice fixture 必须同时包含应调用、不应调用、调用过早/�
 - 多台应用主机或多个并行 writer 成为正式要求；
 - 监控发现持续 lock contention/timeout，SQLite WAL 与重试仍不能满足；
 - 公司提出集中 HA、PITR、跨机 RPO/RTO 或统一审计的强制要求；
-- comment 负载和运维恢复演练证明单文件数据库成为真实瓶颈。
+- comment 负载和一致性/故障测试证明单文件数据库成为真实瓶颈。
 
 “VM 已安装 PostgreSQL”或“Industry Demo 使用 PostgreSQL”不是触发理由。
 
-## 15. Cold recovery bundle 与灾难恢复
+## 15. VM 本地 active/prior 回退与严格保留
 
-### 15.1 与普通回退的边界
+### 15.1 能力边界
 
-- **普通代码回退**：active release 出错但 D state/objects 完好时，切回 D prior release，继续使用当前 D state，绝不倒退评论或工作区状态。
-- **灾难恢复**：D 目录/对象误删、state 损坏或 VM 重建时，操作者显式选择 cold bundle 与 state checkpoint；允许恢复到已声明时间点，并必须报告该时间点之后可能丢失的可变状态。灾难恢复不得自动触发。
+- **普通代码/内容回退**：active release 出错但生产 VM、精确 D 根、当前 D state 与两棵对象 closure 完好时，切到唯一 prior，继续使用当前 D state，绝不倒退评论或工作区状态。
+- **明确不覆盖**：VM、D 根、对象库或 state 整体丢失。本 change 不提供这类场景的系统重建或状态替换承诺，控制器必须 fail closed，release certificate 必须显式披露剩余风险。
+- 稳态只保留精确 D 根内的 active、恰一 prior 与二者共用的当前 state；candidate 的 online-backup 数据库只存在于 D-root isolation，用后即清。
 
-### 15.2 自动生成与故障域
+### 15.2 Pair binding 与保留集合
 
-每个可生产激活的 release 都必须由发布系统自动生成一个 self-contained logical bundle，可物化为目录或 archive：
+生产稳态的 release roots 固定为：
 
 ```text
-cold-recovery-<bundle_id>/
-  recovery_manifest.json
-  release/                 # 精确代码、前端、release_manifest
-  content/                 # 内容 snapshot、IR、knowledge、search/MCP index
-  resources/               # PDF、图片、对象及完整 closure
-  state-checkpoint/        # SQLite online backup 与恢复点元数据
-  operational/             # D-root tooling/python、固定控制面、service install candidate 与启动所需无 secret 闭包
-  tools/restore/           # 固定恢复/验证命令
-  RUNBOOK.md
-  SHA256SUMS
+active_release.json ───────► R_active
+local_prior_binding.json ──► R_active
+                           └► R_prior
 ```
 
-最终 `RECOVERY_ROOT` 必须保存到 **生产 VM 整机之外**、且经实测独立的故障域，默认候选是开发工作站受保护目录或经批准的独立网络存储。同一生产 VM 上的 C/D/E 等任何本地或虚拟盘、挂载点、subst、junction/reparse、映射回该 VM 的共享路径，即使盘符不同也一律不合格。
+`active_release.json` 是唯一 current authority。`local_prior_binding.json` 只提供最近一代回退资格，必须 exact 绑定 active/prior 的 release ID、manifest SHA-256、canonical path、state compatibility verdict 和生成 attempt；它不参与 Web、Search、MCP 的 current 解析。两份 release manifest 都不能反向引用 active、binding 或 receipt。
 
-实施门禁必须生成 `recovery_failure_domain_attestation`，至少记录 production host identity、recovery host/storage authority identity、canonical path、volume/backend identity、UNC/重解析解析结果、探测时间与工具版本，并证明：
+成功激活后，新 candidate 成为 `R_active`，旧 active 成为 `R_prior`。旧于 prior 的 release 只有在新 active、binding、activation receipt、启动、关键功能和当前 state 兼容性全部通过后才可精确清理。运行中的 candidate 仅在存在合法 durable attempt journal 时可暂时作为第三棵树；终态后 completed candidate、incoming/partial 与不再被 active/prior closure 引用的对象必须清理并生成 receipt。
 
-1. recovery host/storage authority 与生产 VM host 不同；
-2. `RECOVERY_ROOT` 不依赖生产 D 的对象或同一 VM 本地卷；
-3. 开发机候选根中的 bundle 可独立通过 hash/closure 检查，且唯一生产 VM 的真实 empty-D materialization event 与该 bundle/root/host/storage identity 已机械绑定。
+首次 C→D handoff 不设置内容等价的 bootstrap 特例：在开放 D 流量前，先以冻结 V39 baseline `R0` 建立尚未对外的 active，再通过正常激活协议切换到真实 successor `R1`，由 `R0` 成为 prior。无法提供真实 `R1/R0` pair 时继续停留在隔离验证，不得开放 D 外部流量或伪造 prior。
 
-只配置路径、看到不同盘符或成功写入一次都不构成故障域证明。为避免“无 bundle 不能恢复、无恢复事件不能 attestation、无 attestation 又不能建 bundle”的循环，首个 V39 `legacy_c` 闭包允许在已验证不同 host/storage 且无 reparse 的候选根作为 **qualification bundle** 生成；它只能用于真实空 D 恢复，不得签 recovery protection。物化事件完成并形成最终 attestation 后，同一 root/bundle 才可进入生产恢复保护。后续 `d_active`/state-only/publish 路径一律先验证新鲜 attestation，不得使用该资格豁免。对象仓库可以在合格 `RECOVERY_ROOT` 中按 hash 去重，但任一 retained recovery manifest 的完整 closure 必须独立可读并通过 missing-object 检查。
+### 15.3 激活与回退
 
-### 15.3 Manifest、安全与恢复点
+- 激活前同时验证 candidate、当前 active、当前 state schema/read-write compatibility，以及当前 active 成为 prior 后的可启动性。任何失败都发生在 pointer 切换前。
+- 激活成功必须依次闭合 active pointer、candidate start、post-activation health/关键功能/writer fence、pair binding 和 activation receipt；之后才清理更早 prior。
+- 激活失败只写 failure receipt 并恢复原 pair；未成功激活的 candidate 不能成为 prior。
+- 人工普通回退交换 pair 角色：旧 prior 成为 active，旧 active 成为新的恰一 prior。回退继续使用当前 D state；不替换 SQLite 文件、不恢复旧事件、不降级 schema。
+- pointer、binding、receipt 之间的 pending journal 只作 crash coordination。重放必须最终得到一个 exact pair 与一个终态 receipt；普通 reboot/手工 start 在 pending 时 fail closed。
 
-`recovery_manifest.json` 在 release manifest hash 已确定后生成，至少记录自身 schema/bundle ID、**单向引用**的 release manifest SHA-256、完整文件/对象 inventory、content/index IDs、一个明确 immutable SQLite checkpoint manifest/hash/time/schema/logical counts、可从空 D 启动服务的 operational bootstrap inventory/hash、compatibility verdict、restore tool hashes 和 no-secret attestation。它不得被 release manifest 反向引用。operational closure 必须覆盖 `tooling/python`、固定控制面模块/配置 schema 和 service install candidate；受保护 access digest、API key、SSH/GitHub credential 等仍在恢复后由受保护渠道重新注入，不得打包。
+### 15.4 清理与边界验收
 
-- API key、GitHub/VM 凭据、cookie、session、密码和 Authorization header 均不得进入 bundle、manifest、日志或 runbook；恢复后由受保护配置重新注入。
-- state checkpoint 使用 SQLite online backup；每次产生新的 immutable checkpoint manifest，记录 `captured_at`、当时观察到的 active release manifest hash、state authority/schema/logical counts 和数据库 hash，并验证 integrity、foreign key 与可恢复性；不复制 WAL/SHM 作为恢复协议。
-- 至少在每次 production publish、每次 state schema 迁移前后生成 checkpoint；另以一个可监控、可重试且不阻塞在线写入的 state-only backup job 至少每 24 小时运行。每次成功任务创建新的 `C`、引用当前 `R` 的新 `RM` 和 checkpoint receipt；复用 content-addressed release/resource closure，不修改 `R`、不切 active、不要求重新发布代码。
-- 动态 `recovery_protection_status` 只能由 retained、closure 可读且完全验证的最新 `C/RM` 推导，RPO age 使用 `now - checkpoint.captured_at`，不能使用 job start、receipt 或最后一次尝试时间。`protected` 要求 age 不超过 24 小时且最近任务/attestation 无未裁决失败；最近任务失败或 checkpoint 超龄但仍可恢复时为 `degraded`；不存在有效 checkpoint、closure/attestation 无效或恢复验证失败时为 `failed`。`degraded/failed` 必须告警、重试，并禁止 release certificate/运维面声称 RPO 已满足，但不得阻塞在线 comment 写入。
-- candidate 在激活前必须确认一个单向绑定 candidate `R` 和兼容 `C` 的 `RM` 已写入 attested 独立故障域并通过机器校验，并生成 `recovery_protection_receipt` 后才能获得“recovery protected”状态；此时不得生成 `activation_receipt`。成功切换并完成切换后验证才生成 `activation_receipt`；切换失败只生成 `failure_receipt`。
-
-### 15.4 空目录恢复演练与清理
-
-- **首次生产切换前**，cold bundle 仍必须保存在生产 VM 整机之外、不同 host/storage 的 attested `RECOVERY_ROOT`；但恢复执行端固定为唯一目标 VM `10.5.1.240`，不依赖 `.223/.235` 或第二台恢复 VM。旧 C 盘 V39 继续在线且 D 尚未承接 writer 时，先验证恢复闭包与 writer fence，再清空精确 `D:\quant\quant_platform`，仅凭 off-host V39 bundle、受保护运行配置和 runbook 恢复并通过验收。该证据不存在时，C→D 只能做副本候选验证，不得开放生产流量或转移 writer authority。
-- 旧 C V39 占用生产 `8765` 时，恢复后的 D candidate 必须由 D-root tooling 在 loopback 隔离端口启动，使用 D `tmp` 内的 checkpoint 副本，并返回 exact release/manifest/snapshot；它不得改 production active pointer、生产 state、C 盘或外部 writer authority。浏览器/API/资源验收与清理审计通过后才可进入正式 writer fence。生产 Windows Service 仍固定 `0.0.0.0:8765`，不得为了 candidate 验证改变正式拓扑。
-- 首次 C→D 切换期间保留 V39 ZIP、C 状态备份和旧服务恢复材料，直到 D active、D prior rollback、cold bundle 和空目录恢复全部实测通过。空 D 恢复通过之前同样禁止任何清理。
-- Stage 5 还必须对功能完整的最终 release 重跑一次空 D 灾难恢复，防止只有 V39 基线可恢复而 parser/knowledge/MCP 资源闭包不可恢复。若 D 已成为 active writer，必须先建立维护窗、最终 checkpoint、外部流量/writer fence 与可验证的恢复路径，禁止在线直接删除活动目录来制造测试。
-- 恢复验收覆盖 manifest/hash、代码/前端、全部资源链接、页面/Search/MCP snapshot、SQLite 状态、schema compatibility、operational tooling/control/service candidate、受保护凭据重新注入后的启动和关键浏览器/API。只恢复 `release/state/tools/control` 而缺少可启动的 D-root operational closure 不得签发成功 recovery receipt。
-- 对象清理使用 mark-and-sweep，根集合持续包含 active release manifest、D prior release manifest、全部 retained recovery manifests 和全部 retained checkpoints；沿 `RM→R/C→closure` 遍历。任一根仍引用的对象不得删除，state-only backup 不得通过替换“latest”使旧 retained checkpoint 失去保护。
-- 清理首次迁移材料或旧 recovery bundle 必须生成可审计 cleanup receipt，证明仍存在一个已演练、完整且满足保留策略的恢复路径。
+- 第三个 retained release、多个 prior、binding/active 漂移、清理失败或对象 closure 缺失均阻止下一次 publish。
+- 清理必须先校验 exact canonical target、无 reparse、目标不属于 active/prior closure，再执行并生成 path/hash/delta receipt；不能用宽泛目录或目录时间决定删除对象。
+- Stage 5 必须对功能完整 release 执行 active→prior→active 序列，覆盖代码/前端、内容、PDF/图片/对象、页面/Search/MCP snapshot、当前 SQLite state、schema compatibility、浏览器/API 和评论生命周期。
+- Stage 5 同时检查 installed wheel、CLI、config、schema、Windows 任务清单、runbook 引用和 VM write-set：不得存在 D 根之外的项目存储、周期性状态副本任务或不属于 active/prior 合同的正式权威入口。
+- C→D 过渡材料只保留到 writer handoff、首个 active、首个可启动 prior 与同一 state 回退全部通过；其后按精确清单审计清理，不继续作为产品级回退权威。
 
 ## 16. 激活、回退与故障语义
 
@@ -622,19 +613,20 @@ cold-recovery-<bundle_id>/
 - V39 legacy screenshot/interaction regression；
 - content snapshot 的 page/search/MCP consistency；
 - knowledge enhancement 状态合法；base snapshot 不含旧版本冒充的当前语义知识，enriched snapshot 的 generation 已验证/接受；
-- comment/workspace backup 副本读写 fixture 后回滚；
+- comment/workspace 隔离副本读写 fixture 后清理；
 - rollback release 可启动且兼容同一 D state。
-- 单向 `RM→R/C` 的 cold recovery bundle 已在 attested 独立故障域完成 closure/hash/state checkpoint/no-secret 验证，激活前 `recovery_protection_receipt` 已绑定 candidate `R/RM/C` 且没有 release↔recovery hash 环；首次生产 handoff 还必须已有 V39 真实空 D 恢复 PASS，缺任一证据均禁止生产切换。`activation_receipt` 不是激活前门禁输入，只能在切换和切换后验证成功后生成。
+- 当前 active 可成为唯一 prior；candidate 与当前 active 均对同一当前 D state 通过 read/write/schema/启动验证；预期 pair 满足 exact path/hash、无 reparse、恰一 prior 与空间预算。`activation_receipt` 不是激活前门禁输入，只能在 pointer、启动、post-activation、binding 全部成功后生成。
 
 ### 16.2 切换
 
 1. 获取 VM deployment lock，重新验证 active 与 candidate。
-2. 锁定 prior release，确认可兼容当前 state。
-3. 停止 active 服务并取得必要的最终 state backup。
-4. atomic replace `active_release.json`，启动 candidate。
-5. 验证 health、关键页面、搜索、MCP、评论读取和写入 canary。
-6. 全部成功后才写入成功 `activation_receipt`。
-7. 任一步失败则停止 candidate，恢复 prior pointer并启动 prior；状态仍在同一 D root，并只写入 `failure_receipt`，不得生成成功 activation receipt。
+2. 锁定当前 active 为拟议唯一 prior，确认 candidate 与当前 active 都兼容同一当前 state。
+3. 停止 active 服务；不得替换或倒退 state。
+4. 写入 crash-coordination journal，atomic replace `active_release.json`，启动 candidate。
+5. 验证 health、关键页面、搜索、MCP、评论读取/写入 canary 和 writer fence。
+6. 写入并复验 `local_prior_binding`，全部成功后才写入 `activation_receipt`。
+7. 清理更早 prior 与终态 candidate/incoming，生成 `cleanup_receipt`，复验终态只有 active 与恰一 prior。
+8. 任一步失败则停止 candidate、恢复原 active/pair 并只写 `failure_receipt`；状态始终为同一 D state，不得生成成功 activation receipt。
 
 不要求为无实际影响的 Python/package 小版本差异 HALT；门禁关注真实导入、关键路径、数据兼容、浏览器行为和可回退性。
 
@@ -644,8 +636,8 @@ cold-recovery-<bundle_id>/
 
 - 冻结 V39 全资产 inventory、代表性页面/API/数据/浏览器基线。
 - GitHub 保持 Public；建立 secret/large file/reference/PDF/SQLite/object/internal-research 禁入门禁。
-- 实现单一 immutable release manifest、active pointer、单向 `RM→R/C` 合同、证据 receipt、VM deploy CLI 骨架和 state root 合同，并用依赖图/linter 证明 `R` 不含动态 recovery/checkpoint identity。
-- 实测本地测试入口、VM 网络/权限/端口和 cutover budget；只读发现 `RECOVERY_ROOT` 候选，不因盘符不同预判其独立性。
+- 实现单一 immutable release manifest、active pointer、`local_prior_binding→active/prior` 合同、证据 receipt、VM deploy CLI 骨架和 state root 合同，并用依赖图/linter 证明 `R` 不反向引用 active、binding 或 receipt。
+- 实测本地测试入口、VM 网络/权限/端口、cutover budget，以及 exact D 根内 releases/control/state/isolation 的 canonical path 与无 reparse 边界；不发现或配置 D 根之外的项目存储。
 
 **门禁**：能从 manifest 重建并验证 V39 candidate；未触碰现网 writer。
 
@@ -653,18 +645,18 @@ cold-recovery-<bundle_id>/
 
 - 全量同步 V39 Git 外 assets；建立隔离候选。
 - 完成 legacy 页面/功能/数据对照。
-- 对开发机候选 `RECOVERY_ROOT` 先生成 host/storage/path/volume/backend facts，证明它不在生产 VM 的任何盘符或映射回该 VM 的路径；用完整 qualification bundle 在 `.240` 完成真实空 D 物化后，再将事件和 bundle/root identity 密封为最终 attestation。
-- 先冻结 V39 `R`，再生成 immutable `C` 与单向引用 `R/C` 的 `RM`。首个 `legacy_c` qualification bundle 不能签 protection receipt；空 D 物化与最终 attestation 通过后，激活前 `recovery_protection_receipt` 才可绑定已验证的 `R/RM/C`，但不得声称已经激活。恢复执行端固定为 `.240`：在旧 C writer 继续服务期间对精确 D 根完成真实空目录恢复；实际 handoff 成功并验证后才生成 `activation_receipt`，失败则生成 `failure_receipt`。
-- 只有前述空 D 恢复 PASS 后，才演练并在获批 apply 时执行 C 状态备份、外部流量/writer fence 与 D exact-V39 baseline handoff；之后另建 D candidate 演练 D prior rollback。
-- 全程保留全部旧 C/V39 恢复材料，直到 D active、D prior、cold bundle 和空 D 恢复四项均通过。
+- 建立 exact D 的 release inventory：生产终态只允许 active、恰一 prior 与当前 state；合法 journal 可暂时授权一个 candidate，终态后必须清理。
+- 从冻结 V39 inventory 构建唯一 baseline `R0`，并在其上建立具有真实不同 manifest/release identity 的 successor candidate `R1`；在旧 C writer 继续服务期间以 D-root isolation 的 SQLite 副本分别完成验证。正式 handoff 在外部流量/writer fence 内取得最终一致副本并落为 D state，先建立尚未对外的 `R0` active，再以正常激活协议形成 `R1` active + `R0` prior；D 尚未接受外部写入时失败可退回未变化的 C，只有真实 pair 通过后才开放 D 流量并使 C 永久退出 writer authority。
+- 证明 current active 可成为 prior、两版本兼容同一 D state，完成激活与 `local_prior_binding` 后演练 active/prior 角色交换。
+- 全程保留 C→D 过渡材料，直到 writer handoff、D active、首个可启动 prior 与同一 state 回退全部通过；其后按精确清单审计清理，不继续作为产品级权威。
 
-**门禁**：D baseline 在副本状态下实测通过；`RECOVERY_ROOT` 独立故障域 attestation、V39 cold closure 与真实空 D 恢复 PASS 是首次生产 handoff 的前置条件。之后“无外部 D 写入则退 C”和“D 开放流量后只退 D prior”语义分别验证；批准前仍不切现网，正式 apply 时 D 一旦开放流量，C 永久退出 writer authority。
+**门禁**：D baseline 在副本状态下实测通过；exact D write-set、writer fence、最终 state 一致性和 C→D 过渡语义通过。之后“无外部 D 写入则退 C”和“D 开放流量后只退 local prior”分别验证；正式 apply 时 D 一旦开放流量，C 永久退出 writer authority。
 
 ### Stage 2：一次 publish 自动发布
 
 - 实现受控 local publish CLI、GitHub-hosted exact-SHA CI 和 VM 调用 adapter。
 - 实现 latest-only coalescing、deployment lock、partial cleanup、失败报告和显式 replay。
-- publish 在不改写 `R` 的前提下生成新的 `RM/C/recovery_protection_receipt` 并维护跨故障域 cold closure；成功切换并验证后生成 `activation_receipt`，失败只生成 `failure_receipt`。本版不实现裸 push watcher、pre-push 部署 hook 或 self-hosted runner。
+- publish 在不改写 `R` 的前提下验证当前 active 可成为 prior，原子切换后生成 exact `local_prior_binding` 与 `activation_receipt`；失败只生成 `failure_receipt` 并恢复原 pair。终态清理更早 prior 与 candidate。本版不实现裸 push watcher、pre-push 部署 hook 或 self-hosted runner。
 
 **门禁**：一次命令从 push 到 candidate/activation 全自动；故障不影响 active；不人工制作广播包。
 
@@ -689,11 +681,11 @@ cold-recovery-<bundle_id>/
 
 ### Stage 5：全局验证与 release certificate
 
-- 全量重放、增量/幂等/DeepSeek 失败与升级、异常/恢复/性能/安全回归。
-- 独立 verifier 检查来源、无环 manifest 依赖、动态 RPO age、浏览器、搜索、MCP 拓扑、state/comment 锚点和回退证据。
+- 全量重放、增量/幂等/DeepSeek 失败与升级、异常/回退/性能/安全回归。
+- 独立 verifier 检查来源、active/prior 无环 manifest 依赖、严格两版本保留、浏览器、搜索、MCP 拓扑、state/comment 锚点和回退证据。
 - 执行非空 comment 序列：写入→新代码→source 修订/移动→renderer 展示→D prior 回退→再读取，验证 stable document target、确定性重定位与 unresolved/history 可见性。
-- 对最终功能完整 release 在非生产真实空 `D:\quant\quant_platform` 目标仅凭独立故障域 cold bundle 重跑灾难恢复；验证 schema forward/rollback compatibility、对象保留和 cleanup roots。
-- D active、D prior、cold recovery、空目录恢复全部通过后才允许清理旧 C/V39 恢复材料，并形成 release certificate。
+- 对最终功能完整 release 执行 active→prior→active 序列，验证 schema forward/rollback compatibility、当前 state 不倒退、对象只按两棵 closure 保留，以及第三 release/清理失败反例 fail closed。
+- 检查 source、fresh installed wheel、CLI、config、schema、Windows 任务清单、runbook 引用和 VM write-set，证明不存在 D 根之外的项目存储、周期性状态副本或不属于 active/prior 合同的正式权威入口。通过后按 C→D 过渡清理合同处置旧材料并形成 release certificate。
 - Vector、HTTP MCP、PostgreSQL、高级展示仅在各自触发条件成立时进入独立子决策；它们不是本版完成前置。
 
 ### Stage 6：Public→Private 最终关闭
@@ -712,10 +704,10 @@ cold-recovery-<bundle_id>/
 - V39 关键页面、DOM、桌面/窄屏截图、公式、表格、引用、评论、Dashboard、Paper Lab 和访问门禁无未授权差异。
 - 完整 PDF/图片/对象/内容库 inventory 的 path/size/hash 对齐，链接可达。
 - 精确 SHA CI 与 candidate manifest 可追溯；active 目录无 `git pull`。
-- `R` 不含具体 `RM/C`；`RM` 只单向引用 `R/C`；state-only job 产生新 immutable `C/RM/receipt` 而不改变 `R` 或 active。依赖图和 hash fixture 证明无环。
-- 切换失败能自动回到 D prior release；C 不再成为 writer。
-- 最终 `RECOVERY_ROOT` 有生产 host 不同、storage authority 独立、路径解析无回指和生产 VM/D 不可用时仍可读的实测 attestation；同一 VM 其他盘符不合格。
-- V39 真实空 D 恢复在首次生产切换前通过；最终功能完整 release 在 Stage 5 再通过一次空 D 恢复。此前不得清理 V39 ZIP、C 状态备份或旧服务材料。
+- `R` 不反向引用 active、`local_prior_binding` 或 receipt；binding 只指向 active/prior，activation/rollback、failure、cleanup receipt 分别指向结果 pair、原 pair + candidate、保留 pair + 精确移除目标及结果。依赖图和 hash fixture 证明无环。
+- 切换失败能恢复原 active/pair；成功终态只保留 D active 与恰一 prior，C 不再成为 writer。
+- active/prior 均在生产 VM exact D 根内通过 canonical path、无 reparse、manifest closure、启动和同一当前 state compatibility 验证；第三 release 或 D 根之外项目路径均使门禁失败。
+- Stage 5 对最终功能完整 release 完成 active→prior→active，证明 state 不替换、不降级、评论/工作区事件不倒退；release certificate 明确不覆盖 VM、D 根、对象库或 state 整体丢失。
 - Stage 5 后 Public→Private 的 CI 与无切换 candidate 演练通过。
 
 ### 18.2 内容与一致性
@@ -729,11 +721,11 @@ cold-recovery-<bundle_id>/
 
 ### 18.3 评论与状态
 
-- 两族 comment 的 current/event/revision/actor/time 跨发布、source 修订/移动、renderer 升级、代码回退和恢复一致；document comment 绑定 stable identity，block/span 只在 exact/unique proof 下重定位，失败项在 history/unresolved 可见。
+- 两族 comment 的 current/event/revision/actor/time 跨发布、source 修订/移动、renderer 升级和代码回退一致；document comment 绑定 stable identity，block/span 只在 exact/unique proof 下重定位，失败项在 history/unresolved 可见。
 - 非 comment 的 progress/workspace 状态同样位于 release 外且不被 seed 覆盖。
-- 真实空集和非空 fixture 均完成备份/恢复；integrity/foreign-key/schema/count 全通过。
+- 真实空集和非空 fixture 均在 D-root candidate 隔离副本完成写入/清理与完整性验证；active state 的 integrity/foreign-key/schema/count 全通过且物理/逻辑状态不被候选改变。
 - candidate 与 D prior 均兼容升级后的 SQLite schema；普通回退不降级或替换当前 state。
-- RPO 由最新成功且完全验证的 checkpoint `captured_at` 实际年龄计算；超龄或任务失败进入 degraded/failed 并告警，不能继续声称 protected。
+- 系统不存在周期性状态副本任务或状态时间点选择器；普通回退只切 active/prior 并沿用当前 D state。state 整体不可用时 fail closed，不能声称本地 prior 提供数据保护。
 
 ### 18.4 检索与 MCP
 
@@ -751,13 +743,14 @@ cold-recovery-<bundle_id>/
 - **本地 publish 期间离线**：active 不变，candidate 可显式重放；不后台猜测完成。
 - **首次 800+ MB 复制失败**：`.partial` + hash resume；只有完整 inventory 通过才重命名。
 - **C/D 双写**：候选只用副本；切换时停服务、最终复制、禁用 C writer；rollback 使用 D state。
-- **release/recovery hash 环或每日备份漂移 active**：固定 `active→R`、`C→captured R`、`RM→R/C`、`receipt→R/RM/C`；`R` 不含动态 ID，state-only job 永不改写 active。
+- **active/prior identity 漂移或形成第三 current**：固定 `active_release→R_active`、`local_prior_binding→R_active/R_prior`、`receipt→pair/result`；`R` 不含动态控制信息，binding 与 active 不一致时新激活/回退/清理全部 fail closed。
 - **comment 仍在库但页面不可见/错挂**：stable document target、exact unique anchor mapping、history/unresolved fallback 和非空浏览器/数据库序列门禁。
 - **stdio 客户端使用旧知识**：每次 current-sensitive 请求校验 VM identity；不一致或不可达返回 stale/unavailable，跨项目 profile 与 rollback trace 实测。
 - **机器提取误导 agent**：字段级 span、状态分层、冲突验证；candidate 默认不参与权威推荐。
 - **DeepSeek 故障或注入**：changed-only job、外发 policy、无工具隔离、严格 schema/span 验证；确定性 base snapshot 独立发布。
 - **DeepSeek alias 漂移**：官方 revision evidence + per-response model/fingerprint 双绑定；身份不明先隔离，新 generation 与 targeted recompile 后才可替换。
-- **D/VM 灾难**：生产 VM 整机外的 attested cold bundle、状态恢复点、首次切换前与最终 release 的空目录实演、manifest-rooted 对象保留。
+- **VM、D 根、对象库或 state 整体丢失**：本版没有重建承诺；控制器 fail closed，release certificate 明确披露该剩余风险，不得用本地 prior 测试扩大结论。
+- **只有一个 prior**：每次激活前证明 candidate 与当前 active 都兼容当前 D state；成功后严格保留新 active + 旧 active，终态清理更早版本。需要多代版本或数据保护时必须另立经用户批准的 change。
 - **SQLite 升级破坏 prior**：expand/compatible/contract 与 prior 实测；普通回退沿用当前 D state。
 - **评测过拟合**：sealed holdout、hard negative/no-answer、切片指标和有限放行次数。
 - **工具过度拆分**：tool-choice trace 决定合并/拆分，规格不锁死数量。
@@ -770,17 +763,17 @@ cold-recovery-<bundle_id>/
 4. 两族 comment 与其他线上状态本版继续使用 release 外 SQLite。
 5. MCP 本版只完成客户端本地 stdio；交付可跨项目安装 profile，并至少在 `quant_platform` 与 `D:\quant\backtest_demo` 两个真实消费者验收。Streamable HTTP 延后。
 6. `deepseek-v4-pro` 作为 changed-only、policy-gated 的语义候选编译器；当前官方确认 revision 为 `DeepSeek-V4-Pro-0813`，但每次 generation 仍必须保存官方 identity evidence 与 API 返回身份，不能依赖 alias 永久不变。
-7. 最终 `RECOVERY_ROOT` 必须位于生产 VM 整机之外并通过故障隔离实测；V39 空 D 恢复 PASS 前禁止首次生产切换和旧材料清理。
-8. Release/recovery identity 固定为无环单向图；动态 checkpoint 只产生新的 recovery 证据，不改变 release identity 或 active。
+7. 生产 VM 项目存储严格限于精确 `D:\quant\quant_platform`；生产稳态只保留 active + 恰一 prior，普通回退沿用同一当前 D state。
+8. Release identity 固定为无环单向图：`active_release→R_active`、`local_prior_binding→R_active/R_prior`；activation/rollback、failure、cleanup receipt 分别只指向结果 pair、原 pair + candidate、保留 pair + 精确移除目标及结果。release manifest 不反向引用控制对象。本版不设置周期性状态副本，也不声明整机、D 根、对象库或 state 整体丢失后的重建能力。
 
 ## 21. 实施期边界与放行状态
 
 用户已解除设计 HALT 并批准连续 apply Stage 0–6。当前允许实现、测试、Public Git/CI、
-受控 VM D-root candidate 和既定验收；不允许绕过真实空 D recovery、writer fence、状态
-兼容或 recovery protection 门禁。D active、C→D writer handoff、旧材料清理和
+受控 VM D-root candidate 和既定验收；不允许绕过 writer fence、active/prior 同一 state
+兼容、严格两版本保留或 D-root write-set 门禁。D active、C→D writer handoff、旧材料清理和
 Public→Private 仍分别受 Stage 1/5/6 的机器证据约束，不能因本地测试 PASS 自动放行。
 
 设计审核的历史证据仍保留在
 `project_state/reviews/quant_platform_vm_mcp_20260820/Codex实施前针对性合同修订审核_20260821.md`；
-它只证明合同当时一致，不替代当前代码、CI、VM、浏览器、SQLite、RAG/MCP 和灾难恢复
+它只证明合同当时一致，不替代当前代码、CI、VM、浏览器、SQLite、RAG/MCP 和本地回退
 证据。实施状态、外部 blocker 与最新身份以 `project_state/CURRENT.md` 顶部权威表为准。

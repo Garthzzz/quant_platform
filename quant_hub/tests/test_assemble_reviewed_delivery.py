@@ -717,7 +717,7 @@ class ReviewedDeliveryAssemblyTests(unittest.TestCase):
             ["ASSEMBLY_SEAL.json"],
         )
 
-    def test_real_assembly_gate_publish_recovery_and_activation_contract(self) -> None:
+    def test_real_assembly_gate_publish_and_activation_contract(self) -> None:
         fixture = self.fixture(seed_resource=True)
         fixture.assemble()
         seal_path = fixture.output / "ASSEMBLY_SEAL.json"

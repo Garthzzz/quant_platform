@@ -39,12 +39,6 @@ def base_manifest(
         },
         "resources": {},
         "state": {"compatibility": {"comments": {"read": [2], "write": [2]}}},
-        "recovery": {
-            "compatibility": {
-                "checkpoint_manifest_schemas": ["qrh-checkpoint-manifest/v1"],
-                "restore_protocol_versions": ["qrh-restore/v1"],
-            }
-        },
     }
 
 
@@ -79,7 +73,7 @@ class ReleaseBuilderTests(unittest.TestCase):
             (self.candidate / "release_manifest.json").read_text(encoding="utf-8")
         )
         validate_release_manifest(manifest)
-        controller = DeploymentController(self.root / "D-root")
+        controller = DeploymentController.for_test_only(self.root / "D-root")
         partial = controller.partial_path("release-test")
         self.candidate.rename(partial)
         final, digest = controller.finalize_candidate(

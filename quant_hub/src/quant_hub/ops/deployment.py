@@ -17,6 +17,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import shutil
 from typing import Callable, Iterator, Mapping, Sequence
 import uuid
 
@@ -32,12 +33,9 @@ from .release_identity import (
     IdentityContractError,
     authorize_receipt_append,
     canonical_manifest_bytes,
-    lint_identity_graph,
     manifest_sha256,
     validate_active_release,
-    validate_checkpoint_manifest,
     validate_receipt,
-    validate_recovery_manifest,
     validate_release_manifest,
 )
 
@@ -46,11 +44,6 @@ StateCompatibilityProbe = Callable[[Mapping[str, object]], bool]
 StartRelease = Callable[[Path, Mapping[str, object]], bool]
 StopRelease = Callable[[Path], None]
 PostActivationProbe = Callable[[Path, Mapping[str, object]], Mapping[str, bool]]
-RecoveryProtectionProbe = Callable[
-    [Mapping[str, object], Mapping[str, object], Mapping[str, object]], bool
-]
-
-
 class DeploymentError(RuntimeError):
     pass
 
@@ -67,7 +60,7 @@ class DeploymentLocked(DeploymentError):
     pass
 
 
-class PendingActivationRecoveryRequired(DeploymentError):
+class PendingActivationResolutionRequired(DeploymentError):
     pass
 
 
@@ -110,7 +103,6 @@ class DeploymentLayout:
             layout.releases,
             layout.control,
             layout.state,
-            layout.backups,
             layout.audit_receipts,
             layout.audit_events,
             layout.locks,
@@ -140,10 +132,6 @@ class DeploymentLayout:
         """Release 外唯一可变状态根；controller 本身不写业务数据库。"""
 
         return self.root / "state"
-
-    @property
-    def backups(self) -> Path:
-        return self.root / "backups"
 
     @property
     def audit_receipts(self) -> Path:
@@ -184,9 +172,40 @@ def _json_clone(value: object) -> Mapping[str, object]:
     return json.loads(canonical_manifest_bytes(value).decode("utf-8"))
 
 
+_LEGACY_TEST_CONTROLLER_TOKEN = object()
+
+
 class DeploymentController:
-    def __init__(self, root: Path):
+    """Historical v1 controller retained only for isolated regression tests."""
+
+    def __init__(self, root: Path, *, _test_token: object | None = None):
+        # Reject before DeploymentLayout can create, enumerate, or read paths.
+        if _test_token is not _LEGACY_TEST_CONTROLLER_TOKEN:
+            raise DeploymentError(
+                "legacy DeploymentController is test-only; production requires v4 exact controller"
+            )
+        candidate = Path(root).resolve(strict=False)
+        production = Path(r"D:\quant\quant_platform").resolve(strict=False)
+        same_production = (
+            os.path.normcase(os.path.normpath(str(candidate)))
+            == os.path.normcase(os.path.normpath(str(production)))
+        )
+        if not same_production and candidate.exists() and production.exists():
+            try:
+                same_production = os.path.samefile(candidate, production)
+            except OSError:
+                # Fall through to the canonical comparison; uncertainty never
+                # grants access to a path that already normalized to D root.
+                pass
+        if same_production:
+            raise DeploymentError(
+                "legacy DeploymentController cannot target the production D root"
+            )
         self.layout = DeploymentLayout.controlled(root)
+
+    @classmethod
+    def for_test_only(cls, root: Path) -> "DeploymentController":
+        return cls(root, _test_token=_LEGACY_TEST_CONTROLLER_TOKEN)
 
     @contextmanager
     def locked(self) -> Iterator[None]:
@@ -428,8 +447,8 @@ class DeploymentController:
         """只解析唯一 pointer；损坏时不从 receipt 猜 current。"""
 
         if self.layout.pending_activation.exists() and not allow_pending_activation:
-            raise PendingActivationRecoveryRequired(
-                "pending activation requires explicit controller recovery"
+            raise PendingActivationResolutionRequired(
+                "pending activation requires explicit controller resolution"
             )
         try:
             active = validate_active_release(read_json(self.layout.active))
@@ -448,34 +467,30 @@ class DeploymentController:
     def _validate_pending_activation(value: object) -> Mapping[str, object]:
         fields = {
             "schema_version", "authority", "deployment_attempt_id",
-            "candidate_active", "prior_active", "recovery_protection_receipt_id",
+            "candidate_active", "prior_active",
             "activation_receipt_id", "failure_receipt_id", "created_at",
             "service_start_nonce", "phase",
         }
         if not isinstance(value, dict) or set(value) != fields:
-            raise PendingActivationRecoveryRequired("pending activation schema differs")
+            raise PendingActivationResolutionRequired("pending activation schema differs")
         if (
             value.get("schema_version") != "qrh-pending-activation/v1"
-            or value.get("authority") != "recovery_coordination_only"
+            or value.get("authority") != "local_prior_coordination_only"
         ):
-            raise PendingActivationRecoveryRequired("pending activation identity differs")
+            raise PendingActivationResolutionRequired("pending activation identity differs")
         _stable_id(value.get("deployment_attempt_id"), label="deployment_attempt_id")
-        _stable_id(
-            value.get("recovery_protection_receipt_id"),
-            label="recovery_protection_receipt_id",
-        )
         _stable_id(value.get("activation_receipt_id"), label="activation_receipt_id")
         _stable_id(value.get("failure_receipt_id"), label="failure_receipt_id")
         _stable_id(value.get("service_start_nonce"), label="service_start_nonce")
         validate_active_release(value.get("candidate_active"))
         validate_active_release(value.get("prior_active"))
         if not isinstance(value.get("created_at"), str):
-            raise PendingActivationRecoveryRequired("pending activation time is invalid")
+            raise PendingActivationResolutionRequired("pending activation time is invalid")
         if value.get("phase") not in {
             "prepared_before_pointer", "candidate_start_authorized",
-            "prior_recovery_authorized",
+            "prior_start_authorized",
         }:
-            raise PendingActivationRecoveryRequired("pending activation phase is invalid")
+            raise PendingActivationResolutionRequired("pending activation phase is invalid")
         return _json_clone(value)
 
     def _load_pending_activation(self) -> Mapping[str, object] | None:
@@ -486,7 +501,7 @@ class DeploymentController:
                 read_json(self.layout.pending_activation)
             )
         except (RuntimeSealError, IdentityContractError, OSError) as error:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "pending activation journal is unreadable"
             ) from error
 
@@ -495,14 +510,14 @@ class DeploymentController:
         try:
             write_atomic_new_json(self.layout.pending_activation, journal)
         except FileExistsError as error:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "another pending activation already exists"
             ) from error
 
     def _remove_pending_activation(self, expected: Mapping[str, object]) -> None:
         observed = self._load_pending_activation()
         if observed != expected:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "pending activation changed before terminal cleanup"
             )
         self.layout.pending_activation.unlink()
@@ -512,7 +527,7 @@ class DeploymentController:
     ) -> Mapping[str, object]:
         observed = self._load_pending_activation()
         if observed != expected:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "pending activation changed before phase transition"
             )
         updated = self._validate_pending_activation({**expected, "phase": phase})
@@ -529,7 +544,7 @@ class DeploymentController:
 
     def assert_no_pending_activation(self) -> None:
         if self._load_pending_activation() is not None:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "service/controller cannot consume uncommitted active pointer"
             )
 
@@ -546,14 +561,14 @@ class DeploymentController:
             role = "candidate"
             required_phase = "candidate_start_authorized"
         elif observed == journal["prior_active"]:
-            role = "prior_recovery"
-            required_phase = "prior_recovery_authorized"
+            role = "prior"
+            required_phase = "prior_start_authorized"
         else:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "pending service start identity is neither candidate nor prior"
             )
         if journal["phase"] != required_phase:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "pending service start role is not authorized in this phase"
             )
         return (
@@ -571,21 +586,21 @@ class DeploymentController:
         journal = self._load_pending_activation()
         if journal is None:
             if authorization is not None:
-                raise PendingActivationRecoveryRequired(
+                raise PendingActivationResolutionRequired(
                     "service start authorization has no pending activation"
                 )
             return
         if authorization is None:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "ordinary service start cannot consume pending activation"
             )
         expected = self.pending_service_start_authorization(active)
         if authorization != expected:
-            raise PendingActivationRecoveryRequired(
+            raise PendingActivationResolutionRequired(
                 "service start authorization does not bind pending attempt"
             )
 
-    def recover_pending_activation(
+    def resolve_pending_activation(
         self,
         *,
         start_release: StartRelease,
@@ -605,7 +620,7 @@ class DeploymentController:
             activation_path = self._receipt_path(activation_id)
             failure_path = self._receipt_path(failure_id)
             if activation_path.exists() and failure_path.exists():
-                raise PendingActivationRecoveryRequired(
+                raise PendingActivationResolutionRequired(
                     "activation and failure receipts are mutually exclusive"
                 )
             if activation_path.exists():
@@ -616,14 +631,18 @@ class DeploymentController:
                     or activation.get("release_manifest_sha256")
                     != candidate_active["manifest_sha256"]
                 ):
-                    raise PendingActivationRecoveryRequired(
+                    raise PendingActivationResolutionRequired(
                         "activation receipt does not close pending journal"
                     )
                 observed, _ = self.read_active(allow_pending_activation=True)
                 if observed != candidate_active:
-                    raise PendingActivationRecoveryRequired(
+                    raise PendingActivationResolutionRequired(
                         "committed activation receipt and active authority differ"
                     )
+                self._enforce_terminal_release_pair(
+                    active_manifest_sha256=str(candidate_active["manifest_sha256"]),
+                    prior_manifest_sha256=str(prior_active["manifest_sha256"]),
+                )
                 self._remove_pending_activation(journal)
                 return DeploymentResult(
                     "activated", str(candidate_active["release_id"]),
@@ -644,7 +663,7 @@ class DeploymentController:
                 str(prior_active["release_id"])
             )
             journal = self._replace_pending_activation(
-                journal, phase="prior_recovery_authorized"
+                journal, phase="prior_start_authorized"
             )
             rollback_succeeded = (
                 prior_hash == prior_active["manifest_sha256"]
@@ -652,7 +671,7 @@ class DeploymentController:
                 and self.read_active(allow_pending_activation=True)[0] == prior_active
             )
             if not rollback_succeeded:
-                raise PendingActivationRecoveryRequired(
+                raise PendingActivationResolutionRequired(
                     "pending activation could not restore explicit prior"
                 )
             if failure_path.exists():
@@ -665,7 +684,7 @@ class DeploymentController:
                     or failure.get("prior_manifest_sha256")
                     != prior_active["manifest_sha256"]
                 ):
-                    raise PendingActivationRecoveryRequired(
+                    raise PendingActivationResolutionRequired(
                         "failure receipt does not close pending journal"
                     )
             else:
@@ -677,11 +696,15 @@ class DeploymentController:
                     "candidate_manifest_sha256": candidate_active["manifest_sha256"],
                     "prior_manifest_sha256": prior_active["manifest_sha256"],
                     "verdict": "failed", "failed_phase": "activation_interrupted",
-                    "error_code": "activation_interrupted_recovered",
+                    "error_code": "activation_interrupted_resolved",
                     "rollback": {"attempted": True, "succeeded": True},
                 }
                 authorize_receipt_append(failure)
                 self._append_receipt(failure)
+            self._retire_exact_release(
+                str(candidate_active["release_id"]),
+                str(candidate_active["manifest_sha256"]),
+            )
             self._remove_pending_activation(journal)
             return DeploymentResult(
                 "failed", str(candidate_active["release_id"]),
@@ -751,6 +774,71 @@ class DeploymentController:
         write_atomic_new_json(self.layout.audit_events / f"{event_id}.json", payload)
         return event_id
 
+    def _retire_exact_release(self, release_id: str, manifest_digest: str) -> None:
+        """Remove one fully verified obsolete closure inside ``releases`` only."""
+
+        candidate = self.release_path(release_id)
+        if not os.path.lexists(candidate):
+            return
+        _release, observed_digest, path = self._load_release(release_id)
+        if observed_digest != manifest_digest:
+            raise PendingActivationResolutionRequired(
+                "obsolete release identity changed before retention cleanup"
+            )
+        expected = self.layout.releases / _stable_id(release_id, label="release_id")
+        if path.resolve(strict=True) != expected.resolve(strict=True):
+            raise PendingActivationResolutionRequired(
+                "obsolete release path escapes controlled releases"
+            )
+        ensure_no_reparse_components(path)
+        shutil.rmtree(path)
+        if os.path.lexists(path):
+            raise PendingActivationResolutionRequired(
+                "obsolete release retention cleanup did not complete"
+            )
+
+    def _enforce_terminal_release_pair(
+        self, *, active_manifest_sha256: str, prior_manifest_sha256: str
+    ) -> None:
+        """Retain exactly the committed active and its explicit local prior."""
+
+        retained = {active_manifest_sha256, prior_manifest_sha256}
+        inventory: list[tuple[str, str]] = []
+        for path in sorted(self.layout.releases.iterdir(), key=lambda item: item.name):
+            if not path.is_dir():
+                raise PendingActivationResolutionRequired(
+                    "release root contains a non-directory entry"
+                )
+            _release, digest, _ = self._load_release(path.name)
+            inventory.append((path.name, digest))
+        extras = [
+            (release_id, digest)
+            for release_id, digest in inventory
+            if digest not in retained
+        ]
+        self._append_event(
+            "terminal_release_retention_authorized",
+            {
+                "active_manifest_sha256": active_manifest_sha256,
+                "prior_manifest_sha256": prior_manifest_sha256,
+                "obsolete_releases": [
+                    {"release_id": release_id, "manifest_sha256": digest}
+                    for release_id, digest in extras
+                ],
+            },
+        )
+        for release_id, digest in extras:
+            self._retire_exact_release(release_id, digest)
+        remaining = {
+            self._load_release(path.name)[1]
+            for path in self.layout.releases.iterdir()
+            if path.is_dir()
+        }
+        if remaining != retained:
+            raise PendingActivationResolutionRequired(
+                "terminal release retention is not exact active plus one prior"
+            )
+
     def record_candidate_validation(
         self,
         *,
@@ -790,86 +878,6 @@ class DeploymentController:
                 raise CandidateValidationError("finalized candidate manifest hash differs")
             return path, digest
 
-    def record_recovery_protection(
-        self,
-        *,
-        receipt: object,
-        recovery_manifest: object,
-        checkpoint_manifest: object,
-        external_protection_probe: RecoveryProtectionProbe,
-    ) -> Mapping[str, object]:
-        """在激活前记录已完成 R/RM/C 与外部恢复保护验证的 evidence。"""
-
-        with self.locked():
-            active, active_release = self.read_active()
-            protection = _json_clone(validate_receipt(receipt))
-            if protection["receipt_type"] != "recovery_protection":
-                raise DeploymentError("pre-activation evidence must be recovery protection")
-            checkpoint = _json_clone(validate_checkpoint_manifest(checkpoint_manifest))
-            recovery = _json_clone(validate_recovery_manifest(recovery_manifest))
-            candidate_hash = str(protection["release_manifest_sha256"])
-            release_ref = recovery["release"]
-            if not isinstance(release_ref, dict):
-                raise DeploymentError("recovery release reference is invalid")
-            candidate_id = str(release_ref["release_id"])
-            candidate_release, loaded_candidate_hash, _ = self._load_release(
-                candidate_id
-            )
-            if loaded_candidate_hash != candidate_hash:
-                raise DeploymentError("protected candidate release hash is unavailable")
-            if candidate_hash == active["manifest_sha256"]:
-                raise DeploymentError("recovery protection cannot claim an already active release")
-
-            captured = checkpoint["captured_under_active_release"]
-            if not isinstance(captured, dict):
-                raise DeploymentError("checkpoint captured release is invalid")
-            captured_release, captured_hash, _ = self._load_release(
-                str(captured["release_id"])
-            )
-            if captured_hash != captured["manifest_sha256"]:
-                raise DeploymentError("checkpoint captured release hash is unavailable")
-            releases: list[Mapping[str, object]] = [active_release, candidate_release]
-            if all(
-                manifest_sha256(existing) != captured_hash for existing in releases
-            ):
-                releases.append(captured_release)
-            lint_identity_graph(
-                active_release=active,
-                release_manifests=releases,
-                checkpoint_manifests=[checkpoint],
-                recovery_manifests=[recovery],
-                receipts=[protection],
-            )
-            frozen = (
-                canonical_manifest_bytes(protection),
-                canonical_manifest_bytes(recovery),
-                canonical_manifest_bytes(checkpoint),
-            )
-            if external_protection_probe(protection, recovery, checkpoint) is not True:
-                raise DeploymentError("external recovery protection probe did not pass")
-            if frozen != (
-                canonical_manifest_bytes(protection),
-                canonical_manifest_bytes(recovery),
-                canonical_manifest_bytes(checkpoint),
-            ):
-                raise DeploymentError("recovery protection evidence changed during probe")
-            current_candidate, current_hash, _ = self._load_release(candidate_id)
-            if current_hash != candidate_hash or current_candidate != candidate_release:
-                raise DeploymentError("candidate changed during recovery protection probe")
-            observed_active, _ = self.read_active()
-            if observed_active != active:
-                self._write_active(active)
-                restored_active, _ = self.read_active()
-                if restored_active != active:
-                    raise ActiveAuthorityCorrupt(
-                        "could not restore active after pre-activation identity drift"
-                    )
-                raise DeploymentError(
-                    "active authority changed during pre-activation recovery verification"
-                )
-            self._append_receipt(protection)
-            return protection
-
     @staticmethod
     def _post_gates(value: object) -> Mapping[str, bool]:
         if not isinstance(value, dict) or set(value) != {
@@ -887,7 +895,6 @@ class DeploymentController:
         *,
         candidate_release_id: str,
         deployment_attempt_id: str,
-        recovery_protection_receipt_id: str,
         start_release: StartRelease,
         stop_release: StopRelease,
         post_activation_probe: PostActivationProbe,
@@ -903,32 +910,21 @@ class DeploymentController:
             )
             if candidate_hash == prior_hash:
                 raise DeploymentError("candidate is already active; use explicit replay semantics")
-            phase = "recovery_protection"
+            phase = "local_prior_preflight"
             switch_attempted = False
-            protection: Mapping[str, object] | None = None
             journal: Mapping[str, object] | None = None
             activation_committed = False
             try:
-                protection = self._load_receipt(recovery_protection_receipt_id)
-                if (
-                    protection["receipt_type"] != "recovery_protection"
-                    or protection["deployment_attempt_id"] != deployment_attempt_id
-                    or protection["release_manifest_sha256"] != candidate_hash
-                ):
-                    raise DeploymentError(
-                        "recovery protection receipt does not bind this candidate attempt"
-                    )
                 candidate_active = self._active_value(
                     candidate_release_id, candidate_path, candidate_hash
                 )
                 pending = self._validate_pending_activation(
                     {
                         "schema_version": "qrh-pending-activation/v1",
-                        "authority": "recovery_coordination_only",
+                        "authority": "local_prior_coordination_only",
                         "deployment_attempt_id": deployment_attempt_id,
                         "candidate_active": candidate_active,
                         "prior_active": prior_active,
-                        "recovery_protection_receipt_id": recovery_protection_receipt_id,
                         "activation_receipt_id": f"activation-{uuid.uuid4().hex}",
                         "failure_receipt_id": f"failure-{uuid.uuid4().hex}",
                         "service_start_nonce": secrets.token_hex(24),
@@ -958,19 +954,14 @@ class DeploymentController:
                 )
                 phase = "activation_receipt"
                 activation = {
-                    "schema_version": "qrh-activation-receipt/v1",
+                    "schema_version": "qrh-local-activation-receipt/v1",
                     "receipt_type": "activation",
                     "receipt_id": journal["activation_receipt_id"],
                     "deployment_attempt_id": deployment_attempt_id,
                     "recorded_at": _now(),
                     "authority": "evidence_only",
                     "release_manifest_sha256": candidate_hash,
-                    "recovery_manifest_sha256": protection[
-                        "recovery_manifest_sha256"
-                    ],
-                    "checkpoint_manifest_sha256": protection[
-                        "checkpoint_manifest_sha256"
-                    ],
+                    "prior_manifest_sha256": prior_hash,
                     "verdict": "activated",
                     "switch": {
                         "active_pointer_switched": True,
@@ -982,7 +973,6 @@ class DeploymentController:
                 authorize_receipt_append(
                     activation,
                     observed_active_release=observed,
-                    existing_receipts=[protection],
                 )
                 self._append_event(
                     "activation_receipt_authorized",
@@ -999,6 +989,10 @@ class DeploymentController:
                 # append 成功，后续不得再进入 rollback/failure 路径。
                 self._append_receipt(activation)
                 activation_committed = True
+                self._enforce_terminal_release_pair(
+                    active_manifest_sha256=candidate_hash,
+                    prior_manifest_sha256=prior_hash,
+                )
                 self._remove_pending_activation(journal)
                 return DeploymentResult(
                     status="activated",
@@ -1012,7 +1006,7 @@ class DeploymentController:
                 )
             except Exception:
                 if activation_committed:
-                    raise PendingActivationRecoveryRequired(
+                    raise PendingActivationResolutionRequired(
                         "activation committed; pending journal cleanup must replay"
                     )
                 return self._activation_failed(
@@ -1057,7 +1051,7 @@ class DeploymentController:
                 prior_path = self.release_path(str(prior_active["release_id"]))
                 if journal is not None:
                     journal = self._replace_pending_activation(
-                        journal, phase="prior_recovery_authorized"
+                        journal, phase="prior_start_authorized"
                     )
                 restarted = start_release(prior_path, prior_active) is True
                 observed, observed_release = self.read_active(
@@ -1099,6 +1093,7 @@ class DeploymentController:
         # restart did not complete, keep the coordination journal so a later
         # controller can replay the same prior and reuse this one receipt.
         if journal is not None and rollback_succeeded:
+            self._retire_exact_release(candidate_release_id, candidate_hash)
             self._remove_pending_activation(journal)
         result = DeploymentResult(
             status="failed",
