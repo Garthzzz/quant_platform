@@ -20,7 +20,9 @@ from quant_hub.knowledge.semantic import (
 from quant_hub.ops.publish_adapters import HTTPResponse, ReleaseFile
 from quant_hub.ops.publish_runtime import (
     EnvironmentSecretProvider,
+    GitSnapshot,
     ProcessResult,
+    ProductionSourceFreezer,
     ProductionPublishRuntime,
     PublishRuntimeError,
     RUNTIME_CONFIG_SCHEMA,
@@ -119,6 +121,7 @@ class PublishRuntimeTests(unittest.TestCase):
         base_files = {
             "runtime_contract/start.py": b"print('v39-launcher-ok')\n",
             "runtime_contract/code/old.py": b"print('old')\n",
+            "runtime_contract/code/src/quant_hub/presentation/archive_presentation.json": b'{"schema_version":"private-archive-fixture/v1"}\n',
             "runtime_contract/code/src/quant_hub/presentation/citation_projection_overrides.json": canonical_json(
                 {
                     "schema_version": "qrh-reviewed-citation-projection/v1",
@@ -127,6 +130,10 @@ class PublishRuntimeTests(unittest.TestCase):
                     "documents": [],
                 }
             ).encode("utf-8"),
+            "runtime_contract/code/src/quant_hub/presentation/evidence_zh_overlays.json": b'{"schema_version":"private-evidence-fixture/v1"}\n',
+            "runtime_contract/code/src/quant_hub/presentation/research_supplements.json": b'{"schema_version":"private-supplement-fixture/v1"}\n',
+            "runtime_contract/code/src/quant_hub/presentation/chapter_manifests/active.json": b'{"generation_id":"private-generation"}\n',
+            "runtime_contract/code/src/quant_hub/presentation/supplements/private.md": b"private supplement\n",
             "runtime/templates/index.html": b"<main>V39 legacy</main>\n",
             "runtime/static/app.css": b"body{color:#111}\n",
             "runtime/db/archive.sqlite3": b"archive-db",
@@ -256,6 +263,7 @@ class PublishRuntimeTests(unittest.TestCase):
                 "platform_database": "runtime/db/platform.sqlite3",
                 "research_papers_database": "runtime/db/research_papers.sqlite3",
                 "paper_lab_database": "runtime/db/paper_lab.sqlite3",
+                "presentation_manifest": "runtime_contract/code/src/quant_hub/presentation/archive_presentation.json",
                 "papers": "runtime/research_papers",
                 "objects": "runtime/objects",
                 "paper_lab": "runtime/paper_lab",
@@ -359,6 +367,19 @@ class PublishRuntimeTests(unittest.TestCase):
         )
         local_ignored_overlay.parent.mkdir(parents=True)
         local_ignored_overlay.write_text("development-machine-only", encoding="utf-8")
+        local_private_assets = {
+            "archive_presentation.json": b"local-unsealed-archive",
+            "evidence_zh_overlays.json": b"local-unsealed-evidence",
+            "research_supplements.json": b"local-unsealed-supplements",
+        }
+        for name, payload in local_private_assets.items():
+            (local_ignored_overlay.parent / name).write_bytes(payload)
+        local_private_chapter = local_ignored_overlay.parent / "chapter_manifests" / "active.json"
+        local_private_chapter.parent.mkdir()
+        local_private_chapter.write_bytes(b"local-unsealed-chapter")
+        local_private_supplement = local_ignored_overlay.parent / "supplements" / "private.md"
+        local_private_supplement.parent.mkdir()
+        local_private_supplement.write_bytes(b"local-unsealed-supplement")
         deps, backend, invoker, process_calls = self.dependencies()
         semantic_path = self.protected / "publish-state" / "semantic_jobs.sqlite3"
         semantic_hash_before = hashlib.sha256(semantic_path.read_bytes()).hexdigest()
@@ -436,6 +457,16 @@ class PublishRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(base_overlay.read_bytes(), staged_overlay.read_bytes())
         self.assertNotEqual(local_ignored_overlay.read_bytes(), staged_overlay.read_bytes())
+        for relative in (
+            "archive_presentation.json",
+            "evidence_zh_overlays.json",
+            "research_supplements.json",
+            "chapter_manifests/active.json",
+            "supplements/private.md",
+        ):
+            base_private = base_overlay.parent.joinpath(*relative.split("/"))
+            staged_private = staged_overlay.parent.joinpath(*relative.split("/"))
+            self.assertEqual(base_private.read_bytes(), staged_private.read_bytes())
         self.assertFalse((releases[0] / "external" / "reference").exists())
         launched = subprocess.run(
             [sys.executable, str(launcher)], capture_output=True, text=True,
@@ -455,6 +486,61 @@ class PublishRuntimeTests(unittest.TestCase):
         self.assertFalse((releases[0] / "semantic_jobs.sqlite3").exists())
         self.assertNotIn("checkpoint_id", serialized_manifest)
         self.assertNotIn("checkpoint_manifest_sha256", serialized_manifest)
+
+    def test_missing_inherited_private_presentation_manifest_fails_before_publish(self) -> None:
+        presentation_manifest = (
+            self.runtime_base
+            / "runtime_contract"
+            / "code"
+            / "src"
+            / "quant_hub"
+            / "presentation"
+            / "archive_presentation.json"
+        )
+        presentation_manifest.unlink()
+        seal_path = self.runtime_base / "release_manifest.json"
+        seal_path.unlink()
+        base_manifest = {
+            "schema_version": "qrh-release-manifest/v1",
+            "release_id": "v39-like-base-without-presentation",
+            "built_at": "2026-08-21T00:00:00Z",
+            "application": {
+                "source_kind": "legacy_broadcast",
+                "commit_sha": "0" * 40,
+                "tracked_tree_sha256": "1" * 64,
+                "build_tool_version": "v39-like-fixture/v1",
+                "source_archive_sha256": "2" * 64,
+                "legacy_deployment_id": "v39-like-fixture",
+            },
+            "content": {
+                "snapshot_id": "v39-like-snapshot",
+                "source_inventory_sha256": "3" * 64,
+                "ir_sha256": "4" * 64,
+                "knowledge_sha256": "5" * 64,
+                "search_sha256": "6" * 64,
+                "knowledge_enrichment": {"status": "not_applicable"},
+            },
+            "resources": {},
+            "state": {"compatibility": {"comments": {"read": [1], "write": [1]}}},
+        }
+        resealed = seal_release(
+            candidate_root=self.runtime_base,
+            manifest_without_inventory=base_manifest,
+        )
+        self.config_value["runtime_base_manifest_sha256"] = resealed.manifest_sha256
+        deps, *_ = self.dependencies()
+        freezer = ProductionSourceFreezer(
+            self.config(), process_runner=deps.process_runner
+        )
+        with self.assertRaisesRegex(PublishRuntimeError, "presentation_manifest"):
+            freezer(
+                GitSnapshot(
+                    commit_sha=self.commit,
+                    branch="main",
+                    tracked_tree_sha256="7" * 64,
+                    tracked_clean=True,
+                )
+            )
 
     def test_semantic_only_change_creates_a_new_release_identity(self) -> None:
         first_deps, *_ = self.dependencies()
@@ -605,6 +691,60 @@ class PublishRuntimeTests(unittest.TestCase):
         inside.write_text(canonical_json(self.config_value), encoding="utf-8")
         with self.assertRaisesRegex(PublishRuntimeError, "outside"):
             RuntimePublishConfig.load(inside, expected_project_root=self.project)
+
+    def test_presentation_manifest_authority_is_bound_to_loader_path(self) -> None:
+        self.config_value["required_runtime_paths"]["presentation_manifest"] = (
+            "runtime_contract/code/src/quant_hub/presentation/"
+            "citation_projection_overrides.json"
+        )
+        with self.assertRaisesRegex(
+            PublishRuntimeError, "presentation manifest authority"
+        ):
+            self.config()
+
+    def test_tracked_code_cannot_override_inherited_private_authority(self) -> None:
+        tracked_private = (
+            self.project
+            / "quant_hub"
+            / "src"
+            / "quant_hub"
+            / "presentation"
+            / "archive_presentation.json"
+        )
+        tracked_private.parent.mkdir(parents=True)
+        tracked_private.write_bytes(b"tracked-private-conflict")
+        subprocess.run(
+            ["git", "add", tracked_private.relative_to(self.project).as_posix()],
+            cwd=self.project,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "tracked private conflict"],
+            cwd=self.project,
+            check=True,
+            capture_output=True,
+        )
+        self.commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.project,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        ).stdout.strip()
+        deps, *_ = self.dependencies()
+        freezer = ProductionSourceFreezer(
+            self.config(), process_runner=deps.process_runner
+        )
+        with self.assertRaisesRegex(PublishRuntimeError, "tracked code conflicts"):
+            freezer(
+                GitSnapshot(
+                    commit_sha=self.commit,
+                    branch="main",
+                    tracked_tree_sha256="8" * 64,
+                    tracked_clean=True,
+                )
+            )
 
     def test_prior_release_reuses_historical_source_objects_after_revision(self) -> None:
         first_deps, *_ = self.dependencies()

@@ -80,6 +80,31 @@ from . import local_release_identity as local_identity
 RUNTIME_CONFIG_SCHEMA = "qrh-production-publish-runtime/v1"
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
+# These business-data assets are deliberately excluded from Public Git, but
+# they are part of the sealed production runtime. A code overlay must inherit
+# their exact bytes from the validated immutable runtime base instead of
+# silently dropping them or reading an unsealed developer working copy.
+_INHERITED_PRIVATE_CODE_EXACT = frozenset(
+    {
+        PurePosixPath("src/quant_hub/presentation/archive_presentation.json"),
+        PurePosixPath(
+            "src/quant_hub/presentation/citation_projection_overrides.json"
+        ),
+        PurePosixPath("src/quant_hub/presentation/evidence_zh_overlays.json"),
+        PurePosixPath("src/quant_hub/presentation/research_supplements.json"),
+    }
+)
+_INHERITED_PRIVATE_CODE_PREFIXES = (
+    PurePosixPath("src/quant_hub/presentation/chapter_manifests"),
+    PurePosixPath("src/quant_hub/presentation/supplements"),
+)
+
+
+def _is_inherited_private_code_path(relative: PurePosixPath) -> bool:
+    return relative in _INHERITED_PRIVATE_CODE_EXACT or any(
+        prefix in relative.parents for prefix in _INHERITED_PRIVATE_CODE_PREFIXES
+    )
+
 
 class PublishRuntimeError(PublishError):
     pass
@@ -178,7 +203,7 @@ class RuntimePublishConfig:
         required_names = {
             "launcher", "templates", "static", "archive_database",
             "platform_database", "research_papers_database", "paper_lab_database",
-            "papers", "objects", "paper_lab", "state_seed",
+            "presentation_manifest", "papers", "objects", "paper_lab", "state_seed",
         }
         raw_required = value["required_runtime_paths"]
         if not isinstance(raw_required, dict) or set(raw_required) != required_names:
@@ -189,6 +214,17 @@ class RuntimePublishConfig:
         }
         if required["launcher"] != launcher:
             raise PublishRuntimeError("launcher authority and required path differ")
+        presentation_manifest = (
+            PurePosixPath(code_overlay)
+            / "src"
+            / "quant_hub"
+            / "presentation"
+            / "archive_presentation.json"
+        ).as_posix()
+        if required["presentation_manifest"] != presentation_manifest:
+            raise PublishRuntimeError(
+                "presentation manifest authority and code overlay differ"
+            )
         raw_sources = value["resource_overlays"]
         if not isinstance(raw_sources, list):
             raise PublishRuntimeError("resource_overlays must be a list")
@@ -373,20 +409,12 @@ class ProductionSourceFreezer:
         if actual != expected:
             raise PublishRuntimeError("runtime base closure differs from its immutable R")
         overlay = PurePosixPath(self.config.code_overlay_relative_path)
-        citation_overlay = overlay.joinpath(
-            "src",
-            "quant_hub",
-            "presentation",
-            "citation_projection_overrides.json",
-        )
         for relative_text in sorted(actual):
             relative = PurePosixPath(relative_text)
-            if (
-                relative == overlay
-                or overlay in relative.parents
-                and relative != citation_overlay
-            ):
-                continue
+            if relative == overlay or overlay in relative.parents:
+                overlay_relative = relative.relative_to(overlay)
+                if not _is_inherited_private_code_path(overlay_relative):
+                    continue
             self._copy_file(base.joinpath(*relative.parts), staging.joinpath(*relative.parts))
         prior_path = base / SNAPSHOT_ARTIFACT_PATH
         if prior_path.is_file():
@@ -537,6 +565,10 @@ class ProductionSourceFreezer:
                     overlay_relative = relative.relative_to(code_source)
                 else:
                     continue
+                if _is_inherited_private_code_path(overlay_relative):
+                    raise PublishRuntimeError(
+                        "tracked code conflicts with inherited private runtime authority"
+                    )
                 source = self.config.project_root.joinpath(*relative.parts).resolve(strict=True)
                 if not source.is_relative_to(self.config.project_root.resolve(strict=True)):
                     raise PublishRuntimeError("tracked path escapes project root")
@@ -564,6 +596,7 @@ class ProductionSourceFreezer:
             required_files = {
                 "launcher", "archive_database", "platform_database",
                 "research_papers_database", "paper_lab_database",
+                "presentation_manifest",
             }
             missing = []
             for name, relative in self.config.required_runtime_paths.items():
