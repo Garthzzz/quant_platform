@@ -14,6 +14,7 @@ from quant_hub.collaboration.checkpoint import (
     CheckpointError,
     create_sqlite_checkpoint,
 )
+from quant_hub.ops.local_release_identity import identity_sha256
 from quant_hub.ops.release_identity import canonical_manifest_bytes, manifest_sha256
 from quant_hub.ops.vm_service_cli import production_runtime_document
 from quant_hub.ops.windows_service import (
@@ -127,20 +128,53 @@ def _pending_access_seed(root: Path) -> tuple[V39Baseline, bytes]:
         "        ACCESS_PASSWORD_ITERATIONS,\n"
         "    )\n"
     ).encode("utf-8")
-    release = _release()
-    inventory = release["inventory"]
-    assert isinstance(inventory, dict)
-    inventory["files"] = [
-        {
-            "path": "tools/viewer/server.py",
-            "bytes": len(source),
-            "sha256": hashlib.sha256(source).hexdigest(),
-        }
-    ]
-    resources = release["resources"]
-    assert isinstance(resources, dict)
-    resources["inventory_sha256"] = manifest_sha256(inventory)
-    baseline = V39Baseline(manifest_sha256(release))
+    inventory = {
+        "schema_version": "qrh-release-file-inventory/v2",
+        "files": [
+            {
+                "path": "tools/viewer/server.py",
+                "bytes": len(source),
+                "sha256": hashlib.sha256(source).hexdigest(),
+            }
+        ],
+    }
+    release = {
+        "schema_version": "qrh-release-manifest/v2",
+        "release_id": "v39-baseline-20260731-hotfix1",
+        "built_at": "2026-07-31T10:04:18Z",
+        "application": {
+            "source_kind": "legacy_broadcast",
+            "source_archive_sha256": H["8"],
+            "legacy_deployment_id": "quant-hub-v39-company-broadcast-20260731-hotfix1",
+            "build_tool_version": "writer-handoff-tests/v2",
+            "provenance": {
+                "builder": "writer-handoff-tests",
+                "labels": ["exact-local-active-prior", "legacy-v39-baseline"],
+            },
+        },
+        "content": {
+            "snapshot_id": "v39-content-20260731-hotfix1",
+            "source_inventory_sha256": H["2"],
+            "ir_sha256": H["3"],
+            "knowledge_sha256": H["4"],
+            "search_sha256": H["5"],
+            "page_projection_sha256": H["6"],
+            "mcp_sha256": H["7"],
+            "active_membership_sha256": H["8"],
+            "knowledge_enrichment": {"status": "not_applicable"},
+            "presentation": {"language": "zh-CN"},
+        },
+        "resources": {"inventory_sha256": identity_sha256(inventory)},
+        "state": {
+            "compatibility": {
+                "comments": {"read": [1, 2], "write": [1, 2]},
+                "research_workspace": {"read": [1, 2, 3], "write": [1, 2, 3]},
+                "rollback_policy": "expand_only_no_down_migration",
+            }
+        },
+        "inventory": inventory,
+    }
+    baseline = V39Baseline(identity_sha256(release))
     candidate = root / "incoming" / f"{baseline.release_id}.partial"
     server = candidate / "tools" / "viewer" / "server.py"
     server.parent.mkdir(parents=True)

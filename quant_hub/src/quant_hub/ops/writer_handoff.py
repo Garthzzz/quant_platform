@@ -1244,7 +1244,8 @@ def seed_v39_access_identity(
     candidate = root / "incoming" / f"{baseline.release_id}.partial"
     active_path = root / "control" / "active_release.json"
     binding_path = root / "control" / "local_prior_binding.json"
-    if os.path.lexists(candidate):
+    pending_candidate = os.path.lexists(candidate)
+    if pending_candidate:
         ensure_no_reparse_components(candidate)
         if not candidate.is_dir() or candidate.is_symlink():
             raise WriterHandoffError("access seed pending V39 candidate is invalid")
@@ -1265,13 +1266,17 @@ def seed_v39_access_identity(
             or Path(str(active.get("release_path"))).resolve(strict=True) != release
         ):
             raise WriterHandoffError("access seed active V39 identity differs")
-    manifest = validate_release_manifest(
-        read_json(_inside(release, "release_manifest.json"))
-    )
+    raw_manifest = read_json(_inside(release, "release_manifest.json"))
+    if pending_candidate:
+        manifest = local_identity.validate_release_manifest(raw_manifest)
+        observed_manifest_sha256 = local_identity.identity_sha256(manifest)
+    else:
+        manifest = validate_release_manifest(raw_manifest)
+        observed_manifest_sha256 = manifest_sha256(manifest)
     content = manifest.get("content")
     if (
         manifest.get("release_id") != baseline.release_id
-        or manifest_sha256(manifest) != baseline.manifest_sha256
+        or observed_manifest_sha256 != baseline.manifest_sha256
         or not isinstance(content, Mapping)
         or content.get("snapshot_id") != baseline.snapshot_id
     ):
