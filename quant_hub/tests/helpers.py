@@ -7,11 +7,56 @@ import re
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from quant_hub.config import Settings
 from quant_hub.archive.source_reader import archive_origin_uri
 from quant_hub.ids import object_id_for_sha256, sha256_hex, stable_sha256
 from quant_hub.platform.releases import ReleaseAuthority
+from quant_hub.presentation import ArchivePresentation
+from quant_hub.presentation.chapters import ArchiveChapterManifests
+
+
+def public_test_archive_presentation() -> ArchivePresentation:
+    """Return a synthetic presentation with no private research metadata."""
+
+    return ArchivePresentation(
+        {
+            "schema_version": "qrh-archive-presentation/v1",
+            "home": {
+                "eyebrow": "Public test fixture",
+                "title": "Synthetic archive",
+                "introduction": "Public runtime contract fixture.",
+            },
+            "visibility": {"hidden_research_slugs": []},
+            "search": {"excluded_line_markers": []},
+            "research": {},
+            "system_managed_topics": {
+                "suppress_until_researcher_updates": [],
+                "system_actor_names": [],
+                "title_overrides": {},
+            },
+        }
+    )
+
+
+def install_public_archive_presentation(test_case: unittest.TestCase) -> None:
+    """Keep public-checkout tests independent of ignored private resources."""
+
+    presentation_patcher = mock.patch.object(
+        ArchivePresentation,
+        "default",
+        return_value=public_test_archive_presentation(),
+    )
+    chapter_patcher = mock.patch.object(
+        ArchiveChapterManifests,
+        "default",
+        return_value=mock.Mock(),
+    )
+    presentation_patcher.start()
+    chapter_patcher.start()
+    test_case.addCleanup(presentation_patcher.stop)
+    test_case.addCleanup(chapter_patcher.stop)
 
 
 def latest_activated_reviewed_delivery(

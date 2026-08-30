@@ -44,6 +44,7 @@ from tests.test_local_deployment_persistence import (
     seal,
     state_identity,
 )
+from tests.helpers import install_public_archive_presentation
 
 
 _BUSINESS_TABLES = {
@@ -73,6 +74,10 @@ _BUSINESS_TABLES = {
 
 
 class ExactRuntimeCanaryInputTests(PersistenceFixture):
+    def setUp(self) -> None:
+        super().setUp()
+        install_public_archive_presentation(self)
+
     def migration_root(self) -> Path:
         return Path(__file__).resolve().parents[1] / "migrations" / "research_workspace"
 

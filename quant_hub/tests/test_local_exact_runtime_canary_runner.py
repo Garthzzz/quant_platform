@@ -28,6 +28,7 @@ from quant_hub.ops.local_windows_writer_lease_holder import ExactRuntimeLeaseIde
 from quant_hub.ops.local_windows_writer_lease_holder import WindowsWriterLeaseBusy
 from quant_hub.platform import db as platform_db
 from quant_hub.research_workspace.service import ResearchWorkspace
+from tests.helpers import install_public_archive_presentation
 
 
 def _hash(label: str) -> str:
@@ -37,6 +38,7 @@ def _hash(label: str) -> str:
 @unittest.skipUnless(os.name == "nt", "真实 Win32 writer lease canary 只在 Windows 执行")
 class ExactRuntimeCanaryRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        install_public_archive_presentation(self)
         self.temporary = tempfile.TemporaryDirectory(
             prefix="qrh-exact-canary-", dir=Path.cwd()
         )

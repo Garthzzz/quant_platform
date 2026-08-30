@@ -28,6 +28,7 @@ from quant_hub.ops.local_windows_writer_lease_holder import (
     _TestOnlyWindowsWriterLeaseHolderAdapter,
 )
 from quant_hub.web.access_gate import derive_password_digest, install_access_gate
+from tests.helpers import install_public_archive_presentation
 
 
 def _record() -> dict[str, object]:
@@ -101,6 +102,7 @@ class ExactRuntimeServerTests(unittest.TestCase):
     challenge = "1" * 48
 
     def setUp(self) -> None:
+        install_public_archive_presentation(self)
         self.app = Flask(__name__)
         self.app.testing = True
         self.lease = _FakeLease()
