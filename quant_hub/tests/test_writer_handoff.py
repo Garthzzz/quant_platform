@@ -187,7 +187,8 @@ def _pending_access_seed(root: Path) -> tuple[V39Baseline, bytes]:
 class Fixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name) / "D-root"
+        temporary_root = Path(self.temporary.name).resolve(strict=True)
+        self.root = temporary_root / "D-root"
         self.root.mkdir()
         release = _release()
         self.baseline = V39Baseline(manifest_sha256(release))
@@ -216,7 +217,7 @@ class Fixture:
         (state / "viewer_access_password.digest").write_text("a" * 64 + "\n", encoding="ascii")
         _database(state / "comments.sqlite3", "d-comments-old")
         _database(state / "research_workspace.sqlite3", "d-workspace-old")
-        self.legacy = Path(self.temporary.name) / "C-state"
+        self.legacy = temporary_root / "C-state"
         _database(self.legacy / "comments.sqlite3", "c-comments-final")
         _database(self.legacy / "research_workspace.sqlite3", "c-workspace-final")
 
@@ -424,7 +425,7 @@ class FakeRuntime:
 class V39AccessIdentitySeedTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name) / "D-root"
+        self.root = Path(self.temporary.name).resolve(strict=True) / "D-root"
         self.root.mkdir()
         self.baseline, self.default_digest = _pending_access_seed(self.root)
 

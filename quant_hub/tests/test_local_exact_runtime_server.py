@@ -958,7 +958,7 @@ finally:
 
     def test_runtime_state_checkpoint_allows_same_database_file_but_not_replacement(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qrh-runtime-state-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve(strict=True)
             secret = root / "viewer_secret.key"
             digest = root / "viewer_access_password.digest"
             comments = root / "comments.sqlite3"
@@ -984,7 +984,7 @@ finally:
     @unittest.skipUnless(os.name == "nt", "mutable state guard is a Win32 contract")
     def test_mutable_state_guard_allows_write_but_blocks_replacement(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qrh-runtime-db-guard-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve(strict=True)
             comments = root / "comments.sqlite3"
             workspace = root / "research_workspace.sqlite3"
             comments.write_bytes(b"comments")
@@ -1003,7 +1003,7 @@ finally:
 
     def test_runtime_state_checkpoint_detects_protected_content_drift(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qrh-runtime-secret-") as directory:
-            root = Path(directory)
+            root = Path(directory).resolve(strict=True)
             secret = root / "viewer_secret.key"
             digest = root / "viewer_access_password.digest"
             comments = root / "comments.sqlite3"

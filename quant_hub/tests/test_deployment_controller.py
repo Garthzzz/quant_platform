@@ -101,7 +101,7 @@ def write_partial(
 class DeploymentFixture:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name) / "D-root"
+        self.root = Path(self.temporary.name).resolve(strict=True) / "D-root"
         self.controller = DeploymentController.for_test_only(self.root)
 
     def close(self) -> None:
