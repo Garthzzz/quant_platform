@@ -54,6 +54,44 @@ def _manifest(snapshot_id: str) -> dict[str, object]:
     }
 
 
+def _manifest_v2(snapshot_id: str) -> dict[str, object]:
+    return {
+        "schema_version": "qrh-release-manifest/v2",
+        "release_id": "knowledge-release-test",
+        "built_at": "2026-08-21T12:00:00Z",
+        "application": {
+            "source_kind": "git",
+            "commit_sha": "a" * 40,
+            "tracked_tree_sha256": "1" * 64,
+            "build_tool_version": "knowledge-release-tests/v2",
+            "provenance": {
+                "builder": "knowledge-release-tests",
+                "labels": ["exact-local-active-prior", "public-source"],
+            },
+        },
+        "content": {
+            "snapshot_id": snapshot_id,
+            "source_inventory_sha256": None,
+            "ir_sha256": None,
+            "knowledge_sha256": None,
+            "search_sha256": None,
+            "page_projection_sha256": None,
+            "mcp_sha256": None,
+            "active_membership_sha256": "2" * 64,
+            "knowledge_enrichment": {"status": "not_applicable"},
+            "presentation": {"language": "zh-CN"},
+        },
+        "resources": {"inventory_sha256": None},
+        "state": {
+            "compatibility": {
+                "comments": {"read": [2], "write": [2]},
+                "research_workspace": {"read": [3], "write": [3]},
+                "rollback_policy": "expand_only_no_down_migration",
+            }
+        },
+    }
+
+
 class KnowledgeReleaseBuildTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -210,7 +248,9 @@ class KnowledgeReleaseBuildTests(unittest.TestCase):
 
 
 class GenericReleaseApplicationTests(SettingsTestCase):
-    def _sealed_release(self) -> tuple[Path, bytes, str, str]:
+    def _sealed_release(
+        self, *, exact_v2: bool = False, incoming_partial: bool = False
+    ) -> tuple[Path, bytes, str, str]:
         sources = self.root / "new-research"
         sources.mkdir()
         source = (
@@ -227,18 +267,37 @@ class GenericReleaseApplicationTests(SettingsTestCase):
         store = SemanticJobStore(self.root / "semantic-state" / "knowledge.sqlite3")
         extract_source_explicit(base, store)
         enriched = build_enriched_snapshot(base, store)
-        release = self.root / "knowledge-release-test"
+        release_name = (
+            "knowledge-release-test.partial"
+            if incoming_partial
+            else "knowledge-release-test"
+        )
+        release = self.root / release_name
         release.mkdir()
         (release / "app.py").write_text("print('release')\n", encoding="utf-8")
         seal_knowledge_release(
             candidate_root=release,
-            manifest_without_inventory=_manifest(enriched.snapshot_id),
+            manifest_without_inventory=(
+                _manifest_v2(enriched.snapshot_id)
+                if exact_v2
+                else _manifest(enriched.snapshot_id)
+            ),
             snapshot=base,
             enriched=enriched,
             source_root=sources,
         )
         document_id, version_id = next(iter(base.active_membership.items()))
         return release, source, document_id, version_id
+
+    def test_exact_v2_incoming_candidate_loads_after_full_inventory_verification(self) -> None:
+        release, source, document_id, version_id = self._sealed_release(
+            exact_v2=True,
+            incoming_partial=True,
+        )
+
+        catalog = load_generic_catalog_from_release(release)
+
+        self.assertEqual(source, catalog.source_bytes(document_id, version_id))
 
     def test_app_factory_loads_new_document_from_finalized_release_without_route_code(self) -> None:
         release, source, document_id, version_id = self._sealed_release()

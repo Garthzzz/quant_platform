@@ -25,6 +25,7 @@ from quant_hub.ops.release_identity import (
     manifest_sha256,
     validate_release_manifest,
 )
+from quant_hub.ops import local_release_identity
 from quant_hub.runtime_seal import RuntimeSealError, safe_tree_file_state
 from quant_hub.config import ensure_no_reparse_components
 from quant_hub.knowledge_mcp.mirror import (
@@ -329,23 +330,44 @@ def _load_knowledge(payload: bytes) -> tuple[str, str, dict[str, str], dict[str,
 
 def _verified_release_inventory(root: Path) -> Mapping[str, Mapping[str, object]]:
     try:
-        manifest = validate_release_manifest(
-            json.loads((root / "release_manifest.json").read_text(encoding="utf-8"))
+        raw_manifest = json.loads(
+            (root / "release_manifest.json").read_text(encoding="utf-8")
+        )
+        exact_v2 = (
+            isinstance(raw_manifest, dict)
+            and raw_manifest.get("schema_version")
+            == local_release_identity.RELEASE_MANIFEST_SCHEMA
+        )
+        manifest = (
+            local_release_identity.validate_release_manifest(raw_manifest)
+            if exact_v2
+            else validate_release_manifest(raw_manifest)
         )
         actual = safe_tree_file_state(root)
     except (OSError, UnicodeError, json.JSONDecodeError, RuntimeSealError, ValueError) as error:
         raise GenericReleaseError("finalized release cannot be verified") from error
-    if manifest["release_id"] != root.name:
+    release_id = str(manifest["release_id"])
+    if root.name not in {release_id, f"{release_id}.partial"}:
         raise GenericReleaseError("release directory and release identity disagree")
     inventory = manifest["inventory"]
+    expected_inventory_schema = (
+        "qrh-release-file-inventory/v2"
+        if exact_v2
+        else "qrh-release-file-inventory/v1"
+    )
     if (
         not isinstance(inventory, dict)
         or set(inventory) != {"schema_version", "files"}
-        or inventory["schema_version"] != "qrh-release-file-inventory/v1"
+        or inventory["schema_version"] != expected_inventory_schema
         or not isinstance(inventory["files"], list)
     ):
         raise GenericReleaseError("release inventory schema is invalid")
-    if manifest["resources"]["inventory_sha256"] != manifest_sha256(inventory):
+    inventory_sha256 = (
+        local_release_identity.identity_sha256(inventory)
+        if exact_v2
+        else manifest_sha256(inventory)
+    )
+    if manifest["resources"]["inventory_sha256"] != inventory_sha256:
         raise GenericReleaseError("release inventory hash is not bound")
     expected: dict[str, Mapping[str, object]] = {}
     for row in inventory["files"]:
