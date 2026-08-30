@@ -25,6 +25,7 @@ from quant_hub.ops.publish_adapters import (
     SecretValue,
     VMDeploymentAdapter,
     _powershell_package_inventory_verification_script,
+    _powershell_utf8_output_script,
 )
 from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_identity import manifest_sha256
@@ -512,6 +513,29 @@ class OpenSSHVMBackendTests(AuthorityPatchedTestCase):
     def _script(call) -> str:
         return base64.b64decode(call[-1]).decode("utf-16le")
 
+    def test_powershell_utf8_contract_round_trips_non_ascii_json(self) -> None:
+        script = (
+            _powershell_utf8_output_script()
+            + "$name=([string][char]0x91cf+[char]0x5316+'.json');"
+            "[ordered]@{path=$name}|ConvertTo-Json -Compress"
+        )
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                base64.b64encode(script.encode("utf-16le")).decode("ascii"),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual({"path": "量化.json"}, json.loads(completed.stdout))
+
     def test_remote_scripts_enforce_root_and_reparse_checks_before_writes(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
         calls = []
@@ -540,7 +564,16 @@ class OpenSSHVMBackendTests(AuthorityPatchedTestCase):
             if call[0] == "ssh"
         ]
         self.assertTrue(all("D:\\quant\\quant_platform" in script for script in scripts))
+        self.assertTrue(all("[Console]::OutputEncoding=$utf8" in script for script in scripts))
+        self.assertTrue(all("$OutputEncoding=$utf8" in script for script in scripts))
         self.assertTrue(all("SSH_CONNECTION" in script for script in scripts))
+        self.assertTrue(
+            all(
+                script.index("[Console]::OutputEncoding=$utf8")
+                < script.index("SSH_CONNECTION")
+                for script in scripts
+            )
+        )
         self.assertTrue(
             all(
                 script.index("SSH_CONNECTION") < script.index("New-Item")

@@ -49,6 +49,20 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,99}")
 
 
+def _powershell_utf8_output_script() -> str:
+    """Pin remote PowerShell stdout to the UTF-8 contract used by the runner.
+
+    Windows PowerShell otherwise inherits the VM console code page.  JSON remains
+    syntactically valid in that encoding, but non-ASCII inventory paths are then
+    decoded as UTF-8 by :func:`_subprocess_runner` and silently change identity.
+    """
+
+    return (
+        "$utf8=[Text.UTF8Encoding]::new($false);"
+        "[Console]::OutputEncoding=$utf8;$OutputEncoding=$utf8;"
+    )
+
+
 class PublishAdapterError(PublishError):
     pass
 
@@ -706,7 +720,11 @@ class OpenSSHVMBackend:
         self.command_runner = command_runner
 
     def _ssh(self, script: str) -> str:
-        script = ssh_target_guard_script(self.config.target_address) + script
+        script = (
+            _powershell_utf8_output_script()
+            + ssh_target_guard_script(self.config.target_address)
+            + script
+        )
         result = self.command_runner(
             [
                 "ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
