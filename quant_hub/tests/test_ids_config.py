@@ -8,10 +8,14 @@ from quant_hub.archive.catalog import ArchiveCatalog
 from quant_hub.collaboration.service import ArchiveCollaboration
 from quant_hub.config import ConfigurationError, Settings
 from quant_hub.ids import new_public_id, object_id_for_sha256, stable_sha256, validate_public_id
-from tests.helpers import SettingsTestCase
+from tests.helpers import SettingsTestCase, install_public_archive_presentation
 
 
 class IdTests(SettingsTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        install_public_archive_presentation(self)
+
     def test_public_and_content_ids_are_valid(self) -> None:
         value = new_public_id("run")
         self.assertEqual(value, validate_public_id(value))
