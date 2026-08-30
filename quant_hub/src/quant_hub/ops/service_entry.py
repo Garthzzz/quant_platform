@@ -366,6 +366,9 @@ def serve(
         archive_root=archive,
         var_root=var_root,
         migration_root=migration,
+        # Candidate and steady processes both consume immutable release bytes;
+        # all mutable state is supplied by the external D state/probe roots.
+        read_only_runtime=True,
     )
     application_config: dict[str, object] = {
         "SECRET_KEY": _secret_key(session_path),

@@ -21,6 +21,7 @@ from uuid import uuid4
 
 PRODUCTION_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
 SERVICE_NAME = "QuantResearchHub"
+SERVICE_CLASS = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 MANIFEST_SCHEMA = "qrh-release-manifest/v2"
 INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v1"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
@@ -52,6 +53,23 @@ _PACKAGE_BINDINGS = {
     "service_entry_module": "ops/service_entry.py",
     "deployment_cli_module": "ops/vm_deploy_cli.py",
     "access_gate_module": "web/access_gate.py",
+}
+_INSTALL_PATH_BINDINGS = {
+    "service_executable": "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+    "service_python": "tooling/python/python.exe",
+    "service_host_module": (
+        "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py"
+    ),
+    "service_entry_module": (
+        "tooling/python/Lib/site-packages/quant_hub/ops/service_entry.py"
+    ),
+    "deployment_cli_module": (
+        "tooling/python/Lib/site-packages/quant_hub/ops/vm_deploy_cli.py"
+    ),
+    "access_gate_module": (
+        "tooling/python/Lib/site-packages/quant_hub/web/access_gate.py"
+    ),
+    "deployment_runtime": "control/deployment_runtime.json",
 }
 _TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v1"
 _TOOLING_SCOPE = "exact_runtime_tooling_claim_not_independently_observed"
@@ -300,6 +318,74 @@ def _write_atomic(path: Path, value: Mapping[str, object], *, suffix: str) -> No
     os.replace(temporary, path)
 
 
+def _write_atomic_new(
+    path: Path, value: Mapping[str, object], *, suffix: str
+) -> None:
+    """Publish canonical bytes atomically without replacing an existing claim."""
+
+    temporary = path.with_name(f".{path.name}.{suffix}.partial")
+    if temporary.exists() or os.path.lexists(path):
+        raise ToolingUpdateError("tooling bootstrap claim target already exists")
+    raw = _canonical(value)
+    published = False
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Same-volume link publishes complete bytes with create-if-absent
+        # semantics on Windows and on the test platforms.
+        os.link(temporary, path)
+        published = True
+        temporary.unlink()
+    except BaseException:
+        if published:
+            if path.read_bytes() != raw:
+                raise ToolingUpdateError(
+                    "bootstrapped tooling claim changed during publication"
+                )
+            path.unlink()
+        if temporary.exists():
+            temporary.unlink()
+        raise
+
+
+def _validate_installed_bindings(
+    root: Path,
+    install: object,
+    package: Path,
+    package_records: Mapping[str, tuple[int, str]],
+) -> Mapping[str, object]:
+    """Close the legacy fixed-D install before a claim may be bootstrapped."""
+
+    if (
+        not isinstance(install, dict)
+        or set(install) != _INSTALL_FIELDS
+        or install.get("schema_version") != INSTALL_SCHEMA
+        or install.get("service_name") != SERVICE_NAME
+        or install.get("python_class") != SERVICE_CLASS
+        or install.get("start_type") != "automatic"
+    ):
+        raise ToolingUpdateError("service install candidate identity differs")
+    expected_package = _guard_chain(root, package)
+    if install.get("quant_hub_package_root") != str(expected_package):
+        raise ToolingUpdateError("installed tooling package path differs")
+    if _package_inventory_sha256(package_records) != install.get(
+        "quant_hub_package_inventory_sha256"
+    ):
+        raise ToolingUpdateError("installed tooling package binding differs")
+    for field, relative in _INSTALL_PATH_BINDINGS.items():
+        expected = _guard_chain(root, root.joinpath(*relative.split("/")))
+        if not expected.is_file():
+            raise ToolingUpdateError("installed tooling binding is not a regular file")
+        if (
+            install.get(field) != str(expected)
+            or install.get(f"{field}_sha256") != _hash_file(expected)
+        ):
+            raise ToolingUpdateError(f"installed tooling binding differs: {field}")
+    return install
+
+
 def _copy_package(
     source: Path,
     destination: Path,
@@ -467,6 +553,7 @@ def update_vm_tooling(
     allow_test_root: bool = False,
     service_stopped_probe: Callable[[], bool] = _service_stopped,
     fail_after_package_swap: bool = False,
+    fail_after_claims_swap: bool = False,
 ) -> Mapping[str, object]:
     """Install one sealed candidate package and atomically rebind its hashes."""
 
@@ -480,7 +567,7 @@ def update_vm_tooling(
         raise ToolingUpdateError("test tooling update cannot target production D")
     if not allow_test_root and service_stopped_probe is not _service_stopped:
         raise ToolingUpdateError("production service-state probe is not injectable")
-    if fail_after_package_swap and not allow_test_root:
+    if (fail_after_package_swap or fail_after_claims_swap) and not allow_test_root:
         raise ToolingUpdateError("tooling update fault injection is test-only")
     _guard_chain(root, root)
     candidate = _guard_chain(root, root / "incoming" / f"{release}.partial")
@@ -503,7 +590,11 @@ def update_vm_tooling(
     control = _guard_chain(root, root / "control")
     install_path = _guard_chain(root, control / "service_install_candidate.json")
     install_prior = control / f".service_install_candidate.{attempt}.prior"
-    tooling_path = _guard_chain(root, control / "exact_runtime_tooling.json")
+    tooling_path = control / "exact_runtime_tooling.json"
+    tooling_bootstrap = not os.path.lexists(tooling_path)
+    tooling_path = _guard_chain(
+        root, tooling_path, must_exist=not tooling_bootstrap
+    )
     tooling_prior = control / f".exact_runtime_tooling.{attempt}.prior"
     journal_path = control / "tooling_update_pending.json"
     for path in (
@@ -521,36 +612,18 @@ def update_vm_tooling(
         install = json.loads(install_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ToolingUpdateError("service install candidate is unreadable") from error
-    if (
-        not isinstance(install, dict)
-        or set(install) != _INSTALL_FIELDS
-        or install.get("schema_version") != INSTALL_SCHEMA
-        or install.get("service_name") != SERVICE_NAME
-        or install.get("start_type") != "automatic"
-        or Path(str(install.get("quant_hub_package_root"))).resolve(strict=True)
-        != package
-    ):
-        raise ToolingUpdateError("service install candidate identity differs")
     old_inventory = _regular_files(package)
-    if _package_inventory_sha256(old_inventory) != install.get(
-        "quant_hub_package_inventory_sha256"
-    ):
-        raise ToolingUpdateError("installed tooling package binding differs")
-    for field, relative in _PACKAGE_BINDINGS.items():
-        path = package.joinpath(*relative.split("/"))
-        if (
-            Path(str(install.get(field))).resolve(strict=True) != path
-            or install.get(f"{field}_sha256") != _hash_file(path)
-        ):
-            raise ToolingUpdateError("installed tooling module binding differs")
-    try:
-        tooling_raw = tooling_path.read_bytes()
-        tooling = json.loads(tooling_raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ToolingUpdateError("exact runtime tooling claim is unreadable") from error
+    install = _validate_installed_bindings(root, install, package, old_inventory)
     expected_old_tooling = _build_tooling_claim(root, old_inventory)
-    if tooling_raw != _canonical(tooling) or tooling != expected_old_tooling:
-        raise ToolingUpdateError("exact runtime tooling claim differs from live bytes")
+    tooling_raw: bytes | None = None
+    if not tooling_bootstrap:
+        try:
+            tooling_raw = tooling_path.read_bytes()
+            tooling = json.loads(tooling_raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ToolingUpdateError("exact runtime tooling claim is unreadable") from error
+        if tooling_raw != _canonical(tooling) or tooling != expected_old_tooling:
+            raise ToolingUpdateError("exact runtime tooling claim differs from live bytes")
 
     _copy_package(source, stage, expected)
     updated = dict(install)
@@ -561,7 +634,8 @@ def update_vm_tooling(
         updated[f"{field}_sha256"] = expected[relative][1]
     updated_tooling = _build_tooling_claim(root, expected)
     install_prior.write_bytes(install_path.read_bytes())
-    tooling_prior.write_bytes(tooling_raw)
+    if tooling_raw is not None:
+        tooling_prior.write_bytes(tooling_raw)
     journal = {
         "schema_version": "qrh-tooling-update-pending/v1",
         "attempt_id": attempt,
@@ -569,6 +643,7 @@ def update_vm_tooling(
         "release_manifest_sha256": expected_manifest,
         "old_package_inventory_sha256": _package_inventory_sha256(old_inventory),
         "new_package_inventory_sha256": _package_inventory_sha256(expected),
+        "old_exact_runtime_tooling": "absent" if tooling_bootstrap else "present",
         "phase": "staged",
         "authority": "coordination_only",
     }
@@ -586,10 +661,15 @@ def update_vm_tooling(
             raise ToolingUpdateError("injected failure after package swap")
         _write_atomic(install_path, updated, suffix=attempt)
         candidate_swapped = True
-        _write_atomic(tooling_path, updated_tooling, suffix=attempt)
+        if tooling_bootstrap:
+            _write_atomic_new(tooling_path, updated_tooling, suffix=attempt)
+        else:
+            _write_atomic(tooling_path, updated_tooling, suffix=attempt)
         tooling_swapped = True
         journal["phase"] = "claims_swapped"
         _write_atomic(journal_path, journal, suffix=attempt)
+        if fail_after_claims_swap:
+            raise ToolingUpdateError("injected failure after claims swap")
         if _regular_files(package) != expected:
             raise ToolingUpdateError("installed tooling package changed after swap")
         if json.loads(install_path.read_text(encoding="utf-8")) != updated:
@@ -600,7 +680,14 @@ def update_vm_tooling(
         rollback_error: BaseException | None = None
         try:
             if tooling_swapped:
-                os.replace(tooling_prior, tooling_path)
+                if tooling_bootstrap:
+                    if tooling_path.read_bytes() != _canonical(updated_tooling):
+                        raise ToolingUpdateError(
+                            "bootstrapped tooling claim changed before rollback"
+                        )
+                    tooling_path.unlink()
+                else:
+                    os.replace(tooling_prior, tooling_path)
             if candidate_swapped:
                 os.replace(install_prior, install_path)
             if package_swapped:
@@ -623,7 +710,8 @@ def update_vm_tooling(
 
     _remove_tree(prior)
     install_prior.unlink()
-    tooling_prior.unlink()
+    if tooling_prior.exists():
+        tooling_prior.unlink()
     journal_path.unlink()
     return {
         "schema_version": "qrh-tooling-update-result/v1",

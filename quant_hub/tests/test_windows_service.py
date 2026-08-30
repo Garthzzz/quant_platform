@@ -65,6 +65,7 @@ from pathlib import Path
 import sqlite3
 
 def create_app(settings, config):
+    settings.ensure_runtime_directories()
     app = Flask(__name__)
     app.config.update(config)
     label = (Path(settings.project_root) / "version.txt").read_text(encoding="utf-8").strip()
@@ -85,11 +86,20 @@ def create_app(settings, config):
     return app
 '''
 
-FIXTURE_CONFIG = b'''from types import SimpleNamespace
+FIXTURE_CONFIG = b'''from pathlib import Path
+from types import SimpleNamespace
 class Settings:
     @classmethod
     def default(cls, **values):
-        return SimpleNamespace(**values)
+        read_only_runtime = values.pop("read_only_runtime", False)
+        def ensure_runtime_directories():
+            if not read_only_runtime:
+                (Path(values["var_root"]) / "replay" / "evidence").mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(
+            **values,
+            read_only_runtime=read_only_runtime,
+            ensure_runtime_directories=ensure_runtime_directories,
+        )
 '''
 
 
@@ -986,6 +996,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
 
     def test_candidate_probe_runs_exact_r2_on_isolated_loopback_and_checkpoint_state(self) -> None:
         active_before = (self.root / "control" / "active_release.json").read_bytes()
+        candidate_root = self.root / "releases" / "release-r2"
+        candidate_members_before = sorted(
+            path.relative_to(candidate_root).as_posix()
+            for path in candidate_root.rglob("*")
+        )
         state_before = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
             for path in (self.root / "state").glob("*.sqlite3")
@@ -1064,6 +1079,14 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         )
         self.assertFalse(any((self.root / "state").glob("*.sqlite3-wal")))
         self.assertFalse(any((self.root / "state").glob("*.sqlite3-shm")))
+        self.assertEqual(
+            candidate_members_before,
+            sorted(
+                path.relative_to(candidate_root).as_posix()
+                for path in candidate_root.rglob("*")
+            ),
+        )
+        self.assertFalse((candidate_root / "runtime" / "replay").exists())
         self.assertEqual(Path(sys.executable).resolve(), Path(popen_arguments[0][0]).resolve())
         self.assertEqual(2, len(cleanup_targets))
         self.assertEqual(cleanup_targets[0], cleanup_targets[1])

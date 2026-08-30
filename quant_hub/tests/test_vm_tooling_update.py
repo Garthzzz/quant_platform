@@ -221,6 +221,54 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
         self.assertFalse(any(self.package.parent.glob("quant_hub.update-*")))
 
+    def test_missing_old_claim_bootstraps_after_strict_live_verification(self) -> None:
+        self.tooling_path.unlink()
+        result = self.update()
+        expected = module._regular_files(self.source)
+        tooling = json.loads(self.tooling_path.read_text(encoding="utf-8"))
+        self.assertEqual(module._build_tooling_claim(self.root, expected), tooling)
+        self.assertEqual(tooling["tooling_sha256"], result["exact_runtime_tooling_sha256"])
+        self.assertFalse(any((self.root / "control").glob(".exact_runtime_tooling.*")))
+
+    def test_missing_old_claim_rejects_tampered_binary_binding_without_write(self) -> None:
+        self.tooling_path.unlink()
+        install = json.loads(self.install_path.read_text(encoding="utf-8"))
+        install["service_python_sha256"] = "0" * 64
+        self.install_path.write_bytes(module._canonical(install))
+        old_install = self.install_path.read_bytes()
+        with self.assertRaisesRegex(module.ToolingUpdateError, "service_python"):
+            self.update()
+        self.assertFalse(self.tooling_path.exists())
+        self.assertEqual(old_install, self.install_path.read_bytes())
+        self.assertEqual(
+            self.old_package,
+            {
+                item.relative_to(self.package).as_posix(): item.read_bytes()
+                for item in self.package.rglob("*")
+                if item.is_file()
+            },
+        )
+
+    def test_bootstrap_failure_after_claim_creation_removes_new_claim(self) -> None:
+        self.tooling_path.unlink()
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "injected failure after claims swap"
+        ):
+            self.update(fail_after_claims_swap=True)
+        self.assertFalse(self.tooling_path.exists())
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(
+            self.old_package,
+            {
+                item.relative_to(self.package).as_posix(): item.read_bytes()
+                for item in self.package.rglob("*")
+                if item.is_file()
+            },
+        )
+        self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
+        self.assertFalse(any(self.package.parent.glob("quant_hub.update-*")))
+        self.assertFalse(any((self.root / "control").glob(".exact_runtime_tooling.*")))
+
 
 if __name__ == "__main__":
     unittest.main()

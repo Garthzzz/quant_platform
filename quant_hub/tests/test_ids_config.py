@@ -81,6 +81,31 @@ class IdTests(SettingsTestCase):
         self.assertFalse(self.settings.research_papers_database_path.exists())
         self.assertFalse(self.settings.paper_lab_database_path.exists())
 
+    def test_read_only_runtime_never_materializes_missing_release_directories(self) -> None:
+        runtime = self.project / "quant_hub" / "immutable-runtime"
+        (runtime / "db").mkdir(parents=True)
+        before = sorted(
+            path.relative_to(runtime).as_posix()
+            for path in runtime.rglob("*")
+        )
+        settings = Settings.default(
+            project_root=self.project,
+            archive_root=self.archive,
+            var_root=runtime,
+            migration_root=self.settings.migration_root,
+            read_only_runtime=True,
+        )
+
+        settings.ensure_runtime_directories()
+
+        self.assertTrue(settings.read_only_runtime)
+        self.assertEqual(
+            before,
+            sorted(path.relative_to(runtime).as_posix() for path in runtime.rglob("*")),
+        )
+        self.assertFalse(settings.evidence_replay_root.exists())
+        self.assertFalse(settings.paper_lab_asset_root.exists())
+
     def test_default_can_bind_an_explicit_frozen_migration_root(self) -> None:
         runtime = self.project / "quant_hub" / "frozen-runtime"
         settings = Settings.default(

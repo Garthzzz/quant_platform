@@ -54,6 +54,7 @@ class Settings:
     database_path: Path
     object_root: Path
     migration_root: Path
+    read_only_runtime: bool = False
 
     @property
     def archive_database_path(self) -> Path:
@@ -131,6 +132,7 @@ class Settings:
         archive_root: Path | None = None,
         var_root: Path | None = None,
         migration_root: Path | None = None,
+        read_only_runtime: bool = False,
     ) -> "Settings":
         source_formal_root = Path(__file__).resolve().parents[2]
         source_migrations = source_formal_root / "migrations" / "platform"
@@ -159,6 +161,7 @@ class Settings:
             database_path=runtime / "db" / "platform.sqlite3",
             object_root=runtime / "objects",
             migration_root=selected_migration_root,
+            read_only_runtime=read_only_runtime,
         )
         settings.validate()
         return settings
@@ -239,6 +242,24 @@ class Settings:
         # Check every existing ancestor before creating descendants so an
         # already-replaced runtime root cannot be followed even once.
         ensure_no_reparse_components(self.var_root)
+        if self.read_only_runtime:
+            if not self.var_root.is_dir():
+                raise ConfigurationError("read-only runtime root must already exist")
+            for directory in (
+                self.database_path.parent,
+                self.object_root,
+                self.research_papers_root,
+                self.evidence_replay_root,
+                self.paper_lab_asset_root,
+                self.paper_lab_drop_root,
+                self.research_workspace_root,
+            ):
+                ensure_no_reparse_components(directory)
+                if os.path.lexists(directory) and not directory.is_dir():
+                    raise ConfigurationError(
+                        f"read-only runtime path must be a directory: {directory}"
+                    )
+            return
         self.var_root.mkdir(parents=True, exist_ok=True)
         ensure_no_reparse_components(self.var_root)
         for directory in (
