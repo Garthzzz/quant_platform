@@ -422,6 +422,144 @@ class ProductionExactDeploymentController:
             _seal(journal, "journal_sha256")
         ), compatibility_documents
 
+    def _initial_rollback_journal(
+        self,
+        *,
+        lock: CrashReleasedFileLock,
+        attempt: str,
+        nonce: str,
+    ) -> tuple[
+        Mapping[str, object],
+        tuple[Mapping[str, object], ...],
+        Mapping[str, object],
+    ]:
+        """Derive an ordinary rollback only from the retained active/prior pair."""
+
+        active_record = self._persistence.read_active_release()
+        binding_record = self._persistence.read_local_prior_binding()
+        if active_record is None or binding_record is None:
+            raise ExactDeploymentControllerError(
+                "ordinary rollback requires one exact active/prior binding"
+            )
+        binding = binding_record.value
+        original_pair = _pair(binding["active"], binding["prior"])
+        if (
+            binding["prior"] is None
+            or active_record.value["release"] != binding["active"]
+        ):
+            raise ExactDeploymentControllerError(
+                "ordinary rollback requires a non-null prior and aligned active pointer"
+            )
+        receipts = tuple(
+            record.value for record in self._persistence.read_local_receipts()
+        )
+        retention = self._persistence.plan_retention(
+            lock=lock,
+            receipts=receipts,
+        )
+        if retention.transient is not None or retention.cleanup_targets:
+            raise ExactDeploymentControllerError(
+                "ordinary rollback requires a closed stable retention state"
+            )
+        state_identity = identity.validate_state_identity(
+            binding["state_identity"]
+        )
+        candidate_manifest = self._manifest(
+            str(binding["prior"]["release_id"])
+        )
+        candidate_ref = _release_ref(candidate_manifest)
+        if candidate_ref != binding["prior"]:
+            raise ExactDeploymentControllerError(
+                "retained prior manifest differs from the binding"
+            )
+        current_manifest = self._manifest(str(binding["active"]["release_id"]))
+        plan = plan_exact_release_compatibility(
+            operation="rollback",
+            attempt_id=attempt,
+            nonce=nonce,
+            state_identity_sha256=str(state_identity["identity_sha256"]),
+            candidate_manifest=candidate_manifest,
+            prior_manifest=current_manifest,
+        )
+        compatibility_documents = tuple(
+            _build_compatibility_document(
+                operation="rollback",
+                attempt_id=attempt,
+                nonce=nonce,
+                state_identity_sha256=str(state_identity["identity_sha256"]),
+                database_name=database,
+                candidate=candidate_manifest,
+                prior=current_manifest,
+            )
+            for database in DATABASE_ORDER
+        )
+        _, observed_aggregate = validate_exact_release_compatibility_evidence_set(
+            compatibility_documents
+        )
+        if observed_aggregate != plan.aggregate_sha256:
+            raise ExactDeploymentControllerError(
+                "rollback compatibility plan drifted"
+            )
+        target_pair = _pair(candidate_ref, binding["active"])
+        desired_binding = _binding(
+            attempt=attempt,
+            active=candidate_ref,
+            prior=binding["active"],
+            state_identity=state_identity,
+        )
+        created = _now()
+        journal: dict[str, object] = {
+            "schema_version": DEPLOYMENT_ATTEMPT_SCHEMA,
+            "attempt": attempt,
+            "operation": "rollback",
+            "revision": 0,
+            "phase": "intent_durable",
+            "nonce": nonce,
+            "timestamps": {"created_at": created, "updated_at": created},
+            "previous_journal_sha256": None,
+            "original_pair": original_pair,
+            "candidate": candidate_ref,
+            "target_pair": target_pair,
+            "pointer_cas": {
+                "expected": binding["active"],
+                "desired": candidate_ref,
+            },
+            "binding_cas": {
+                "expected_binding": binding,
+                "desired_binding": desired_binding,
+                "expected_binding_sha256": binding["binding_sha256"],
+                "desired_binding_sha256": desired_binding["binding_sha256"],
+            },
+            "state_plan": {
+                "state_identity_sha256": state_identity["identity_sha256"],
+                "expand_plan_sha256": identity.identity_sha256(
+                    {
+                        "policy": "expand_only_no_down_migration",
+                        "databases": list(DATABASE_ORDER),
+                        "target": candidate_ref,
+                    }
+                ),
+                "compatibility_sha256": plan.aggregate_sha256,
+                "database_names": list(DATABASE_ORDER),
+            },
+            "database_seals": [],
+            "transient_start": [],
+            "reserved_receipt_ids": {
+                "activation": None,
+                "rollback": f"rollback-{attempt}",
+                "failure": f"failure-{attempt}",
+                "cleanup": f"cleanup-{attempt}",
+            },
+            "cleanup_targets": [],
+            "evidence_hashes": {field: None for field in _EVIDENCE_FIELDS},
+            "terminal_receipt": None,
+        }
+        return (
+            validate_deployment_journal(_seal(journal, "journal_sha256")),
+            compatibility_documents,
+            candidate_manifest,
+        )
+
     @staticmethod
     def _production_state_identity() -> Mapping[str, object]:
         value: dict[str, object] = {
@@ -695,11 +833,9 @@ class ProductionExactDeploymentController:
             if role == "prior"
             else "candidate_start_authorized"
         )
-        reference = (
-            latest["original_pair"]["active"]  # type: ignore[index]
-            if role == "prior"
-            else latest["candidate"]
-        )
+        reference = latest["candidate"]
+        if role == "prior" and latest["operation"] == "activation":
+            reference = latest["original_pair"]["active"]  # type: ignore[index]
         lease = ExactRuntimeLeaseIdentity(
             attempt_id=str(latest["attempt"]),
             nonce=str(latest["nonce"]),
@@ -822,25 +958,38 @@ class ProductionExactDeploymentController:
                     ],
                 }
             )
+            rollback = latest["operation"] == "rollback"
             receipt: dict[str, object] = {
-                "schema_version": identity.ACTIVATION_RECEIPT_SCHEMA,
-                "receipt_id": latest["reserved_receipt_ids"]["activation"],
+                "schema_version": (
+                    identity.ROLLBACK_RECEIPT_SCHEMA
+                    if rollback
+                    else identity.ACTIVATION_RECEIPT_SCHEMA
+                ),
+                "receipt_id": latest["reserved_receipt_ids"][
+                    "rollback" if rollback else "activation"
+                ],
                 "attempt_id": latest["attempt"],
                 # The source revision is durable before receipt creation, so a
                 # commit-success/journal-append-crash replay regenerates exact
                 # canonical bytes rather than a new timestamp/hash.
                 "recorded_at": latest["timestamps"]["updated_at"],
                 "authority": "evidence_only",
-                "operation": "activate_successor",
+                "operation": (
+                    "rollback_to_prior" if rollback else "activate_successor"
+                ),
                 "pair": latest["target_pair"],
                 "result": {
-                    "status": "activated",
+                    "status": "rolled_back" if rollback else "activated",
                     "pair_sha256": identity.identity_sha256(latest["target_pair"]),
                     "controller_verification_sha256": verification,
                 },
             }
             receipt = dict(_seal(receipt, "receipt_sha256"))
-            validated = identity.validate_activation_receipt(receipt)
+            validated = (
+                identity.validate_rollback_receipt(receipt)
+                if rollback
+                else identity.validate_activation_receipt(receipt)
+            )
             self._persistence.commit_local_receipt(
                 lock=lock, receipt=validated
             )
@@ -851,7 +1000,7 @@ class ProductionExactDeploymentController:
                 "controller_verification_sha256"
             ] = verification  # type: ignore[index]
             terminal["terminal_receipt"] = {
-                "kind": "activation",
+                "kind": "rollback" if rollback else "activation",
                 "receipt_id": validated["receipt_id"],
                 "receipt_sha256": validated["receipt_sha256"],
             }
@@ -1040,6 +1189,13 @@ class ProductionExactDeploymentController:
                 "requested candidate differs from durable attempt"
             )
 
+    @staticmethod
+    def _assert_rollback_journal(latest: Mapping[str, object]) -> None:
+        if latest["operation"] != "rollback":
+            raise ExactDeploymentControllerError(
+                "requested rollback differs from durable attempt"
+            )
+
     def _original_state_identity(
         self, latest: Mapping[str, object]
     ) -> Mapping[str, object]:
@@ -1211,11 +1367,16 @@ class ProductionExactDeploymentController:
             raise DeploymentJournalError(
                 "failure receipt namespace contains duplicate reserved ID"
             )
+        receipt_operation = (
+            "rollback_to_prior"
+            if latest["operation"] == "rollback"
+            else "activate_successor"
+        )
         if existing:
             receipt = identity.validate_failure_receipt(existing[0])
             if (
                 receipt["attempt_id"] != latest["attempt"]
-                or receipt["operation"] != "activate_successor"
+                or receipt["operation"] != receipt_operation
                 or receipt["failed_phase"] != latest["phase"]
                 or receipt["original_pair"] != original_pair
                 or receipt["candidate"] != latest["candidate"]
@@ -1231,7 +1392,7 @@ class ProductionExactDeploymentController:
                 "attempt_id": latest["attempt"],
                 "recorded_at": latest["timestamps"]["updated_at"],
                 "authority": "evidence_only",
-                "operation": "activate_successor",
+                "operation": receipt_operation,
                 "original_pair": original_pair,
                 "original_state_identity": state,
                 "candidate": latest["candidate"],
@@ -1605,12 +1766,13 @@ class ProductionExactDeploymentController:
             raise cause
         latest = history[-1]
         if latest["phase"] == "failure_receipt_committed":
-            self._persistence.cleanup_failed_candidate(
-                lock=lock,
-                attempt_id=attempt_id,
-            )
+            if latest["operation"] != "rollback":
+                self._persistence.cleanup_failed_candidate(
+                    lock=lock,
+                    attempt_id=attempt_id,
+                )
             raise ExactDeploymentControllerError(
-                "activation already failed after exact original pair restoration; "
+                "deployment already failed after exact original pair restoration; "
                 f"failure_receipt={latest['terminal_receipt']['receipt_id']}"  # type: ignore[index]
             ) from cause
         if latest["phase"] in {
@@ -1823,12 +1985,13 @@ class ProductionExactDeploymentController:
         # a competing controller can only replay the same idempotent cleanup.
         lock.release()
         lock.acquire()
-        self._persistence.cleanup_failed_candidate(
-            lock=lock,
-            attempt_id=attempt_id,
-        )
+        if latest["operation"] != "rollback":
+            self._persistence.cleanup_failed_candidate(
+                lock=lock,
+                attempt_id=attempt_id,
+            )
         raise ExactDeploymentControllerError(
-            "activation failed after exact original pair restoration; "
+            "deployment failed after exact original pair restoration; "
             f"failure_receipt={terminal['terminal_receipt']['receipt_id']}"  # type: ignore[index]
         ) from cause
 
@@ -2036,6 +2199,175 @@ class ProductionExactDeploymentController:
                 "attempt_id": attempt_id,
                 "terminal_journal_sha256": closed["journal_sha256"],
                 "activation_receipt_id": closed["terminal_receipt"]["receipt_id"],  # type: ignore[index]
+            }
+        except Exception as error:
+            if failure_replay_selected:
+                raise
+            self._restore_and_commit_failure(
+                lock=lock,
+                workspace=workspace,
+                attempt_id=attempt_id,
+                cause=error,
+            )
+        finally:
+            if workspace is not None and workspace._state != "closed":  # noqa: SLF001
+                workspace.close()
+            if lock.held:
+                lock.release()
+
+    def rollback_to_prior(
+        self,
+        *,
+        attempt_id: str,
+    ) -> Mapping[str, object]:
+        """Swap only the currently bound active/prior pair on shared D state."""
+
+        self._assert_live_provenance()
+        lock = self._persistence.global_lock()
+        workspace: LockedAttemptWorkspace | None = None
+        failure_replay_selected = False
+        lock.acquire()
+        try:
+            histories = self._persistence.journals.histories()
+            history = histories.get(attempt_id.casefold())
+            if history is None:
+                nonce = secrets.token_hex(24)
+                intent, compatibility, candidate = (
+                    self._initial_rollback_journal(
+                        lock=lock,
+                        attempt=attempt_id,
+                        nonce=nonce,
+                    )
+                )
+                latest = self._persistence.journals.append(intent, lock=lock)
+            else:
+                latest = history[-1]
+                nonce = str(history[0]["nonce"])
+                self._assert_rollback_journal(latest)
+                if latest["phase"] == "failure_receipt_committed":
+                    raise ExactDeploymentControllerError(
+                        "durable rollback attempt already ended in failure; "
+                        f"failure_receipt={latest['terminal_receipt']['receipt_id']}"  # type: ignore[index]
+                    )
+                failure_selection = (
+                    self._persistence.read_failure_selection_authorization(
+                        lock=lock,
+                        attempt_id=attempt_id,
+                        nonce=nonce,
+                    )
+                )
+                failure_recovery = (
+                    self._persistence.read_failure_steady_recovery_authorization(
+                        lock=lock,
+                        attempt_id=attempt_id,
+                        nonce=nonce,
+                    )
+                )
+                if failure_selection is not None or failure_recovery is not None:
+                    failure_replay_selected = True
+                    self._restore_and_commit_failure(
+                        lock=lock,
+                        workspace=None,
+                        attempt_id=attempt_id,
+                        cause=ExactDeploymentControllerError(
+                            "durable rollback failure recovery replay required"
+                        ),
+                    )
+                candidate = self._manifest(
+                    str(latest["candidate"]["release_id"])  # type: ignore[index]
+                )
+                if _release_ref(candidate) != latest["candidate"]:
+                    raise ExactDeploymentControllerError(
+                        "retained rollback target differs from durable attempt"
+                    )
+                compatibility = self._compatibility_documents_from_journal(
+                    history[0], candidate
+                )
+
+            self._assert_rollback_journal(latest)
+            if latest["phase"] == "failure_receipt_committed":
+                raise ExactDeploymentControllerError(
+                    "durable rollback attempt already ended in failure"
+                )
+            workspace = self._persistence.bind_attempt_workspace(
+                lock, attempt_id, nonce
+            )
+            latest = self._persistence.journals.replay(attempt_id)[-1]
+            if latest["phase"] in {
+                "intent_durable",
+                "root_preflight_verified",
+            }:
+                latest = self._append_preflight_and_state(
+                    lock=lock,
+                    workspace=workspace,
+                    latest=latest,
+                    compatibility_documents=compatibility,
+                    candidate_manifest=candidate,
+                )
+            if latest["phase"] == "state_expand_applied":
+                latest = self._append_start_authorization(
+                    lock=lock, latest=latest, role="prior"
+                )
+            if latest["phase"] == "prior_start_authorized":
+                prior_verified = self._qualify_and_stop(
+                    lock=lock, workspace=workspace, role="prior"
+                )
+                try:
+                    self._persistence.consume_verified_phase_next_cas(
+                        lock, workspace, prior_verified
+                    )
+                finally:
+                    self._release_verified_resources(prior_verified)
+                latest = self._persistence.journals.replay(attempt_id)[-1]
+            elif latest["phase"] == "prior_verified":
+                self._resume_verified_cas(
+                    lock=lock, workspace=workspace, role="prior"
+                )
+                latest = self._persistence.journals.replay(attempt_id)[-1]
+            if latest["phase"] == "pointer_cas_committed":
+                latest = self._append_start_authorization(
+                    lock=lock, latest=latest, role="candidate"
+                )
+            if latest["phase"] == "candidate_start_authorized":
+                candidate_verified = self._qualify_and_stop(
+                    lock=lock, workspace=workspace, role="candidate"
+                )
+                try:
+                    self._persistence.consume_verified_phase_next_cas(
+                        lock, workspace, candidate_verified
+                    )
+                finally:
+                    self._release_verified_resources(candidate_verified)
+                latest = self._persistence.journals.replay(attempt_id)[-1]
+            elif latest["phase"] == "candidate_verified":
+                self._resume_verified_cas(
+                    lock=lock, workspace=workspace, role="candidate"
+                )
+                latest = self._persistence.journals.replay(attempt_id)[-1]
+            if latest["phase"] not in {
+                "binding_cas_committed",
+                "terminal_receipt_committed",
+                "cleanup_authorized",
+                "cleanup_planned",
+                "cleanup_receipt_committed",
+            }:
+                raise DeploymentJournalError(
+                    f"unsupported rollback replay phase: {latest['phase']}"
+                )
+            closed = self._finish_success(lock=lock, workspace=workspace)
+            workspace.close()
+            workspace = None
+            lock.release()
+            target = closed["target_pair"]["active"]  # type: ignore[index]
+            self._ensure_steady(target)
+            return {
+                "schema_version": "qrh-vm-deploy-result/v2",
+                "status": "rolled_back",
+                "release_id": target["release_id"],
+                "release_manifest_sha256": target["manifest_sha256"],
+                "attempt_id": attempt_id,
+                "terminal_journal_sha256": closed["journal_sha256"],
+                "rollback_receipt_id": closed["terminal_receipt"]["receipt_id"],  # type: ignore[index]
             }
         except Exception as error:
             if failure_replay_selected:

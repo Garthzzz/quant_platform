@@ -343,6 +343,71 @@ class VMDeployCLITests(unittest.TestCase):
         )
         self.assertEqual("activation-exact-attempt", result["evidence_id"])
 
+    def test_rollback_prior_cli_exposes_only_attempt_and_exact_d_root(self) -> None:
+        exact = mock.Mock()
+        exact.rollback_to_prior.return_value = {
+            "schema_version": "qrh-vm-deploy-result/v2",
+            "status": "rolled_back",
+            "release_id": "release-r0",
+            "release_manifest_sha256": "a" * 64,
+            "attempt_id": "rollback-r1-to-r0",
+            "terminal_journal_sha256": "b" * 64,
+            "rollback_receipt_id": "rollback-rollback-r1-to-r0",
+        }
+        exact_root = Path(r"D:\quant\quant_platform")
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_production_root",
+            return_value=exact_root,
+        ) as verify, mock.patch(
+            "quant_hub.ops.local_exact_deployment_controller."
+            "ProductionExactDeploymentController.load_exact_d",
+            return_value=exact,
+        ):
+            result = vm_deploy_module.rollback_prior(
+                vm_root=exact_root,
+                deployment_attempt_id="rollback-r1-to-r0",
+            )
+        verify.assert_called_once_with(exact_root)
+        exact.rollback_to_prior.assert_called_once_with(
+            attempt_id="rollback-r1-to-r0"
+        )
+        self.assertEqual("rolled_back", result["status"])
+
+        with mock.patch(
+            "quant_hub.ops.vm_deploy_cli.verify_production_root",
+            return_value=exact_root,
+        ), mock.patch(
+            "quant_hub.ops.vm_deploy_cli.capture_vm_write_snapshot",
+            return_value=object(),
+        ) as capture, mock.patch(
+            "quant_hub.ops.vm_deploy_cli.rollback_prior",
+            return_value=result,
+        ) as rollback, mock.patch(
+            "quant_hub.ops.vm_deploy_cli.finalize_vm_write_audit",
+        ) as audit, mock.patch("builtins.print"):
+            code = vm_deploy_module.main(
+                [
+                    "rollback-prior",
+                    "--vm-root",
+                    str(exact_root),
+                    "--deployment-attempt-id",
+                    "rollback-r1-to-r0",
+                    "--json",
+                ]
+            )
+        self.assertEqual(0, code)
+        capture.assert_called_once_with(exact_root)
+        rollback.assert_called_once_with(
+            vm_root=exact_root,
+            deployment_attempt_id="rollback-r1-to-r0",
+        )
+        audit.assert_called_once_with(
+            exact_root,
+            mock.ANY,
+            operation="rollback-prior",
+            outcome="succeeded",
+        )
+
     def test_exact_stop_and_steady_start_require_observed_terminal_states(self) -> None:
         runtime = windows_runtime(self.fixture.root)
         with mock.patch.object(

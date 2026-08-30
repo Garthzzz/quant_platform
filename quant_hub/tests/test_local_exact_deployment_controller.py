@@ -68,6 +68,143 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                         attempt_id="activate-r1",
                     )
 
+    def test_rollback_intent_and_success_derive_only_the_retained_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            persistence = LocalDeploymentPersistence.for_test_only(
+                root, allow_posix_test_only=True
+            )
+            prior = release(
+                "release-prior", b"prior", "8", include_migrations=True
+            )
+            current = release(
+                "release-current", b"current", "9", include_migrations=True
+            )
+            for manifest, payload in (
+                (prior, b"prior"),
+                (current, b"current"),
+            ):
+                self._materialize(
+                    persistence.layout.releases / str(manifest["release_id"]),
+                    manifest,
+                    payload,
+                )
+            current_receipt = transition_receipt(
+                current, prior, attempt="activate-current"
+            )
+            controller = object.__new__(ProductionExactDeploymentController)
+            object.__setattr__(controller, "_persistence", persistence)
+            object.__setattr__(controller, "_service", object())
+            object.__setattr__(controller, "_sealed", True)
+            lock = persistence.global_lock()
+            lock.acquire()
+            workspace = None
+            try:
+                persistence.cas_active_release(
+                    lock=lock, expected=None, desired=active(current)
+                )
+                original_binding = binding(current, prior)
+                persistence.cas_local_prior_binding(
+                    lock=lock,
+                    expected=None,
+                    desired=original_binding,
+                )
+                persistence.commit_local_receipt(
+                    lock=lock, receipt=current_receipt
+                )
+                with patch(
+                    "quant_hub.ops.local_exact_deployment_controller._now",
+                    return_value="2026-08-26T10:02:00+08:00",
+                ):
+                    intent, documents, candidate = (
+                        controller._initial_rollback_journal(
+                            lock=lock,
+                            attempt="rollback-current",
+                            nonce="rollback-current-nonce",
+                        )
+                    )
+                self.assertEqual("rollback", intent["operation"])
+                self.assertEqual(
+                    intent["original_pair"]["prior"], intent["candidate"]
+                )
+                self.assertEqual(
+                    {
+                        "active": intent["candidate"],
+                        "prior": intent["original_pair"]["active"],
+                    },
+                    intent["target_pair"],
+                )
+                self.assertEqual([], intent["cleanup_targets"])
+                self.assertIsNone(
+                    intent["reserved_receipt_ids"]["activation"]
+                )
+                self.assertEqual(
+                    "rollback-rollback-current",
+                    intent["reserved_receipt_ids"]["rollback"],
+                )
+                self.assertEqual(prior, candidate)
+                self.assertEqual(
+                    ["rollback", "rollback"],
+                    [document["operation"] for document in documents],
+                )
+                finish_intent = journal(
+                    current,
+                    current,
+                    original_prior=prior,
+                    operation="rollback",
+                    attempt="rollback-current",
+                    nonce="rollback-current-nonce",
+                )
+                history = history_to(
+                    finish_intent, "binding_cas_committed"
+                )
+                for revision in history:
+                    persistence.journals.append(revision, lock=lock)
+                persistence.cas_active_release(
+                    lock=lock,
+                    expected=active(current),
+                    desired=active(prior),
+                )
+                persistence.cas_local_prior_binding(
+                    lock=lock,
+                    expected=original_binding,
+                    desired=finish_intent["binding_cas"]["desired_binding"],
+                )
+                workspace = persistence.bind_attempt_workspace(
+                    lock,
+                    "rollback-current",
+                    "rollback-current-nonce",
+                )
+                closed = controller._finish_success(
+                    lock=lock, workspace=workspace
+                )
+                rollback_receipts = [
+                    record.value
+                    for record in persistence.read_local_receipts()
+                    if record.value["schema_version"]
+                    == identity.ROLLBACK_RECEIPT_SCHEMA
+                ]
+                self.assertEqual(1, len(rollback_receipts))
+                self.assertEqual(
+                    "rollback_to_prior", rollback_receipts[0]["operation"]
+                )
+                self.assertEqual("rolled_back", rollback_receipts[0]["result"]["status"])
+                self.assertEqual(
+                    "rollback", closed["terminal_receipt"]["kind"]
+                )
+                self.assertEqual(
+                    ["release-current", "release-prior"],
+                    sorted(
+                        item.release_id
+                        for item in persistence.release_inventory()
+                    ),
+                )
+            finally:
+                if workspace is not None and workspace._state != "closed":
+                    workspace.close()
+                if lock.held:
+                    lock.release()
+
     def test_bootstrap_successor_intent_precedes_exact_candidate_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

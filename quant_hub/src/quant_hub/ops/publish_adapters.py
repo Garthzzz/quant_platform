@@ -712,6 +712,69 @@ def bootstrap_verified_d_tooling_python_script(
     )
 
 
+def sealed_candidate_tooling_update_script(
+    *,
+    release_id: str,
+    release_manifest_sha256: str,
+    attempt_id: str,
+) -> str:
+    """Authenticate and execute the stdlib-only updater from one candidate."""
+
+    release = _name(release_id, "tooling update release ID")
+    manifest_hash = _digest(
+        release_manifest_sha256, "tooling update release manifest"
+    )
+    attempt = _name(attempt_id, "tooling update attempt ID")
+    candidate = validate_production_vm_write_path(
+        PRODUCTION_VM_ROOT / "incoming" / f"{release}.partial",
+        allow_root=False,
+    )
+    manifest = validate_production_vm_write_path(
+        candidate / "release_manifest.json", allow_root=False
+    )
+    updater_relative = "runtime_contract/code/tools/update_vm_tooling.py"
+    updater = validate_production_vm_write_path(
+        candidate / PureWindowsPath(updater_relative), allow_root=False
+    )
+    temporary = validate_production_vm_write_path(
+        PRODUCTION_VM_ROOT / "tmp" / "deployment-cli", allow_root=False
+    )
+    arguments = (
+        "-I",
+        str(updater),
+        "--vm-root",
+        str(PRODUCTION_VM_ROOT),
+        "--release-id",
+        release,
+        "--release-manifest-sha256",
+        manifest_hash,
+        "--attempt-id",
+        attempt,
+        "--json",
+    )
+    rendered_arguments = ",".join(_ps_literal(item) for item in arguments)
+    return (
+        verified_d_tooling_python_script("deployment_cli_module")
+        + f"$manifestExpected={_ps_literal(str(manifest))};"
+        + f"$manifestFull=Assert-OperationalFile $manifestExpected {_ps_literal(manifest_hash)};"
+        + "$releaseManifest=Get-Content -LiteralPath $manifestFull -Raw -Encoding UTF8|ConvertFrom-Json;"
+        + f"if($releaseManifest.schema_version-ne'qrh-release-manifest/v2'"
+        + f"-or $releaseManifest.release_id-ne{_ps_literal(release)})"
+        + "{throw 'tooling_candidate_manifest_identity_differs'};"
+        + f"$updaterEntry=@($releaseManifest.inventory.files|Where-Object{{$_.path-eq{_ps_literal(updater_relative)}}});"
+        + "if($updaterEntry.Count-ne1){throw 'tooling_updater_inventory_entry_differs'};"
+        + f"$updaterExpected={_ps_literal(str(updater))};"
+        + "$updaterFull=Assert-OperationalFile $updaterExpected $updaterEntry[0].sha256;"
+        + "$updaterLength=(Get-Item -LiteralPath $updaterFull -Force).Length;"
+        + "if($updaterLength-ne[long]$updaterEntry[0].bytes)"
+        + "{throw 'tooling_updater_size_differs'};"
+        + f"$tmp={_ps_literal(str(temporary))};"
+        + "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
+        + f"$toolingArgs=@({rendered_arguments});$output=& $python @toolingArgs;"
+        + "if($LASTEXITCODE-ne0){throw 'tooling_update_failed'};$output|Write-Output"
+    )
+
+
 class OpenSSHVMBackend:
     """使用 Windows OpenSSH/PowerShell 的实际 backend；命令均为 argv，不经 shell。"""
 
@@ -1019,6 +1082,86 @@ class OpenSSHDeploymentInvoker:
         return value
 
 
+class OpenSSHToolingUpdater:
+    """Host-side fixed SSH invoker for the sealed candidate updater."""
+
+    def __init__(
+        self,
+        config: VMConfig,
+        *,
+        command_runner: CommandRunner = _subprocess_runner,
+    ) -> None:
+        self.config = config
+        self.command_runner = command_runner
+
+    def invoke(
+        self,
+        *,
+        vm_root: PureWindowsPath,
+        release_id: str,
+        release_manifest_sha256: str,
+        attempt_id: str,
+    ) -> Mapping[str, object]:
+        root = validate_production_vm_write_path(vm_root, allow_root=True)
+        if root != PRODUCTION_VM_ROOT or root != self.config.root:
+            raise PublishAdapterError("tooling updater root is not exact configured D")
+        temporary = validate_production_vm_write_path(
+            root / "tmp" / "deployment-cli", allow_root=False
+        )
+        script = (
+            _powershell_utf8_output_script()
+            + ssh_target_guard_script(self.config.target_address)
+            + OpenSSHVMBackend._ensure_directory_script(temporary)
+            + sealed_candidate_tooling_update_script(
+                release_id=release_id,
+                release_manifest_sha256=release_manifest_sha256,
+                attempt_id=attempt_id,
+            )
+        )
+        result = self.command_runner(
+            [
+                "ssh",
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=20",
+                "--",
+                self.config.ssh_alias,
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                _powershell_encoded(script),
+            ]
+        )
+        if result.returncode != 0:
+            raise PublishAdapterError("remote tooling updater failed")
+        try:
+            value = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise PublishAdapterError("remote tooling updater result is invalid JSON") from None
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != "qrh-tooling-update-result/v1"
+            or value.get("status") != "updated"
+            or value.get("release_id") != release_id
+            or value.get("release_manifest_sha256")
+            != release_manifest_sha256
+            or value.get("attempt_id") != attempt_id
+        ):
+            raise PublishAdapterError("remote tooling updater returned another identity")
+        _digest(
+            value.get("quant_hub_package_inventory_sha256"),
+            "updated package inventory",
+        )
+        _digest(
+            value.get("exact_runtime_tooling_sha256"),
+            "updated exact runtime tooling",
+        )
+        return value
+
+
 __all__ = [
     "ActivationAuthorization",
     "CONFIG_SCHEMA",
@@ -1027,6 +1170,7 @@ __all__ = [
     "HTTPResponse",
     "IncrementalVMTransport",
     "OpenSSHDeploymentInvoker",
+    "OpenSSHToolingUpdater",
     "OpenSSHVMBackend",
     "ProductionPublishConfig",
     "PublishAdapterError",
@@ -1036,6 +1180,7 @@ __all__ = [
     "VMDeploymentAdapter",
     "bootstrap_verified_d_tooling_python_script",
     "exact_production_root_parent_guard_script",
+    "sealed_candidate_tooling_update_script",
     "ssh_target_guard_script",
     "verified_d_tooling_python_script",
 ]

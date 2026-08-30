@@ -17,6 +17,7 @@ from quant_hub.ops.publish_adapters import (
     HTTPResponse,
     IncrementalVMTransport,
     OpenSSHDeploymentInvoker,
+    OpenSSHToolingUpdater,
     OpenSSHVMBackend,
     ProductionPublishConfig,
     PublishAdapterError,
@@ -26,6 +27,7 @@ from quant_hub.ops.publish_adapters import (
     VMDeploymentAdapter,
     _powershell_package_inventory_verification_script,
     _powershell_utf8_output_script,
+    sealed_candidate_tooling_update_script,
 )
 from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_identity import manifest_sha256
@@ -74,6 +76,77 @@ def run(run_id: int, *, sha: str = COMMIT, status: str = "completed", conclusion
 
 
 class ProductionConfigTests(unittest.TestCase):
+    def test_sealed_candidate_tooling_update_binds_direct_script_before_python(self) -> None:
+        script = sealed_candidate_tooling_update_script(
+            release_id="release-r1",
+            release_manifest_sha256="a" * 64,
+            attempt_id="tooling-r1",
+        )
+        updater = (
+            r"D:\quant\quant_platform\incoming\release-r1.partial"
+            r"\runtime_contract\code\tools\update_vm_tooling.py"
+        )
+        self.assertIn("package_inventory_hash_mismatch", script)
+        self.assertIn("tooling_updater_inventory_entry_differs", script)
+        self.assertIn(updater, script)
+        self.assertIn("Assert-OperationalFile $updaterExpected", script)
+        self.assertIn("-I", script)
+        self.assertIn("--release-manifest-sha256", script)
+        self.assertLess(
+            script.index("Assert-OperationalFile $updaterExpected"),
+            script.index("& $python @toolingArgs"),
+        )
+        parsed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[void][scriptblock]::Create([Console]::In.ReadToEnd())",
+            ],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, parsed.returncode, parsed.stderr)
+
+    def test_host_tooling_invoker_uses_only_fixed_manifest_bound_script(self) -> None:
+        config = ProductionPublishConfig.parse(config_value()).vm
+        calls = []
+
+        def runner(arguments):
+            calls.append(arguments)
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "schema_version": "qrh-tooling-update-result/v1",
+                        "status": "updated",
+                        "attempt_id": "tooling-r1",
+                        "release_id": "release-r1",
+                        "release_manifest_sha256": "a" * 64,
+                        "quant_hub_package_inventory_sha256": "b" * 64,
+                        "exact_runtime_tooling_sha256": "c" * 64,
+                    }
+                ),
+            )
+
+        result = OpenSSHToolingUpdater(
+            config, command_runner=runner
+        ).invoke(
+            vm_root=config.root,
+            release_id="release-r1",
+            release_manifest_sha256="a" * 64,
+            attempt_id="tooling-r1",
+        )
+        self.assertEqual("updated", result["status"])
+        script = base64.b64decode(calls[0][-1]).decode("utf-16le")
+        self.assertIn("SSH_CONNECTION", script)
+        self.assertIn("tooling_updater_inventory_entry_differs", script)
+        self.assertIn("update_vm_tooling.py", script)
+        self.assertLess(script.index("SSH_CONNECTION"), script.index("New-Item"))
+
     def test_checked_in_schema_matches_runtime_contract_and_contains_no_secret(self) -> None:
         schema_path = ROOT / "config" / "production_publish.schema.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))

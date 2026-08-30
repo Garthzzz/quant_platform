@@ -58,7 +58,7 @@
 
 ## Stage 5 certificate 的最低内容
 
-新证书 schema/producer 完成迁移后至少绑定：
+新证书至少绑定：
 
 - Public repository observation、full 40/64 位非零 commit SHA、tracked tree；
 - exact active/prior release、manifest、snapshot、binding 与 application/content/resource closure；
@@ -74,7 +74,7 @@
 重读 canonical bytes、复算 hash、核对真实对象和现场身份。任一必需 producer 尚未实现或现场
 证据尚未取得时，certificate 必须 fail closed。
 
-## 当前实现与不可执行项
+## 当前实现与现场签发边界
 
 - 本地 release identity、v2 `candidate_only`、普通 failure recovery、R0 bootstrap、R0→R1
   exact pair bridge 和产品撤销面已完成实现与专项回归；正常首次切换由
@@ -90,7 +90,10 @@
   replace、candidate probe 和 transient cleanup 只通过固定父目录相对操作；产品 controller、
   persistence、Windows runtime 均为 live provenance + slots 对象，不能通过实例 method shadow、
   test hook、环境或 alias 注入绕过固定生产调用图。
-- 旧 Stage 5 schema/producer 已移除；新证书必须等 active/prior、writer handoff、现场 D-root
-  证据和全局回归全部闭合后再实现和签发。
+- 新 `quant_hub.ops.release_closure` producer/verifier 已实现：Stage 5 强制消费十类 canonical
+  gate evidence，Stage 6 强制消费 Stage 5 certificate 与五类 Private 复验证据；两者都会重读
+  artifact、复算 hash、核对 subject/time/producer/assertions，并以 create-only canonical 文件
+  输出。实现存在不等于已经放行；只有 active/prior、writer handoff、现场 D-root 和功能证据
+  真实闭合后才能签发，当前不得预造 PASS。
 - 已建立的生产 VM 连接只用于只读盘点。未获 VM 写入放行前，不启动/停止服务，不切
   pointer/binding/writer，不清理 release/state，不改变 GitHub visibility。

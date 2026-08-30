@@ -54,13 +54,30 @@ qrh-vm-bootstrap prepare-v39 `
   --release-manifest-sha256 <R0_MANIFEST_SHA256>
 ```
 
-R0 与 R1 partial、服务绑定和 D state 均就绪后，先执行只读 inspect。inspect 必须证明 C 是 8765
-唯一 listener、D service 已停止、R0 为 pending bootstrap（或是一次失败重试留下的唯一 sealed
-non-ingress bootstrap R0）且 R1 是精确 successor。将返回对象中的 `receipt` 按 canonical JSON 原字节
-保存到 `control\writer-handoff-intents`，并保存命令返回的 `inspection_sha256`：
+R1 candidate-only 传输完成且 D service 保持 `STOPPED` 后，从本地受控 host 入口更新 fixed D
+tooling。host 会先用旧 tooling 验证 D Python/package，再按 R1 manifest 精确验证 candidate 内的
+stdlib-only updater；更新会同步 package、`service_install_candidate.json` 与
+`exact_runtime_tooling.json`，并生成 exact-D write audit：
 
 ```powershell
-qrh-writer-handoff inspect `
+qrh-tooling-update `
+  --ssh-alias honghu-vm `
+  --target-address 10.5.1.240 `
+  --vm-root D:\quant\quant_platform `
+  --release-id <R1_RELEASE_ID> `
+  --release-manifest-sha256 <R1_MANIFEST_SHA256> `
+  --attempt-id <UNIQUE_TOOLING_ATTEMPT> `
+  --json
+```
+
+R0 与 R1 partial、服务绑定和 D state 均就绪后，执行 `prepare-intent`。它先做完整现场 inspect，
+证明 C 是 8765 唯一 listener、D service 已停止、R0 为 pending bootstrap（或是一次失败重试留下的
+唯一 sealed non-ingress bootstrap R0）且 R1 是精确 successor；随后只在 exact D 的
+`control\writer-handoff-intents` 内 create-only 写入 canonical receipt，并返回 receipt 路径与
+`inspection_sha256`：
+
+```powershell
+qrh-writer-handoff prepare-intent `
   --vm-root D:\quant\quant_platform `
   --release-manifest-sha256 <R0_MANIFEST_SHA256> `
   --successor-release-id <R1_RELEASE_ID> `
@@ -135,6 +152,18 @@ bootstrap 控制器还会在 C 停止后证明 SCM 为 `STOPPED`、8765 无 list
 回退只能从 exact-matched `local_prior_binding` 选择唯一 prior，把
 `active=A, prior=P` 交换为 `active=P, prior=A`。切换前后均验证同一 D state identity、两版本
 read/write/CAS、SCM/endpoint/writer identity 和业务事件不倒退；不接受任意 release ID。
+
+固定 D tooling 更新并完成首次 handoff 后，回退只接受 attempt ID，不接受 release/hash 目标：
+
+```powershell
+D:\quant\quant_platform\tooling\python\python.exe -B -m quant_hub.ops.vm_deploy_cli rollback-prior `
+  --vm-root D:\quant\quant_platform `
+  --deployment-attempt-id <UNIQUE_ROLLBACK_ATTEMPT> `
+  --json
+```
+
+需要切回原 active 时，对交换后的同一 pair 再执行一次 `rollback-prior`，使用新的 attempt ID；
+不得构造第三版本或替换当前 D state。
 
 ## 放行证据
 

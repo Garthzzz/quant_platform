@@ -35,6 +35,7 @@ from quant_hub.ops.writer_handoff import (
     finalize_writer_handoff,
     inspect_d_closure,
     inspect_writer_handoff,
+    persist_writer_handoff_inspection,
     seed_v39_access_identity,
 )
 
@@ -742,6 +743,47 @@ class WriterHandoffTests(unittest.TestCase):
         rendered = json.dumps(receipt, sort_keys=True)
         self.assertNotIn("a" * 64, rendered)  # protected access digest is not recorded
         self.assertFalse((self.fixture.root / "audit" / "writer-handoff").exists())
+
+    def test_prepare_intent_persists_exact_canonical_receipt_only(self) -> None:
+        result = persist_writer_handoff_inspection(
+            vm_root=self.fixture.root,
+            baseline=self.fixture.baseline,
+            runtime=self.runtime,
+            nonce=NONCE,
+            inspected_at=NOW,
+            allow_test_root=True,
+            closure_verifier=self.fixture.closure,
+        )
+        path = Path(str(result["inspection_receipt"]))
+        self.assertEqual(
+            self.fixture.root
+            / "control"
+            / "writer-handoff-intents"
+            / f"writer-handoff-inspection-{NONCE}.json",
+            path,
+        )
+        raw = path.read_bytes()
+        receipt = json.loads(raw.decode("utf-8"))
+        self.assertEqual(canonical_manifest_bytes(receipt), raw)
+        self.assertEqual(
+            manifest_sha256(receipt), result["inspection_sha256"]
+        )
+        self.assertEqual("evidence_only", receipt["authority"])
+        self.assertFalse(receipt["mutation_performed"])
+        self.assertTrue(self.runtime.legacy_running)
+        self.assertEqual([], self.runtime.events)
+        with self.assertRaisesRegex(
+            WriterHandoffError, "immutable handoff receipt ID already exists"
+        ):
+            persist_writer_handoff_inspection(
+                vm_root=self.fixture.root,
+                baseline=self.fixture.baseline,
+                runtime=self.runtime,
+                nonce=NONCE,
+                inspected_at=NOW,
+                allow_test_root=True,
+                closure_verifier=self.fixture.closure,
+            )
 
     def test_wrong_pid_or_server_path_is_rejected_read_only(self) -> None:
         process = self.runtime.process

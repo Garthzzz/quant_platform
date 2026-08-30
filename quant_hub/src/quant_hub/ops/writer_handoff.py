@@ -65,7 +65,11 @@ from .release_identity import (
     validate_receipt,
     validate_release_manifest,
 )
-from .vm_boundary import PRODUCTION_VM_ROOT
+from .vm_boundary import (
+    PRODUCTION_VM_ROOT,
+    capture_vm_write_snapshot,
+    finalize_vm_write_audit,
+)
 from .vm_service_cli import production_runtime_document
 from .windows_service import verify_installed_operational_bindings
 from .windows_service import PyWin32ServiceInstaller, build_install_candidate
@@ -1467,6 +1471,96 @@ def inspect_writer_handoff(
         successor=successor,
         successor_verifier=successor_verifier,
     )
+
+
+def persist_writer_handoff_inspection(
+    *,
+    vm_root: Path,
+    baseline: V39Baseline,
+    nonce: str,
+    runtime: HandoffRuntime | None = None,
+    inspected_at: datetime | None = None,
+    allow_test_root: bool = False,
+    closure_verifier: DClosureVerifier = inspect_d_closure,
+    successor: ExactSuccessor | None = None,
+    successor_verifier: SuccessorVerifier = inspect_exact_successor_candidate,
+) -> Mapping[str, object]:
+    """Inspect and create one canonical receipt in the fixed exact-D intake."""
+
+    receipt = inspect_writer_handoff(
+        vm_root=vm_root,
+        baseline=baseline,
+        runtime=runtime,
+        nonce=nonce,
+        inspected_at=inspected_at,
+        allow_test_root=allow_test_root,
+        closure_verifier=closure_verifier,
+        successor=successor,
+        successor_verifier=successor_verifier,
+    )
+    root = _root(vm_root, allow_test_root=allow_test_root)
+    control = root / "control"
+    intake = control / "writer-handoff-intents"
+    if _is_production_path(intake):
+        safe_root = _SafeRoot(root, allow_posix_test_only=False)
+        safe_root.preflight(
+            control, expected_kind="directory", allow_absent=False
+        )
+        with _BoundDirectory(
+            safe_root, control, protect_rename=True
+        ) as control_bound:
+            if safe_root.preflight(
+                intake, expected_kind="directory", allow_absent=True
+            ) is None:
+                control_bound.mkdir(intake.name, 0o700)
+                control_bound.flush()
+            safe_root.preflight(
+                intake, expected_kind="directory", allow_absent=False
+            )
+    else:
+        intake.mkdir(parents=False, exist_ok=True)
+        ensure_no_reparse_components(intake)
+    path = intake / f"writer-handoff-inspection-{nonce}.json"
+    raw = canonical_manifest_bytes(receipt)
+    safe_root = _SafeRoot(root, allow_posix_test_only=allow_test_root)
+    if safe_root.preflight(
+        path, expected_kind="file", allow_absent=True
+    ) is not None:
+        raise WriterHandoffError(
+            "immutable handoff receipt ID already exists"
+        )
+    try:
+        with _BoundDirectory(
+            safe_root, intake, protect_rename=True
+        ) as intake_bound:
+            _write_new_bound_file(
+                intake_bound,
+                name=path.name,
+                raw=raw,
+                label="immutable writer handoff inspection receipt",
+            )
+    except UnsafeLocalPath as error:
+        raise WriterHandoffError(
+            "immutable handoff inspection receipt could not be committed"
+        ) from error
+    committed = path.resolve(strict=True)
+    reread = _canonical_read(committed)
+    inspection_hash = manifest_sha256(receipt)
+    if (
+        reread != receipt
+        or canonical_manifest_bytes(reread) != raw
+        or manifest_sha256(reread) != inspection_hash
+    ):
+        raise WriterHandoffError(
+            "persisted inspection receipt differs from canonical bytes"
+        )
+    return {
+        "schema_version": "qrh-writer-handoff-persist-result/v1",
+        "status": "persisted",
+        "inspection_sha256": inspection_hash,
+        "inspection_receipt": str(committed),
+        "nonce": nonce,
+    }
 
 
 def _inspect_writer_handoff_core(
@@ -4223,6 +4317,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     inspect_parser.add_argument("--successor-snapshot-id", required=True)
     inspect_parser.add_argument("--nonce", required=True)
+    persist_parser = commands.add_parser("prepare-intent")
+    persist_parser.add_argument("--vm-root", type=Path, required=True)
+    persist_parser.add_argument("--release-manifest-sha256", required=True)
+    persist_parser.add_argument("--successor-release-id", required=True)
+    persist_parser.add_argument(
+        "--successor-release-manifest-sha256", required=True
+    )
+    persist_parser.add_argument("--successor-snapshot-id", required=True)
+    persist_parser.add_argument("--nonce", required=True)
     apply_parser = commands.add_parser("apply")
     apply_parser.add_argument("--vm-root", type=Path, required=True)
     apply_parser.add_argument("--release-manifest-sha256", required=True)
@@ -4283,6 +4386,30 @@ def main(argv: list[str] | None = None) -> int:
                 "inspection_sha256": manifest_sha256(receipt),
                 "receipt": receipt,
             }
+            code = 0
+        elif args.command == "prepare-intent":
+            before = capture_vm_write_snapshot(root)
+            try:
+                result = persist_writer_handoff_inspection(
+                    vm_root=root,
+                    baseline=baseline,
+                    nonce=args.nonce,
+                    successor=successor,
+                )
+            except BaseException:
+                finalize_vm_write_audit(
+                    root,
+                    before,
+                    operation="writer-handoff-prepare-intent",
+                    outcome="failed",
+                )
+                raise
+            finalize_vm_write_audit(
+                root,
+                before,
+                operation="writer-handoff-prepare-intent",
+                outcome="succeeded",
+            )
             code = 0
         elif args.command == "apply":
             intent = _controlled_intent_path(root, args.inspection_receipt)
@@ -4393,6 +4520,7 @@ __all__ = [
     "inspect_d_closure",
     "inspect_exact_successor_candidate",
     "inspect_writer_handoff",
+    "persist_writer_handoff_inspection",
     "inspect_writer_handoff_status",
     "main",
     "seed_v39_access_identity",

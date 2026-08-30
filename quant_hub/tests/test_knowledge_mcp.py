@@ -76,6 +76,8 @@ from quant_hub.knowledge_mcp.server import (
     StdioMCPServer,
 )
 from quant_hub.knowledge_mcp.service import KnowledgeMCPService
+from quant_hub.ops.local_release_identity import identity_sha256 as local_identity_sha256
+from quant_hub.ops.release_identity import manifest_sha256
 
 
 TEST_RUN_ID = "public-fake-run-20260822"
@@ -208,9 +210,6 @@ def _closed_trace_bytes(rows, **bindings) -> bytes:
     return "".join(
         canonical_json(row) + "\n" for row in _closed_codex_rows(rows, **bindings)
     ).encode("utf-8")
-from quant_hub.ops.release_identity import manifest_sha256
-
-
 H = {name: str(index) * 64 for index, name in enumerate(("tree", "source", "ir", "knowledge", "resources"), 1)}
 
 
@@ -239,6 +238,58 @@ def _release(release_id: str, snapshot_id: str, artifact: bytes) -> dict[str, ob
                 "workspace": {"read": [1], "write": [1]},
             }
         },
+    }
+
+
+def _local_v2_release(
+    release_id: str, snapshot_id: str, artifact: bytes
+) -> dict[str, object]:
+    artifact_sha256 = hashlib.sha256(artifact).hexdigest()
+    inventory = {
+        "schema_version": "qrh-release-file-inventory/v2",
+        "files": [
+            {
+                "path": "content/mcp_search.json",
+                "bytes": len(artifact),
+                "sha256": artifact_sha256,
+            }
+        ],
+    }
+    return {
+        "schema_version": "qrh-release-manifest/v2",
+        "release_id": release_id,
+        "built_at": "2026-08-30T08:00:00+08:00",
+        "application": {
+            "source_kind": "git",
+            "commit_sha": "a" * 40,
+            "tracked_tree_sha256": H["tree"],
+            "build_tool_version": "mcp-tests/local-v2",
+            "provenance": {"builder": "mcp-open-ssh-test", "labels": []},
+        },
+        "content": {
+            "snapshot_id": snapshot_id,
+            "source_inventory_sha256": H["source"],
+            "ir_sha256": H["ir"],
+            "knowledge_sha256": H["knowledge"],
+            "search_sha256": artifact_sha256,
+            "page_projection_sha256": "6" * 64,
+            "mcp_sha256": artifact_sha256,
+            "active_membership_sha256": "7" * 64,
+            "knowledge_enrichment": {"status": "not_applicable"},
+            "presentation": {"language": "zh-CN"},
+        },
+        "resources": {"inventory_sha256": local_identity_sha256(inventory)},
+        "state": {
+            "compatibility": {
+                "comments": {"read": [1, 2], "write": [1, 2]},
+                "research_workspace": {
+                    "read": [1, 2, 3],
+                    "write": [1, 2, 3],
+                },
+                "rollback_policy": "expand_only_no_down_migration",
+            }
+        },
+        "inventory": inventory,
     }
 
 
@@ -2105,7 +2156,10 @@ class OpenSSHAuthorityTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.fixture = MCPFixture(Path(temporary.name))
         self.files: dict[str, bytes] = {}
-        self._publish_remote(self.fixture.release1, self.fixture.artifact1)
+        self.remote_release1 = _local_v2_release(
+            "release-r1", self.fixture.snapshot1.snapshot_id, self.fixture.artifact1
+        )
+        self._publish_remote(self.remote_release1, self.fixture.artifact1)
         self.runner = FakeOpenSSHRunner(self.files)
         self.source = OpenSSHAuthoritySource("honghu-vm", runner=self.runner)
 
@@ -2113,10 +2167,12 @@ class OpenSSHAuthorityTests(unittest.TestCase):
         release_id = str(release["release_id"])
         release_root = rf"D:\quant\quant_platform\releases\{release_id}"
         active = {
-            "schema_version": "qrh-active-release/v1",
-            "release_id": release_id,
-            "release_path": release_root,
-            "manifest_sha256": manifest_sha256(release),
+            "schema_version": "qrh-active-release/v2",
+            "release": {
+                "release_id": release_id,
+                "release_path": release_root,
+                "manifest_sha256": local_identity_sha256(release),
+            },
         }
         self.files[r"D:\quant\quant_platform\control\active_release.json"] = (
             canonical_json(active).encode("utf-8")
@@ -2136,7 +2192,7 @@ class OpenSSHAuthorityTests(unittest.TestCase):
         self.assertEqual("fresh", result["availability"])
         expected = AuthorityIdentity(
             "release-r1",
-            manifest_sha256(self.fixture.release1),
+            local_identity_sha256(self.remote_release1),
             self.fixture.snapshot1.snapshot_id,
         )
         self.assertEqual(expected.to_dict(), result["identity"])
@@ -2146,7 +2202,10 @@ class OpenSSHAuthorityTests(unittest.TestCase):
             all(call[5] == "honghu-vm" and len(call) == 12 for call in self.runner.calls)
         )
 
-        self._publish_remote(self.fixture.release2, self.fixture.artifact2)
+        remote_release2 = _local_v2_release(
+            "release-r2", self.fixture.snapshot2.snapshot_id, self.fixture.artifact2
+        )
+        self._publish_remote(remote_release2, self.fixture.artifact2)
         changed = service.search_quant_knowledge(query="leakage")
         self.assertEqual("snapshot_refresh_required", changed["status"])
         self.assertEqual(
@@ -2174,8 +2233,28 @@ class OpenSSHAuthorityTests(unittest.TestCase):
         self.runner.fail = False
         active_path = r"D:\quant\quant_platform\control\active_release.json"
         active = json.loads(self.files[active_path])
-        active["manifest_sha256"] = "f" * 64
+        active["release"]["manifest_sha256"] = "f" * 64
         self.files[active_path] = canonical_json(active).encode("utf-8")
+        with self.assertRaises(AuthorityUnavailable):
+            self.source.probe()
+
+    def test_legacy_v1_remote_active_pointer_is_not_production_authority(self) -> None:
+        release = self.fixture.release1
+        release_id = str(release["release_id"])
+        release_root = rf"D:\quant\quant_platform\releases\{release_id}"
+        legacy_active = {
+            "schema_version": "qrh-active-release/v1",
+            "release_id": release_id,
+            "release_path": release_root,
+            "manifest_sha256": manifest_sha256(release),
+        }
+        self.files[r"D:\quant\quant_platform\control\active_release.json"] = (
+            canonical_json(legacy_active).encode("utf-8")
+        )
+        self.files[release_root + r"\release_manifest.json"] = canonical_json(
+            release
+        ).encode("utf-8")
+
         with self.assertRaises(AuthorityUnavailable):
             self.source.probe()
 

@@ -40,10 +40,17 @@ from quant_hub.knowledge.retrieval import (
 )
 from quant_hub.knowledge.semantic import EnrichedSnapshot, KnowledgeGeneration
 from quant_hub.evidence.ids import citation_id_for_marker, validate_citation_id
+from quant_hub.ops.local_release_identity import (
+    RELEASE_MANIFEST_SCHEMA as LOCAL_RELEASE_MANIFEST_SCHEMA,
+    identity_sha256 as local_identity_sha256,
+    validate_active_release as validate_local_active_release,
+    validate_release_manifest as validate_local_release_manifest,
+)
 from quant_hub.ops.release_identity import (
-    manifest_sha256,
-    validate_active_release,
-    validate_release_manifest,
+    RELEASE_SCHEMA as LEGACY_RELEASE_MANIFEST_SCHEMA,
+    manifest_sha256 as legacy_manifest_sha256,
+    validate_active_release as validate_legacy_active_release,
+    validate_release_manifest as validate_legacy_release_manifest,
 )
 
 
@@ -283,13 +290,38 @@ def _safe_directory(path: Path, *, must_exist: bool) -> Path:
     return resolved
 
 
+def _validate_mirror_release_manifest(value: object) -> Mapping[str, object]:
+    """Validate either immutable read-only manifest generation exactly.
+
+    Production OpenSSH authority is v2-only.  The v1 branch remains solely so
+    existing read-only file-share mirrors can be consumed during migration;
+    dispatch is by the exact schema and each branch retains its own validator.
+    """
+
+    schema = value.get("schema_version") if isinstance(value, Mapping) else None
+    if schema == LOCAL_RELEASE_MANIFEST_SCHEMA:
+        return validate_local_release_manifest(value)
+    if schema == LEGACY_RELEASE_MANIFEST_SCHEMA:
+        return validate_legacy_release_manifest(value)
+    raise MirrorError("unsupported read-only release manifest schema")
+
+
+def _release_manifest_sha256(release: Mapping[str, object]) -> str:
+    schema = release.get("schema_version")
+    if schema == LOCAL_RELEASE_MANIFEST_SCHEMA:
+        return local_identity_sha256(release)
+    if schema == LEGACY_RELEASE_MANIFEST_SCHEMA:
+        return legacy_manifest_sha256(release)
+    raise MirrorError("unsupported read-only release manifest schema")
+
+
 def _identity_from_release(release: Mapping[str, object]) -> AuthorityIdentity:
     content = release.get("content")
     if not isinstance(content, Mapping):
         raise MirrorError("release content identity is unavailable")
     return AuthorityIdentity(
         release_id=str(release["release_id"]),
-        manifest_sha256=manifest_sha256(release),
+        manifest_sha256=_release_manifest_sha256(release),
         snapshot_id=str(content["snapshot_id"]),
     )
 
@@ -1808,12 +1840,14 @@ class FileAuthorityProbe:
             _safe_directory(self.active_release_path.parent, must_exist=True)
             _safe_directory(self.release_root, must_exist=True)
             _regular_file(self.active_release_path)
-            active = validate_active_release(_read_json(self.active_release_path))
+            active = validate_legacy_active_release(
+                _read_json(self.active_release_path)
+            )
             release_id = str(active["release_id"])
             manifest_path = self.release_root / release_id / "release_manifest.json"
             _regular_file(manifest_path)
-            release = validate_release_manifest(_read_json(manifest_path))
-            observed_hash = manifest_sha256(release)
+            release = validate_legacy_release_manifest(_read_json(manifest_path))
+            observed_hash = legacy_manifest_sha256(release)
             if observed_hash != active["manifest_sha256"]:
                 raise MirrorError("active pointer manifest hash mismatch")
             if release["release_id"] != release_id:
@@ -1914,23 +1948,26 @@ class OpenSSHAuthoritySource:
     def _verified_identity(self) -> AuthorityIdentity:
         active_path = self.vm_root / "control" / "active_release.json"
         active_before = self._read_remote(active_path)
-        active = validate_active_release(
+        active = validate_local_active_release(
             _decode_json_bytes(active_before, label="remote active authority")
         )
-        release_id = str(active["release_id"])
+        release_ref = active["release"]
+        if not isinstance(release_ref, Mapping):
+            raise MirrorError("remote active release reference is unavailable")
+        release_id = str(release_ref["release_id"])
         if not _SAFE_REMOTE_NAME.fullmatch(release_id):
             raise MirrorError("active release ID cannot form an exact remote path")
         exact_release_root = self.vm_root / "releases" / release_id
-        if PureWindowsPath(str(active["release_path"])) != exact_release_root:
+        if PureWindowsPath(str(release_ref["release_path"])) != exact_release_root:
             raise MirrorError("active release path is not the exact VM release path")
         manifest_bytes = self._read_remote(exact_release_root / "release_manifest.json")
-        release = validate_release_manifest(
+        release = validate_local_release_manifest(
             _decode_json_bytes(manifest_bytes, label="remote release manifest")
         )
         identity = _identity_from_release(release)
         if (
             identity.release_id != release_id
-            or identity.manifest_sha256 != active["manifest_sha256"]
+            or identity.manifest_sha256 != release_ref["manifest_sha256"]
         ):
             raise MirrorError("remote active and release identities disagree")
         # Close the active-pointer race: a transition during the reads is not a
@@ -2308,7 +2345,7 @@ class MirrorStore:
             staged_artifact = partial / SEARCH_ARTIFACT_RELATIVE_PATH
             _regular_file(staged_manifest)
             _regular_file(staged_artifact)
-            release = validate_release_manifest(_read_json(staged_manifest))
+            release = _validate_mirror_release_manifest(_read_json(staged_manifest))
             actual_identity = _identity_from_release(release)
             if actual_identity != identity:
                 raise MirrorError("artifact source release identity mismatch")
@@ -2479,7 +2516,7 @@ class MirrorStore:
             raise MirrorError("mirror metadata schema is invalid")
         if metadata.get("identity") != identity.to_dict():
             raise MirrorError("mirror metadata identity mismatch")
-        release = validate_release_manifest(_read_json(release_path))
+        release = _validate_mirror_release_manifest(_read_json(release_path))
         if _identity_from_release(release) != identity:
             raise MirrorError("mirrored release identity mismatch")
         artifact_bytes = artifact_path.read_bytes()

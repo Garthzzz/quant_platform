@@ -116,6 +116,24 @@ def verify_production_root(path: Path) -> Path:
     return verify_existing_vm_write_path(path, allow_root=True)
 
 
+def rollback_prior(
+    *,
+    vm_root: Path,
+    deployment_attempt_id: str,
+) -> Mapping[str, object]:
+    """Invoke the sealed exact-D rollback controller without a target input."""
+
+    root = verify_production_root(vm_root)
+    attempt_id = _stable(deployment_attempt_id, "deployment_attempt_id")
+    from .local_exact_deployment_controller import (
+        ProductionExactDeploymentController,
+    )
+
+    return ProductionExactDeploymentController.load_exact_d().rollback_to_prior(
+        attempt_id=attempt_id
+    )
+
+
 def _probe_directory_identity(path: Path, *, label: str) -> tuple[str, int, int]:
     """Return a stable identity for one exact, ordinary probe directory."""
 
@@ -2014,6 +2032,51 @@ class WindowsServiceRuntime:
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "rollback-prior":
+        parser = argparse.ArgumentParser()
+        parser.add_argument("rollback-prior")
+        parser.add_argument("--vm-root", type=Path, required=True)
+        parser.add_argument("--deployment-attempt-id", required=True)
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args(raw_argv)
+        try:
+            root = verify_production_root(args.vm_root)
+            before = capture_vm_write_snapshot(root)
+            try:
+                result = rollback_prior(
+                    vm_root=root,
+                    deployment_attempt_id=args.deployment_attempt_id,
+                )
+            except BaseException:
+                finalize_vm_write_audit(
+                    root,
+                    before,
+                    operation="rollback-prior",
+                    outcome="failed",
+                )
+                raise
+            finalize_vm_write_audit(
+                root,
+                before,
+                operation="rollback-prior",
+                outcome="succeeded",
+            )
+        except Exception as error:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "qrh-vm-deploy-error/v1",
+                        "status": "error",
+                        "error_type": type(error).__name__,
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 2
+        print(json.dumps(result, sort_keys=True))
+        return 0
+
     parser = argparse.ArgumentParser()
     parser.add_argument("apply-publish", nargs="?")
     parser.add_argument("--vm-root", type=Path, required=True)
@@ -2025,7 +2088,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--deployment-attempt-id")
     parser.add_argument("--json", action="store_true")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
     try:
         root = verify_production_root(args.vm_root)
         before = capture_vm_write_snapshot(root)
