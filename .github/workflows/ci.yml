@@ -41,8 +41,7 @@ jobs:
             [System.IO.Path]::PathSeparator,
             @($workspace, $testPackageRoot, $sourceRoot)
           )
-          $unittestArgs = @(
-            "-B", "-m", "unittest",
+          $testModules = @(
             "tests.test_git_guard",
             "tests.test_legacy_browser_baseline",
             "tests.test_ids_config",
@@ -117,32 +116,46 @@ jobs:
             "tests.test_knowledge_mcp_stress_public",
             "tests.test_ds_review_harness",
             "tests.test_ds_review_external_v3",
-            "tests.test_generic_research_renderer",
-            "-v"
+            "tests.test_generic_research_renderer"
           )
           $unitLog = Join-Path $env:RUNNER_TEMP "qrh-public-unittest.log"
           $PSNativeCommandUseErrorActionPreference = $false
-          & python @unittestArgs *> $unitLog
-          $unitExit = $LASTEXITCODE
-          if ($unitExit -ne 0) {
-            $failureIdentifiers = @(
+          $failureIdentifiers = @()
+          $exceptionTypes = @()
+          $missingModules = @()
+          $failedModuleCount = 0
+          # Keep Win32 handle/provenance tests process-isolated.  The public
+          # checkout contains no private presentation bundle, and one module
+          # must never leave a pinned handle or patched global for another.
+          foreach ($testModule in $testModules) {
+            & python -B -m unittest $testModule -v *> $unitLog
+            $moduleExit = $LASTEXITCODE
+            if ($moduleExit -ne 0) {
+              $failedModuleCount += 1
+              $failureIdentifiers += @(
               Select-String -LiteralPath $unitLog -Pattern '(?<identifier>(?:FAIL|ERROR): [A-Za-z0-9_.]+ \([A-Za-z0-9_.]+\))' |
                 ForEach-Object { $_.Matches[0].Groups['identifier'].Value } |
                 Sort-Object -Unique
-            )
-            $exceptionTypes = @(
+              )
+              $exceptionTypes += @(
               Select-String -LiteralPath $unitLog -Pattern '(?<exception>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception)):' |
                 ForEach-Object { $_.Matches[0].Groups['exception'].Value } |
                 Sort-Object -Unique
-            )
-            $missingModules = @(
+              )
+              $missingModules += @(
               Select-String -LiteralPath $unitLog -Pattern "ModuleNotFoundError: No module named '(?<module>[A-Za-z_][A-Za-z0-9_.]*)'" |
                 ForEach-Object { $_.Matches[0].Groups['module'].Value } |
                 Sort-Object -Unique
-            )
+              )
+            }
             [System.IO.File]::Delete($unitLog)
+          }
+          if ($failedModuleCount -ne 0) {
+            $failureIdentifiers = @($failureIdentifiers | Sort-Object -Unique)
+            $exceptionTypes = @($exceptionTypes | Sort-Object -Unique)
+            $missingModules = @($missingModules | Sort-Object -Unique)
             if ($failureIdentifiers.Count -eq 0) {
-              Write-Output "::error title=Public unit test failure::unittest exited $unitExit without a structured FAIL/ERROR identifier"
+              Write-Output "::error title=Public unit test failure::$failedModuleCount isolated module process(es) failed without a structured FAIL/ERROR identifier"
             }
             else {
               foreach ($identifier in $failureIdentifiers | Select-Object -First 20) {
@@ -156,9 +169,8 @@ jobs:
             foreach ($missingModule in $missingModules | Select-Object -First 20) {
               Write-Output "::error title=Missing public Python module::$missingModule"
             }
-            exit $unitExit
+            exit 1
           }
-          [System.IO.File]::Delete($unitLog)
           Write-Output "Public-safe unit tests passed"
       - name: Build and exercise installable operational wheel
         shell: pwsh

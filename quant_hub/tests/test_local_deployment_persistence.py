@@ -567,6 +567,12 @@ class RootLockAndCasTests(PersistenceFixture):
 
     @unittest.skipUnless(os.name == "nt", "production provenance is Windows-only")
     def test_product_persistence_method_shadow_is_structurally_impossible(self) -> None:
+        production_root = Path(r"D:\quant\quant_platform")
+        if not production_root.is_dir():
+            with self.assertRaises(UnsafeLocalPath):
+                LocalDeploymentPersistence.production_read_only()
+            self.assertNotIn("__dict__", LocalDeploymentPersistence.__dict__)
+            return
         persistence = LocalDeploymentPersistence.production_read_only()
         for method_name in (
             "consume_verified_phase_next_cas",
@@ -603,7 +609,11 @@ class RootLockAndCasTests(PersistenceFixture):
                     ):
                         LocalDeploymentPersistence.for_test_only(alias)
 
-        with tempfile.TemporaryDirectory(dir=self.root) as temporary, patch(
+        with tempfile.TemporaryDirectory(dir=self.root) as temporary, patch.object(
+            Path,
+            "exists",
+            return_value=True,
+        ), patch(
             "quant_hub.ops.local_deployment_persistence.os.path.samefile",
             return_value=True,
         ), patch.object(

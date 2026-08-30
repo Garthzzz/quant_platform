@@ -86,10 +86,17 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
 
     def test_product_factory_is_no_arg_fixed_d_and_test_type_is_separate(self) -> None:
         self.assertEqual({}, inspect.signature(ProductionWindowsDeploymentRuntime.load_exact_d).parameters)
-        product = ProductionWindowsDeploymentRuntime.load_exact_d()
-        self.assertIsInstance(product, ProductionWindowsDeploymentRuntime)
+        production_root = Path(r"D:\quant\quant_platform")
+        if production_root.is_dir():
+            product = ProductionWindowsDeploymentRuntime.load_exact_d()
+            self.assertIsInstance(product, ProductionWindowsDeploymentRuntime)
+            targets = (product, self.runtime)
+        else:
+            with self.assertRaises(LocalDeploymentRuntimeError):
+                ProductionWindowsDeploymentRuntime.load_exact_d()
+            targets = (self.runtime,)
         self.assertNotIsInstance(self.runtime, ProductionWindowsDeploymentRuntime)
-        for target in (product, self.runtime):
+        for target in targets:
             for leaked in ("root", "path", "environment", "config", "hook", "runtime"):
                 self.assertFalse(hasattr(target, leaked))
         source = inspect.getsource(inspect.getmodule(ProductionWindowsDeploymentRuntime))
