@@ -34,6 +34,7 @@ from quant_hub.ops.writer_handoff import (
     finalize_writer_handoff,
     inspect_d_closure,
     inspect_writer_handoff,
+    seed_v39_access_identity,
 )
 
 
@@ -103,6 +104,50 @@ def _release(baseline: V39Baseline | None = None) -> dict[str, object]:
         },
         "inventory": inventory,
     }
+
+
+def _pending_access_seed(root: Path) -> tuple[V39Baseline, bytes]:
+    default_digest = bytes.fromhex("ab" * 32)
+    source = (
+        "import hashlib\n"
+        "import os\n"
+        "ACCESS_PASSWORD_SALT = bytes.fromhex(\"ae829f253a022e21e2b53ddd97c712b8\")\n"
+        "ACCESS_PASSWORD_ITERATIONS = 600_000\n"
+        f"DEFAULT_ACCESS_PASSWORD_DIGEST = bytes.fromhex(\"{default_digest.hex()}\")\n"
+        "def _access_password_digest() -> bytes:\n"
+        "    configured = os.environ.get(\"VIEWER_ACCESS_PASSWORD\")\n"
+        "    if configured is None:\n"
+        "        return DEFAULT_ACCESS_PASSWORD_DIGEST\n"
+        "    if not configured:\n"
+        "        raise RuntimeError(\"override must not be empty\")\n"
+        "    return hashlib.pbkdf2_hmac(\n"
+        "        \"sha256\",\n"
+        "        configured.encode(\"utf-8\"),\n"
+        "        ACCESS_PASSWORD_SALT,\n"
+        "        ACCESS_PASSWORD_ITERATIONS,\n"
+        "    )\n"
+    ).encode("utf-8")
+    release = _release()
+    inventory = release["inventory"]
+    assert isinstance(inventory, dict)
+    inventory["files"] = [
+        {
+            "path": "tools/viewer/server.py",
+            "bytes": len(source),
+            "sha256": hashlib.sha256(source).hexdigest(),
+        }
+    ]
+    resources = release["resources"]
+    assert isinstance(resources, dict)
+    resources["inventory_sha256"] = manifest_sha256(inventory)
+    baseline = V39Baseline(manifest_sha256(release))
+    candidate = root / "incoming" / f"{baseline.release_id}.partial"
+    server = candidate / "tools" / "viewer" / "server.py"
+    server.parent.mkdir(parents=True)
+    server.write_bytes(source)
+    _write_json(candidate / "release_manifest.json", release)
+    (root / "state").mkdir()
+    return baseline, default_digest
 
 
 class Fixture:
@@ -340,6 +385,92 @@ class FakeRuntime:
     ) -> bool:
         self.events.append("verify-c")
         return self.legacy_running and not self.open
+
+
+class V39AccessIdentitySeedTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "D-root"
+        self.root.mkdir()
+        self.baseline, self.default_digest = _pending_access_seed(self.root)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_pending_r0_seeds_identity_before_first_pair_exists(self) -> None:
+        result = seed_v39_access_identity(
+            vm_root=self.root,
+            baseline=self.baseline,
+            allow_test_root=True,
+            override_detector=lambda: False,
+        )
+
+        self.assertEqual("seeded", result["status"])
+        self.assertTrue(result["protected_access_identity_present"])
+        self.assertEqual(
+            self.default_digest.hex() + "\n",
+            (self.root / "state" / "viewer_access_password.digest").read_text(
+                encoding="ascii"
+            ),
+        )
+
+    def test_pending_r0_rejects_an_existing_release_pair(self) -> None:
+        _write_json(
+            self.root / "control" / "active_release.json",
+            {
+                "schema_version": "qrh-active-release/v1",
+                "release_id": self.baseline.release_id,
+                "release_path": str(
+                    self.root / "releases" / self.baseline.release_id
+                ),
+                "manifest_sha256": self.baseline.manifest_sha256,
+            },
+        )
+
+        with self.assertRaisesRegex(WriterHandoffError, "absent D release pair"):
+            seed_v39_access_identity(
+                vm_root=self.root,
+                baseline=self.baseline,
+                allow_test_root=True,
+                override_detector=lambda: False,
+            )
+        self.assertFalse(
+            (self.root / "state" / "viewer_access_password.digest").exists()
+        )
+
+    def test_pending_r0_rejects_server_bytes_outside_manifest(self) -> None:
+        server = (
+            self.root
+            / "incoming"
+            / f"{self.baseline.release_id}.partial"
+            / "tools"
+            / "viewer"
+            / "server.py"
+        )
+        server.write_bytes(server.read_bytes() + b"\n# changed\n")
+
+        with self.assertRaisesRegex(WriterHandoffError, "bytes differ"):
+            seed_v39_access_identity(
+                vm_root=self.root,
+                baseline=self.baseline,
+                allow_test_root=True,
+                override_detector=lambda: False,
+            )
+        self.assertFalse(
+            (self.root / "state" / "viewer_access_password.digest").exists()
+        )
+
+    def test_pending_r0_rejects_access_override_without_reading_it(self) -> None:
+        with self.assertRaisesRegex(WriterHandoffError, "override evidence exists"):
+            seed_v39_access_identity(
+                vm_root=self.root,
+                baseline=self.baseline,
+                allow_test_root=True,
+                override_detector=lambda: True,
+            )
+        self.assertFalse(
+            (self.root / "state" / "viewer_access_password.digest").exists()
+        )
 
 
 class WriterHandoffTests(unittest.TestCase):

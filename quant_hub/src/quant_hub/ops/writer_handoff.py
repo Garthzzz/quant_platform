@@ -1230,9 +1230,10 @@ def seed_v39_access_identity(
     """Seed only the sealed V39 default access identity into protected D state.
 
     No password/digest is accepted as input or returned as evidence.  The
-    immutable source file must itself be present in, and byte-bound by, the
-    exact active release manifest before its constants are parsed without
-    executing legacy code.
+    immutable source file must itself be present in, and byte-bound by, either
+    the exact pending R0 candidate (before the first D pair exists) or the
+    exact active R0 release.  Its constants are parsed without executing
+    legacy code.
     """
 
     root = _root(vm_root, allow_test_root=allow_test_root)
@@ -1240,16 +1241,33 @@ def seed_v39_access_identity(
         raise WriterHandoffError(
             "access override evidence exists; a protected credential path is required"
         )
-    active = validate_active_release(read_json(_inside(root, "control/active_release.json")))
-    release = (root / "releases" / baseline.release_id).resolve(strict=True)
-    ensure_no_reparse_components(release)
-    if (
-        active.get("release_id") != baseline.release_id
-        or active.get("manifest_sha256") != baseline.manifest_sha256
-        or Path(str(active.get("release_path"))).resolve(strict=True) != release
-    ):
-        raise WriterHandoffError("access seed active V39 identity differs")
-    manifest = validate_release_manifest(read_json(_inside(release, "release_manifest.json")))
+    candidate = root / "incoming" / f"{baseline.release_id}.partial"
+    active_path = root / "control" / "active_release.json"
+    binding_path = root / "control" / "local_prior_binding.json"
+    if os.path.lexists(candidate):
+        ensure_no_reparse_components(candidate)
+        if not candidate.is_dir() or candidate.is_symlink():
+            raise WriterHandoffError("access seed pending V39 candidate is invalid")
+        if os.path.lexists(active_path) or os.path.lexists(binding_path):
+            raise WriterHandoffError(
+                "pending V39 access seed requires an absent D release pair"
+            )
+        release = candidate.resolve(strict=True)
+    else:
+        active = validate_active_release(
+            read_json(_inside(root, "control/active_release.json"))
+        )
+        release = (root / "releases" / baseline.release_id).resolve(strict=True)
+        ensure_no_reparse_components(release)
+        if (
+            active.get("release_id") != baseline.release_id
+            or active.get("manifest_sha256") != baseline.manifest_sha256
+            or Path(str(active.get("release_path"))).resolve(strict=True) != release
+        ):
+            raise WriterHandoffError("access seed active V39 identity differs")
+    manifest = validate_release_manifest(
+        read_json(_inside(release, "release_manifest.json"))
+    )
     content = manifest.get("content")
     if (
         manifest.get("release_id") != baseline.release_id
