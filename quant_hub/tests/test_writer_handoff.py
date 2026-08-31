@@ -612,6 +612,30 @@ class WriterHandoffTests(unittest.TestCase):
         runtime.root = Path(r"D:\quant\quant_platform")
         return runtime
 
+    def test_production_d_exposure_ignores_only_exact_restored_legacy_and_is_sticky(
+        self,
+    ) -> None:
+        runtime = self.production_runtime_shell()
+        runtime._d_was_open = False
+        runtime._listener_pids = lambda _port: (12816,)
+        runtime._legacy_server_pids = lambda: (12816,)
+        runtime._service = lambda: {"status": "stopped"}
+        self.assertFalse(runtime.d_external_open(5000))
+
+        runtime._legacy_server_pids = lambda: ()
+        self.assertTrue(runtime.d_external_open(5000))
+
+        runtime._listener_pids = lambda _port: ()
+        runtime._service = lambda: {"status": "stopped"}
+        self.assertTrue(runtime.d_external_open(5000))
+
+        fresh = self.production_runtime_shell()
+        fresh._d_was_open = False
+        fresh._listener_pids = lambda _port: (12816,)
+        fresh._legacy_server_pids = lambda: (12816,)
+        fresh._service = lambda: {"status": "running"}
+        self.assertTrue(fresh.d_external_open(5000))
+
     def test_production_inspect_rejects_fake_runtime_before_root_or_observe(self) -> None:
         successor = ExactSuccessor("release-r1", "e" * 64, "snapshot-r1")
         with mock.patch(

@@ -512,9 +512,15 @@ class WindowsHandoffRuntime:
             raise WriterHandoffError("D listener remained open after service stop")
 
     def d_external_open(self, port: int) -> bool:
-        # Any listener after the D start attempt is exposure.  Ambiguity is
-        # intentionally resolved toward forbidding legacy rollback.
-        if self._listener_pids(port):
+        # A fresh finalize process may observe the exact restored legacy C
+        # listener.  That listener is not D exposure; everything else remains
+        # fail-closed, while a prior D observation stays sticky for the life
+        # of this runtime.
+        listeners = self._listener_pids(port)
+        service = self._service()
+        if service.get("status") != "stopped" or (
+            listeners and listeners != self._legacy_server_pids()
+        ):
             self._d_was_open = True
         return self._d_was_open
 
