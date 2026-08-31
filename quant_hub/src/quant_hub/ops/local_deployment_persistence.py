@@ -13993,7 +13993,10 @@ class LocalDeploymentPersistence:
             }
             for record in self.read_local_receipts()
         ]
-        histories = self.journals.histories()
+        histories = {
+            attempt: list(history)
+            for attempt, history in sorted(self.journals.histories().items())
+        }
         inventory = [
             {
                 "release_id": entry.release_id,
@@ -14728,19 +14731,15 @@ class LocalDeploymentPersistence:
 
         candidate_id = str(candidate["release_id"])
         final = self.layout.releases / candidate_id
-        quarantine_parent = self.layout.temporary / "failure-release-cleanup"
-        quarantine_name = (
-            "failure-"
-            + hashlib.sha256(
-                _identity.canonical_bytes(
-                    {
-                        "attempt": attempt,
-                        "candidate": candidate,
-                    }
-                )
-            ).hexdigest()[:48]
-            + ".partial"
-        )
+        quarantine_parent = self.layout.temporary / "f"
+        quarantine_name = hashlib.sha256(
+            _identity.canonical_bytes(
+                {
+                    "attempt": attempt,
+                    "candidate": candidate,
+                }
+            )
+        ).hexdigest()[:32]
         quarantine = quarantine_parent / quarantine_name
         final_present = self._safe_root.preflight(
             final, expected_kind="directory", allow_absent=True

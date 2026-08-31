@@ -13,6 +13,7 @@ from unittest import mock
 from quant_hub.ops.deployment import CandidateValidationError, DeploymentFailed
 from quant_hub.ops import local_release_identity as local_identity
 from quant_hub.ops.local_deployment_persistence import (
+    DeploymentJournalStore,
     LocalDeploymentPersistence,
     _SafeRoot,
 )
@@ -793,7 +794,17 @@ class VMDeployCLITests(unittest.TestCase):
                 "candidate_probe",
                 autospec=True,
                 return_value=probe,
-            ) as candidate_probe:
+            ) as candidate_probe, mock.patch.object(
+                DeploymentJournalStore,
+                "histories",
+                return_value={
+                    "closed-attempt": ({"phase": "failure_receipt_committed"},)
+                },
+            ), mock.patch.object(
+                DeploymentJournalStore,
+                "active_revisions",
+                return_value=(),
+            ):
                 result = apply_publish(
                     vm_root=root,
                     release_id="release-v2-candidate",
