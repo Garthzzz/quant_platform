@@ -125,6 +125,11 @@ _LOCKED_WINDOWS_STEADY_SCM_PROCESS_HANDLE_TRACKING_TOKEN = object()
 _LOCKED_WINDOWS_WRITER_LEASE_HANDLE_TRACKING_TOKEN = object()
 _LOCKED_WINDOWS_STEADY_WRITER_LEASE_HANDLE_TRACKING_TOKEN = object()
 _LOCKED_MUTABLE_CANARY_SQLITE_SET_TOKEN = object()
+_LOCKED_BOOTSTRAP_COMMENT_SCHEMA_EXPAND_AUTHORIZATION_TOKEN = object()
+
+_BOOTSTRAP_COMMENT_SCHEMA_EXPAND_AUTHORIZATION_SCOPE = (
+    "bootstrap_comment_schema_expand_authorization_only"
+)
 
 _EXACT_TRANSIENT_START_AUTHORIZATION_SCHEMA = (
     "qrh-exact-transient-start-authorization/v1"
@@ -3791,6 +3796,133 @@ class _ExactReleaseRoleState:
     members: tuple[_ExactReleasePinnedMember, ...] = ()
     migration_paths: tuple[str, ...] = ()
     namespace_monitor: object | None = None
+
+
+class LockedBootstrapCommentSchemaExpandAuthorization:
+    """同一 B2 lock epoch 内、仅对 durable bootstrap root-preflight 有效的能力。
+
+    该对象不携带路径，也不允许调用者自报 attempt/nonce/state。每次使用都会重放
+    journal 并重新确认它仍是唯一 active 的 ``root_preflight_verified`` revision、
+    workspace 仍属于同一 lock epoch，且 active/prior control 仍然为空。
+    """
+
+    __slots__ = (
+        "_persistence",
+        "_workspace",
+        "_acquisition_epoch",
+        "_journal_sha256",
+        "_state_identity_sha256",
+        "_candidate_ref_raw",
+    )
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError(
+            "bootstrap comment schema expand authorization 不允许派生伪 capability"
+        )
+
+    def __init__(
+        self,
+        *,
+        persistence: "LocalDeploymentPersistence",
+        workspace: "LockedAttemptWorkspace",
+        acquisition_epoch: _LockAcquisitionEpoch,
+        journal_sha256: str,
+        state_identity_sha256: str,
+        candidate_reference: Mapping[str, object],
+        _construction_token: object,
+    ):
+        if (
+            _construction_token
+            is not _LOCKED_BOOTSTRAP_COMMENT_SCHEMA_EXPAND_AUTHORIZATION_TOKEN
+        ):
+            raise DeploymentLockBusy(
+                "bootstrap comment schema expand authorization 必须由 persistence façade 构造"
+            )
+        self._persistence = persistence
+        self._workspace = workspace
+        self._acquisition_epoch = acquisition_epoch
+        self._journal_sha256 = journal_sha256
+        self._state_identity_sha256 = state_identity_sha256
+        self._candidate_ref_raw = _identity.canonical_bytes(
+            _release_ref(
+                candidate_reference,
+                label="bootstrap comment schema expand candidate",
+            )
+        )
+
+    def __reduce__(self) -> object:
+        raise TypeError(
+            "bootstrap comment schema expand authorization is process-local and non-serializable"
+        )
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        del protocol
+        return self.__reduce__()
+
+    def _assert_live(self) -> Mapping[str, object]:
+        if (
+            type(self._persistence) is not LocalDeploymentPersistence
+            or type(self._workspace) is not LockedAttemptWorkspace
+        ):
+            raise DeploymentLockBusy(
+                "bootstrap comment schema expand authorization 类型漂移"
+            )
+        self._workspace._assert_live()
+        if (
+            self._workspace._safe_root is not self._persistence._safe_root
+            or self._workspace._authority_token
+            is not self._persistence._authority_token
+            or self._workspace._acquisition_epoch is not self._acquisition_epoch
+        ):
+            raise DeploymentLockBusy(
+                "bootstrap comment schema expand authorization authority/epoch 漂移"
+            )
+        history = self._persistence.journals.replay(self._workspace.attempt_id)
+        latest = history[-1]
+        active = self._persistence.journals.active_revisions()
+        evidence = latest["evidence_hashes"]
+        if (
+            len(active) != 1
+            or active[0] != latest
+            or latest["attempt"] != self._workspace.attempt_id
+            or latest["nonce"] != self._workspace.nonce
+            or latest["operation"] != "bootstrap_first_pair"
+            or latest["phase"] != "root_preflight_verified"
+            or latest["journal_sha256"] != self._journal_sha256
+            or latest["original_pair"] is not None
+            or latest["database_seals"] != []
+            or latest["transient_start"] != []
+            or latest["state_plan"]["database_names"]
+            != ["comments", "research_workspace"]
+            or latest["state_plan"]["state_identity_sha256"]
+            != self._state_identity_sha256
+            or not isinstance(evidence, Mapping)
+            or evidence.get("root_preflight_sha256") is None
+            or _identity.canonical_bytes(
+                _release_ref(
+                    latest["candidate"],
+                    label="latest bootstrap comment schema expand candidate",
+                )
+            )
+            != self._candidate_ref_raw
+        ):
+            raise DeploymentJournalError(
+                "bootstrap comment schema expand authorization 已被 durable journal 撤销"
+            )
+        if (
+            self._persistence.read_active_release() is not None
+            or self._persistence.read_local_prior_binding() is not None
+        ):
+            raise DeploymentJournalError(
+                "bootstrap comment schema expand authorization 要求 absent active/prior control"
+            )
+        return latest
+
+    @property
+    def scope(self) -> str:
+        self._assert_live()
+        return _BOOTSTRAP_COMMENT_SCHEMA_EXPAND_AUTHORIZATION_SCOPE
 
 
 class LockedExactTransientStartAuthorization:
@@ -10541,6 +10673,61 @@ class LocalDeploymentPersistence:
 
         lock.assert_held(authority_token=self._authority_token)
 
+    def lock_bootstrap_comment_schema_expand_authorization(
+        self,
+        lock: CrashReleasedFileLock,
+        workspace: LockedAttemptWorkspace,
+    ) -> LockedBootstrapCommentSchemaExpandAuthorization:
+        """从同 epoch durable root-preflight 派生唯一 comments expand 能力。"""
+
+        if (
+            type(lock) is not CrashReleasedFileLock
+            or type(workspace) is not LockedAttemptWorkspace
+        ):
+            raise DeploymentLockBusy(
+                "bootstrap comment schema expand 必须绑定 exact lock/workspace"
+            )
+        self.assert_global_lock(lock)
+        workspace._assert_live()
+        acquisition_epoch = lock._capture_acquisition_epoch(
+            authority_token=self._authority_token,
+        )
+        if (
+            workspace._lock is not lock
+            or workspace._authority_token is not self._authority_token
+            or workspace._safe_root is not self._safe_root
+            or workspace._acquisition_epoch is not acquisition_epoch
+        ):
+            raise DeploymentLockBusy(
+                "bootstrap comment schema expand 必须绑定同一 persistence/lock/workspace epoch"
+            )
+        history = self.journals.replay(workspace.attempt_id)
+        latest = history[-1]
+        if (
+            latest["attempt"] != workspace.attempt_id
+            or latest["nonce"] != workspace.nonce
+            or latest["operation"] != "bootstrap_first_pair"
+            or latest["phase"] != "root_preflight_verified"
+        ):
+            raise DeploymentJournalError(
+                "bootstrap comment schema expand 只接受 exact durable root preflight"
+            )
+        authorization = LockedBootstrapCommentSchemaExpandAuthorization(
+            persistence=self,
+            workspace=workspace,
+            acquisition_epoch=acquisition_epoch,
+            journal_sha256=str(latest["journal_sha256"]),
+            state_identity_sha256=str(
+                latest["state_plan"]["state_identity_sha256"]
+            ),
+            candidate_reference=latest["candidate"],
+            _construction_token=(
+                _LOCKED_BOOTSTRAP_COMMENT_SCHEMA_EXPAND_AUTHORIZATION_TOKEN
+            ),
+        )
+        authorization._assert_live()
+        return authorization
+
     def global_lock(self) -> CrashReleasedFileLock:
         return CrashReleasedFileLock(
             path=self.layout.deployment_lock,
@@ -15336,6 +15523,7 @@ __all__ = [
     "LocalDeploymentLayout",
     "LocalDeploymentPersistence",
     "LocalDeploymentPersistenceError",
+    "LockedBootstrapCommentSchemaExpandAuthorization",
     "LockedExactReleaseClosures",
     "LockedExactScmProcessObservationInput",
     "LockedExactTransientStartAuthorization",

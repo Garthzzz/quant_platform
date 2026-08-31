@@ -45,14 +45,18 @@ python -m quant_hub.knowledge_mcp.cli install `
 python -m quant_hub.knowledge_mcp.cli doctor `
   --client-config <absolute-user-data-root>\quant-research-knowledge\client.json
 
-codex mcp list
+codex -C <project-root> mcp list --json
 ```
 
-`doctor` 只输出身份、时间、状态和去敏原因：
+project scope 的 MCP 配置位于目标项目内，因此必须用 `-C <project-root>` 在该项目
+语境检查。`doctor` 只输出身份、时间、状态和去敏原因，但不等于本机零写入：发现
+可验证的新 authority 三元组时，它可能下载 immutable artifact，并原子更新本机
+mirror/pointer。状态包括：
 
 - `fresh`：authority 与已验证 mirror 三元组相同；
 - `stale`：仅在调用显式允许旧缓存时可作为已标注历史数据读取；
-- `unavailable`：authority 不可达、身份不可验证或同步失败，不得支撑当前结论。
+- `unavailable`：authority 不可达、身份不可验证或同步失败，不得支撑当前结论；
+- `transition_pending`：新旧身份转换尚未由 agent 确认，退出码为 2，不能视为 fresh。
 
 Codex server instructions 与受管 `AGENTS.md` block 要求：需要项目历史方法、
 条件、限制或失败经验时只做一个聚焦 search；重要判断最多展开 search
@@ -86,7 +90,7 @@ authority 探测失败时，默认响应是 `availability=unavailable` 且不带
 
 ## 验收与卸载
 
-真实验收使用 `codex exec --json` 保存 Git 外 trace，并由
+真实验收使用 `codex exec --json` 保存不纳入 Git 跟踪的 trace，并由
 `load_codex_tool_trace` 只投影目标 server 的 completed structured calls。至少
 包含：隐式应调用、无关任务不调用、search→get、R1→R2→R1 的
 list-updates→重查、断网 unavailable，以及同任务 no-MCP 对照。质量 marker
@@ -147,7 +151,7 @@ structured response 与原始 call item，同时单独保留 unrelated MCP calls
 每条 trace 必须恰有一个非空 completed agent message，该消息完成时不能残留其他 open item，
 完成后不得再开始或结束 reasoning/tool/agent item；空字符串不再能重置或绕过“最终消息”状态。
 
-未来全新独立 suite 必须先用 `qrh-mcp-acceptance-preregistration/v2-bound` 生成 canonical
+全新独立 suite 必须先用 `qrh-mcp-acceptance-preregistration/v2-bound` 生成 canonical
 UTF-8 bytes。该封闭 envelope 绑定 suite、authority identity、固定 server/model、公开配置的
 byte length/SHA-256、run ID、UTC 预注册时刻，以及每个 case 的 prompt byte length/SHA-256、
 应调用标志、顺序和调用预算。应调用 case 的顺序必须包含 search→get，每 case 最多 6 次、
@@ -157,14 +161,68 @@ NFKC、casefold 和空白归一化，再要求全局唯一且互不包含；普�
 运行前 byte contract，保持不可
 重算的 FAIL，不回填 marker、不补造 prereg，也不据此重跑真实 Codex。
 
-canonical prereg bytes 生成后还必须立即调用 `record_acceptance_preregistration`，以
-exclusive-create + fsync 写入 durable ledger；存在同名 entry 时拒绝覆盖。公开测试只允许
-`run_fake_acceptance_arm`：它先写 `INTENT`，再调用无网络/无 secret 的进程内 fake transport，
-最后写绑定 trace hash 的 `COMPLETE`，并固定声明
-`FAKE_ONLY_REAL_CODEX_DISABLED`。case 数、prompt/config/marker bytes、逐 trace bytes 和 campaign
-总 trace bytes 都有上限。真实 Codex runner 尚未启用，禁止把 fake ledger 改名为真实证据。
+canonical prereg、真实 launch config 和逐 case prompt 由
+`qrh-mcp-acceptance preregister` 先写入同一父目录内的 create-only staging directory；所有文件
+exclusive-create + fsync、闭合 inventory 复验通过后，Windows 才用 write-through 且不覆盖目标的
+目录提交发布为 evidence root。目标根必须事先不存在；旧根、非空根、reparse/junction/symlink、
+额外目录或额外文件一律拒绝。
 
-最终验收只能由 `evaluate_preregistered_acceptance` 形成 verdict。该单一 gate 同时消费
+launch config 使用 `qrh-mcp-real-codex-launch/v2-process-provenance`。顶层闭合字段为：
+
+- `execution_scope`：`local` 或 `production_exact_d`；
+- `evidence_parent`：evidence root 的显式绝对父目录；生产模式必须解析到
+  `D:\quant\quant_platform\audit` 内，且 evidence root 只能是它的直接子目录；
+- `codex_executable`、`codex_executable_sha256`、`codex_authenticode`：原生
+  `codex.exe` 的路径、散列和 `Valid` OpenAI 签名 subject/thumbprint；`.ps1/.cmd/.bat` 不合格；
+- `working_directory`、`sandbox=read-only`、`timeout_seconds`、
+  `skip_git_repo_check`；
+- `mcp_server`：闭合目标 STDIO 配置，精确包含 `command/command_sha256/args/cwd/env/env_vars/`
+  `enabled/required/enabled_tools/default_tools_approval_mode/startup_timeout_sec/`
+  `tool_timeout_sec/client_config_path/client_config_sha256/python_executable/`
+  `python_executable_sha256/runtime_closures`。
+
+Windows 的 `mcp_server.command` 必须是 `qrh-knowledge-mcp.exe`，不能是 Python、脚本 wrapper
+或 shell 命令；`args` 必须精确绑定唯一 `--client-config`。`enabled=true`、`required=true`、
+`default_tools_approval_mode=writes`，`env_vars=[]`；`env` 固定启用 `PYTHONSAFEPATH`、
+`PYTHONNOUSERSITE`、`PYTHONDONTWRITEBYTECODE`、`PYTHONUTF8`，并把 `PYTHONPATH` 精确指向
+冻结 package root 的父目录，防止从 cwd/user site 导入同名包或让两臂继承变量漂移。
+`runtime_closures` 的顺序固定为 `quant_hub_package`、`quant_hub_distribution`；每项记录绝对
+root 与按 UTF-8 相对路径排序的完整 `{relative_path, sha256}` inventory。它们和 MCP launcher、
+实际 `python.exe`、client config 一起在 preregister、每臂执行前/中/后及 verifier 中重读复算。
+
+真实命令固定带 `--ignore-user-config --ignore-rules --strict-config --ephemeral --json`，并用
+一个完整的 `mcp_servers={target={...}}` session override，并统一关闭 app/plugin/tool-search
+入口。由于 Codex 的 TOML table overlay 不会删除低层未知 server，provenance gate 还会用同一个
+已签名 `codex.exe` 的 app-server `config/read(includeLayers=true,cwd=...)` 读取真实分层配置；只排除
+确实被 `--ignore-user-config` 忽略的 user layer，任何 active packaged/system/enterprise/project/
+legacy-managed layer 含 MCP 或 app/plugin 配置都 fail closed，并冻结各层 version/config hash。
+assisted 与 no-MCP 两个 argv 逐元素比较，只能有目标
+`enabled=true/false` 这一处差异，`required=true` 在两臂保持不变。
+
+```powershell
+qrh-mcp-acceptance run --evidence-root <不纳入Git跟踪的绝对路径>\<run_id>
+qrh-mcp-acceptance verify --evidence-root <不纳入Git跟踪的绝对路径>\<run_id>
+```
+
+本机可把 evidence root 放在受保护的外置运维目录；若命令在生产 VM 上运行，所有写入
+仍必须位于 `D:\quant\quant_platform\audit\...` 这类 exact-D 根内路径，绝不写入 C 盘或
+VM D 根之外。Stage 5 closure 可托管并复验 campaign，但当前磁盘回放固定为非权威证据，
+因此必被 Stage 5 放行门禁拒绝；campaign 目录仍必须是其 evidence root 下的受管相对路径。
+
+真实 runner 在 Windows campaign 全程持有 Codex、MCP launcher、Python、client config、
+package/distribution 文件的 no-share-write/delete handles，用 `shell=False` 启动预注册的
+`codex exec --json`，并从内核查询实际 Codex process image。assisted 臂还必须同时观测目标
+native launcher 与冻结 Python 子进程；no-MCP 臂两者都不得出现。每臂在执行前写 `INTENT`，
+stdout/stderr 由并行 reader 按硬上限流式消费，stdout 直接进入不可覆盖 raw JSONL；超限、超时、
+reader/observer 失败、进程映像或任一前/中/后散列漂移均为非资格失败。`error` 顶层事件直接
+fail closed；实际 Codex 的 reasoning/plan 事件可解析，但 command execution、file change、
+web search 或非目标 MCP 污染会进入 findings，不能通过。失败 campaign 写
+`campaign-failure.json`，不会伪造权威 receipt。公开测试仍可使用无网络/无 secret 的
+`run_fake_acceptance_arm`，但它固定声明
+`FAKE_ONLY_REAL_CODEX_DISABLED`；fake 或 real/fake 混用只能形成
+`PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`，不能冒充真实资格证据。
+
+本回放链的最终功能 verdict 只能由 `evaluate_preregistered_acceptance` 形成。该单一 gate 同时消费
 canonical preregistration bytes/ledger、每项 exact prompt bytes、exact config bytes、两臂
 dispatch intent/completion、MCP-assisted 原始 JSONL bytes、同 prompt 的 no-MCP JSONL bytes
 和预期 authority identity。gate 内部只从 raw bytes
@@ -176,10 +234,16 @@ argument 一致的 object 和完整 citation locator；assisted final 必须是 
 decision/conditions/limitations 的每条 claim 逐项引用同一个 prior-get
 `object/document-version/source/span/byte-range/citation-id` tuple，不能交叉拼接 locator 或靠自由
 文本 token/marker 冒充引用正确。运行先后只信 durable prereg/dispatch ledger，不信 raw JSONL
-内可编辑时间字段。最终 gate 生成 `qrh-mcp-acceptance-campaign-receipt/v2-raw-replay`，冻结逐 case
+内可编辑时间字段。最终 gate 生成
+`qrh-mcp-acceptance-campaign-receipt/v3-dispatch-replay`，冻结逐 case
 trace status、三维 score/gain、findings 与 dispatch timing。审计方调用
 `validate_acceptance_campaign_receipt_bytes` 时必须再次提交 exact ledger/config/prompts/raw traces；
 validator 完整重放并要求 receipt byte-for-byte 相等，而不是只检查自报 hash。旧
 `evaluate_tool_choice` 的任意事件／调用方浮点接口已经 fail closed，不能再签发 PASS；单独
 运行 prereg validator、trace loader、trace gate 或 marker scorer 均显式属于
-`NON_AUTHORITATIVE_COMPONENT`，都不是最终放行证据。
+`NON_AUTHORITATIVE_COMPONENT`，都不是最终放行证据。即使两臂全部标记为 `REAL_CODEX_EXEC`、
+完整重放通过且质量阈值满足，磁盘 receipt authority 也固定为
+`REAL_CODEX_EVIDENCE_REPLAY_NON_AUTHORITATIVE`；`qrh-mcp-acceptance verify` 只证明封闭回放自洽，
+不授予 Stage 5 权威。只有后续独立可信执行 attestation/countersignature 闭合运行身份、隔离运行时、
+进程树和证据时序后，才允许设计新的权威 producer；当前代码没有可签发
+`AUTHORITATIVE_REAL_CODEX_INTEGRATED_GATE` 的路径。

@@ -1485,6 +1485,21 @@ class KnowledgeMCPServiceTests(unittest.TestCase):
 
 
 class KnowledgeMCPProfileTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._native_launcher_directory = tempfile.TemporaryDirectory()
+        launcher = (
+            Path(self._native_launcher_directory.name) / "qrh-knowledge-mcp.exe"
+        )
+        launcher.write_bytes(b"test-only native MCP launcher")
+        self._native_launcher_patch = patch.object(
+            install_module,
+            "_native_profile_launcher",
+            return_value=launcher.resolve(),
+        )
+        self._native_launcher_patch.start()
+        self.addCleanup(self._native_launcher_patch.stop)
+        self.addCleanup(self._native_launcher_directory.cleanup)
+
     def test_cross_project_profile_is_idempotent_cwd_independent_and_removable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1499,20 +1514,28 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 artifact_release_root=root / "artifacts" / "releases",
                 mirror_root=data / "mirror",
             )
-            first = install_profile(
-                scope="project",
-                profile_root=profile,
-                data_root=data,
-                project_root=project,
-                client_config=config,
-            )
-            second = install_profile(
-                scope="project",
-                profile_root=profile,
-                data_root=data,
-                project_root=project,
-                client_config=config,
-            )
+            native_launcher = root / "runtime" / "qrh-knowledge-mcp.exe"
+            native_launcher.parent.mkdir()
+            native_launcher.write_bytes(b"test-only native launcher")
+            with patch.object(
+                install_module,
+                "_native_profile_launcher",
+                return_value=native_launcher.resolve(),
+            ):
+                first = install_profile(
+                    scope="project",
+                    profile_root=profile,
+                    data_root=data,
+                    project_root=project,
+                    client_config=config,
+                )
+                second = install_profile(
+                    scope="project",
+                    profile_root=profile,
+                    data_root=data,
+                    project_root=project,
+                    client_config=config,
+                )
             self.assertTrue(first["changed"])
             self.assertFalse(second["changed"])
             self.assertFalse(first["source_code_copied"])
@@ -1522,9 +1545,28 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
             parsed_profile = tomllib.loads(profile_text)
             configured = parsed_profile["mcp_servers"]["quant_research_knowledge"]
             configured_args = configured["args"]
+            self.assertEqual(str(native_launcher.resolve()), configured["command"])
+            self.assertEqual("serve-stdio", configured_args[0])
             self.assertEqual(
                 str(Path(first["client_config_path"]).resolve()), configured_args[-1]
             )
+            self.assertEqual(
+                str(Path(first["client_config_path"]).resolve().parent),
+                configured["cwd"],
+            )
+            self.assertEqual(
+                {
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONPATH": str(
+                        Path(install_module.__file__).resolve().parents[2]
+                    ),
+                    "PYTHONSAFEPATH": "1",
+                    "PYTHONUTF8": "1",
+                },
+                configured["env"],
+            )
+            self.assertEqual([], configured["env_vars"])
             self.assertTrue(configured["required"])
             self.assertEqual("writes", configured["default_tools_approval_mode"])
             self.assertEqual(
@@ -1535,7 +1577,7 @@ class KnowledgeMCPProfileTests(unittest.TestCase):
                 },
                 set(configured["enabled_tools"]),
             )
-            self.assertNotIn("cwd =", profile_text)
+            self.assertIn("cwd =", profile_text)
             agents = (project / "AGENTS.md").read_text(encoding="utf-8")
             self.assertIn("search_quant_knowledge", agents)
             self.assertIn("不要为了调用率", agents)
@@ -2573,7 +2615,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
 
         report, cases, dispatch_root = evaluate_cases(raw_cases)
         self.assertEqual("PASS", report.status)
-        self.assertEqual("AUTHORITATIVE_INTEGRATED_GATE", report.authority)
+        self.assertEqual("PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE", report.authority)
         campaign_receipt = json.loads(report.campaign_receipt)
         self.assertEqual(
             campaign_receipt,
@@ -2587,7 +2629,7 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            "qrh-mcp-acceptance-campaign-receipt/v2-raw-replay",
+            "qrh-mcp-acceptance-campaign-receipt/v3-dispatch-replay",
             campaign_receipt["schema_version"],
         )
         self.assertEqual(TEST_RUN_ID, campaign_receipt["run_id"])
@@ -2995,6 +3037,53 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
         ).encode("utf-8")
         with self.assertRaisesRegex(ValueError, "unknown event type"):
             load_codex_tool_trace_bytes(unknown)
+
+        top_level_error = (
+            canonical_json({"type": "turn.started"})
+            + "\n"
+            + canonical_json({"type": "error", "message": "provider failed"})
+            + "\n"
+        ).encode("utf-8")
+        with self.assertRaisesRegex(ValueError, "top-level error"):
+            load_codex_tool_trace_bytes(top_level_error)
+
+        non_mcp_execution = (
+            {"type": "turn.started"},
+            {
+                "type": "item.started",
+                "item": {"id": "command-1", "type": "command_execution"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "command-1",
+                    "type": "command_execution",
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {"id": "message-1", "type": "agent_message"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message-1",
+                    "type": "agent_message",
+                    "text": "done",
+                },
+            },
+            {"type": "turn.completed"},
+        )
+        parsed_non_mcp = load_codex_tool_trace_bytes(
+            "".join(
+                canonical_json(row) + "\n" for row in non_mcp_execution
+            ).encode("utf-8")
+        )
+        self.assertEqual(
+            ("line_3:non_mcp_item:command_execution",),
+            parsed_non_mcp.failed_calls,
+        )
 
         rows = list(
             _closed_codex_rows(

@@ -34,8 +34,10 @@ qrh-writer-handoff = "quant_hub.ops.writer_handoff:main"
 qrh-vm-bootstrap = "quant_hub.ops.vm_bootstrap_cli:main"
 qrh-tooling-update = "quant_hub.ops.tooling_update_host:main"
 qrh-knowledge-mcp = "quant_hub.knowledge_mcp.cli:main"
+qrh-mcp-acceptance = "quant_hub.knowledge_mcp.acceptance_cli:main"
 qrh-knowledge-compile = "quant_hub.knowledge.semantic_cli:main"
 qrh-semantic-authority = "quant_hub.ops.semantic_authority:main"
+qrh-release-closure = "quant_hub.ops.release_closure:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

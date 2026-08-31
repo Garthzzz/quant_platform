@@ -152,6 +152,7 @@ jobs:
             "tests.test_knowledge_release_build",
             "tests.test_knowledge_citation_projection",
             "tests.test_knowledge_mcp",
+            "tests.test_knowledge_mcp_real_acceptance",
             "tests.test_knowledge_mcp_stress_public",
             "tests.test_ds_review_harness",
             "tests.test_ds_review_external_v3",
@@ -285,7 +286,13 @@ jobs:
             throw "wheel is missing the MCP trace evaluator"
           }
           if ($entries -notcontains "quant_hub/knowledge_mcp/acceptance_runner.py") {
-            throw "wheel is missing the fake-only MCP acceptance runner"
+            throw "wheel is missing the MCP acceptance runner"
+          }
+          if ($entries -notcontains "quant_hub/knowledge_mcp/acceptance_cli.py") {
+            throw "wheel is missing the MCP acceptance CLI"
+          }
+          if ($entries -notcontains "quant_hub/knowledge_mcp/acceptance_contracts.py") {
+            throw "wheel is missing the MCP acceptance contracts"
           }
           if ($entries -notcontains "quant_hub/knowledge/semantic_cli.py") {
             throw "wheel is missing the semantic operator CLI"
@@ -363,6 +370,9 @@ jobs:
           if (($entryPoints -join "`n") -notmatch "qrh-knowledge-mcp = quant_hub\.knowledge_mcp\.cli:main") {
             throw "wheel is missing the qrh-knowledge-mcp entrypoint"
           }
+          if (($entryPoints -join "`n") -notmatch "qrh-mcp-acceptance = quant_hub\.knowledge_mcp\.acceptance_cli:main") {
+            throw "wheel is missing the qrh-mcp-acceptance entrypoint"
+          }
           if (($entryPoints -join "`n") -notmatch "qrh-knowledge-compile = quant_hub\.knowledge\.semantic_cli:main") {
             throw "wheel is missing the qrh-knowledge-compile entrypoint"
           }
@@ -377,6 +387,9 @@ jobs:
           }
           if (($entryPoints -join "`n") -notmatch "qrh-tooling-update = quant_hub\.ops\.tooling_update_host:main") {
             throw "wheel is missing the qrh-tooling-update entrypoint"
+          }
+          if (($entryPoints -join "`n") -notmatch "qrh-release-closure = quant_hub\.ops\.release_closure:main") {
+            throw "wheel is missing the qrh-release-closure entrypoint"
           }
           $removedEntryPoints = @(
             "qrh-cold-bundle",
@@ -412,6 +425,8 @@ jobs:
             throw "wheel citation projection import smoke failed"
           }
           foreach ($module in @(
+            "quant_hub.knowledge_mcp.acceptance_cli",
+            "quant_hub.ops.release_closure",
             "quant_hub.ops.writer_handoff",
             "quant_hub.ops.tooling_update_host",
             "quant_hub.ops.vm_bootstrap_cli"
@@ -422,6 +437,8 @@ jobs:
             }
           }
           foreach ($entrypoint in @(
+            "qrh-mcp-acceptance.exe",
+            "qrh-release-closure.exe",
             "qrh-writer-handoff.exe",
             "qrh-tooling-update.exe",
             "qrh-vm-bootstrap.exe"

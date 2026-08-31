@@ -309,13 +309,26 @@ def _toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _native_profile_launcher() -> Path:
+    python = Path(sys.executable).resolve(strict=True)
+    candidates = (
+        python.with_name("qrh-knowledge-mcp.exe"),
+        python.parent / "Scripts" / "qrh-knowledge-mcp.exe",
+    )
+    launcher = next((path.resolve() for path in candidates if path.is_file()), None)
+    if launcher is None:
+        raise ProfileInstallError(
+            "native qrh-knowledge-mcp.exe is missing; install the wheel entry point first"
+        )
+    return launcher
+
+
 def profile_toml(client_config_path: Path) -> str:
-    command = _toml_string(sys.executable)
+    command = _toml_string(str(_native_profile_launcher()))
+    package_parent = Path(__file__).resolve(strict=True).parents[2]
     args = ", ".join(
         _toml_string(value)
         for value in (
-            "-m",
-            "quant_hub.knowledge_mcp.cli",
             "serve-stdio",
             "--client-config",
             str(client_config_path.resolve()),
@@ -325,6 +338,11 @@ def profile_toml(client_config_path: Path) -> str:
         f"[mcp_servers.{PROFILE_NAME}]\n"
         f"command = {command}\n"
         f"args = [{args}]\n"
+        f"cwd = {_toml_string(str(client_config_path.resolve().parent))}\n"
+        "env = { PYTHONDONTWRITEBYTECODE = \"1\", PYTHONNOUSERSITE = \"1\", "
+        f"PYTHONPATH = {_toml_string(str(package_parent))}, "
+        "PYTHONSAFEPATH = \"1\", PYTHONUTF8 = \"1\" }\n"
+        "env_vars = []\n"
         "enabled = true\n"
         "required = true\n"
         "enabled_tools = [\"search_quant_knowledge\", \"get_quant_knowledge\", \"list_knowledge_updates\"]\n"

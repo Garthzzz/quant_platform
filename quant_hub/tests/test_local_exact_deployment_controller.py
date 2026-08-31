@@ -1,21 +1,31 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import closing
 import hashlib
 from pathlib import Path
+import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
 
+from quant_hub.collaboration.comment_store import initialize_comment_store
 from quant_hub.ops import local_release_identity as identity
 from quant_hub.ops.local_deployment_persistence import (
     LocalDeploymentPersistence,
     RetentionPlanningError,
 )
+from quant_hub.ops.local_deployment_runtime import (
+    ProductionWindowsDeploymentRuntime,
+    TestOnlyWindowsDeploymentRuntimeAdapter as RuntimeAdapter,
+)
 from quant_hub.ops.local_exact_deployment_controller import (
     ExactDeploymentControllerError,
     ProductionExactDeploymentController,
 )
+from quant_hub.platform.db import connect_database
+from quant_hub.platform.migrations import migrate_up
 
 from tests.test_local_deployment_persistence import (
     active,
@@ -68,6 +78,103 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                         expected_manifest_sha256="b" * 64,
                         attempt_id="activate-r1",
                     )
+
+    def test_bootstrap_preflight_expands_legacy_comments_before_strict_seal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            persistence = LocalDeploymentPersistence.for_test_only(
+                root, allow_posix_test_only=(os.name != "nt")
+            )
+            comments = persistence.layout.state / "comments.sqlite3"
+            initialize_comment_store(comments)
+            with closing(sqlite3.connect(comments, isolation_level=None)) as connection:
+                connection.execute("DROP TABLE comment_target")
+                connection.execute("DROP TABLE comment_target_schema")
+            migration_root = (
+                Path(__file__).resolve().parents[1]
+                / "migrations"
+                / "research_workspace"
+            )
+            workspace_database = (
+                persistence.layout.state / "research_workspace.sqlite3"
+            )
+            connection = connect_database(workspace_database)
+            try:
+                self.assertEqual([1, 2, 3], migrate_up(connection, migration_root))
+            finally:
+                connection.close()
+            runtime = RuntimeAdapter.for_test_only(
+                root,
+                migration_root=migration_root,
+                allow_posix_test_only=(os.name != "nt"),
+            )
+            r0 = release(
+                "release-bootstrap-r0", b"baseline", "8", include_migrations=True
+            )
+            self._materialize(
+                persistence.layout.incoming / "release-bootstrap-r0.partial",
+                r0,
+                b"baseline",
+            )
+            controller = ProductionExactDeploymentController.for_test_only(
+                persistence=persistence,
+                service=object(),
+            )
+            lock = persistence.global_lock()
+            workspace = None
+            lock.acquire()
+            try:
+                candidate = persistence.inspect_exact_incoming_candidate(
+                    lock=lock,
+                    release_id="release-bootstrap-r0",
+                    expected_manifest_sha256=identity.identity_sha256(r0),
+                )
+                intent, compatibility = controller._initial_bootstrap_journal(
+                    lock=lock,
+                    attempt="bootstrap-legacy-comments",
+                    nonce="bootstrap-legacy-comments-nonce",
+                    candidate_manifest=candidate,
+                )
+                latest = persistence.journals.append(intent, lock=lock)
+                persistence.finalize_exact_incoming_candidate(
+                    lock=lock,
+                    release_id="release-bootstrap-r0",
+                    expected_manifest_sha256=identity.identity_sha256(r0),
+                )
+                workspace = persistence.bind_attempt_workspace(
+                    lock,
+                    "bootstrap-legacy-comments",
+                    "bootstrap-legacy-comments-nonce",
+                )
+                with patch.object(
+                    ProductionWindowsDeploymentRuntime,
+                    "load_exact_d",
+                    return_value=runtime,
+                ):
+                    latest = controller._append_preflight_and_state(
+                        lock=lock,
+                        workspace=workspace,
+                        latest=latest,
+                        compatibility_documents=compatibility,
+                        candidate_manifest=candidate,
+                    )
+                self.assertEqual("state_expand_applied", latest["phase"])
+                self.assertEqual(
+                    ["comments", "research_workspace"],
+                    [item["name"] for item in latest["database_seals"]],
+                )
+                with closing(sqlite3.connect(comments)) as connection:
+                    self.assertEqual(
+                        [(3,)],
+                        connection.execute(
+                            "SELECT version FROM comment_target_schema"
+                        ).fetchall(),
+                    )
+            finally:
+                if workspace is not None and workspace._state != "closed":
+                    workspace.close()
+                if lock.held:
+                    lock.release()
 
     def test_rollback_intent_and_success_derive_only_the_retained_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

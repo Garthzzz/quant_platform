@@ -1,30 +1,59 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://quant-research-hub.local/schemas/visibility_closure_receipt.schema.json",
-  "title": "Quant Research Hub visibility closure receipt v3",
+  "title": "Quant Research Hub visibility closure receipt v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "receipt_id", "recorded_at", "authority", "repository", "commit_sha", "release", "stage5_certificate_ref", "evidence_refs", "receipt_sha256"],
+  "required": ["schema_version", "receipt_id", "issued_at", "result", "repository_visibility", "scope", "subject", "stage5_certificate", "private_commit_sha", "candidate_only", "evidence", "evidence_aggregate_sha256", "receipt_sha256"],
   "properties": {
-    "schema_version": {"const": "qrh-visibility-closure-receipt/v3"},
+    "schema_version": {"const": "qrh-visibility-closure-receipt/v1"},
     "receipt_id": {"type": "string", "pattern": "^visibility-[0-9a-f]{32}$"},
-    "recorded_at": {"type": "string", "format": "date-time"},
-    "authority": {"const": "evidence_only"},
-    "repository": {
-      "type": "object", "additionalProperties": false,
-      "required": ["repository_id", "full_name", "visibility_before", "visibility_after"],
-      "properties": {"repository_id": {"$ref": "#/$defs/id"}, "full_name": {"type": "string"}, "visibility_before": {"const": "public"}, "visibility_after": {"const": "private"}}
+    "issued_at": {"type": "string", "format": "date-time"},
+    "result": {"const": "pass"},
+    "repository_visibility": {"const": "private"},
+    "scope": {"$ref": "stage5_release_certificate.schema.json#/$defs/scope"},
+    "subject": {"$ref": "release_closure_gate_observation.schema.json#/$defs/subject"},
+    "stage5_certificate": {"$ref": "#/$defs/certificate_ref"},
+    "private_commit_sha": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},
+    "candidate_only": {"$ref": "#/$defs/candidate_only"},
+    "evidence": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        {"$ref": "stage5_release_certificate.schema.json#/$defs/evidence_ref", "properties": {"gate_role": {"const": "repository_private_observation"}}},
+        {"$ref": "stage5_release_certificate.schema.json#/$defs/evidence_ref", "properties": {"gate_role": {"const": "private_controls_revalidation"}}},
+        {"$ref": "stage5_release_certificate.schema.json#/$defs/evidence_ref", "properties": {"gate_role": {"const": "private_exact_sha_ci"}}},
+        {"$ref": "stage5_release_certificate.schema.json#/$defs/evidence_ref", "properties": {"gate_role": {"const": "private_candidate_only"}}},
+        {"$ref": "stage5_release_certificate.schema.json#/$defs/evidence_ref", "properties": {"gate_role": {"const": "production_identity_unchanged"}}}
+      ],
+      "items": false
     },
-    "commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
-    "release": {"$ref": "#/$defs/release"},
-    "stage5_certificate_ref": {"$ref": "#/$defs/artifact_ref"},
-    "evidence_refs": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"$ref": "#/$defs/artifact_ref"}},
-    "receipt_sha256": {"$ref": "#/$defs/sha256"}
+    "evidence_aggregate_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+    "receipt_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}
   },
   "$defs": {
-    "id": {"type": "string", "pattern": "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]{0,179}$"},
-    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "release": {"type": "object", "additionalProperties": false, "required": ["release_id", "manifest_sha256", "snapshot_id"], "properties": {"release_id": {"$ref": "#/$defs/id"}, "manifest_sha256": {"$ref": "#/$defs/sha256"}, "snapshot_id": {"$ref": "#/$defs/id"}}},
-    "artifact_ref": {"type": "object", "additionalProperties": false, "required": ["kind", "locator", "sha256"], "properties": {"kind": {"$ref": "#/$defs/id"}, "locator": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$"}, "sha256": {"$ref": "#/$defs/sha256"}}}
+    "certificate_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["certificate_id", "certificate_relative_path", "certificate_file_sha256", "certificate_sha256", "issued_at"],
+      "properties": {
+        "certificate_id": {"type": "string", "pattern": "^stage5-[0-9a-f]{32}$"},
+        "certificate_relative_path": {"$ref": "release_closure_gate_observation.schema.json#/$defs/relative_path"},
+        "certificate_file_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+        "certificate_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+        "issued_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "candidate_only": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_id", "manifest_sha256", "production_switch"],
+      "properties": {
+        "release_id": {"$ref": "release_closure_gate_observation.schema.json#/$defs/id"},
+        "manifest_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+        "production_switch": {"const": "not_performed"}
+      }
+    }
   }
 }

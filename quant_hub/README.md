@@ -2,6 +2,14 @@
 
 这里是统一量化研究平台的正式可写实现区。正式系统包含 Archive 研究主体、独立 Research Evidence 论文证据库，以及迁移后的外部论文精读与架构设计系统 Paper Lab。`spikes/` 只保留技术实测；正式代码位于 `src/quant_hub/`。
 
+> 当前放行状态（2026-08-31）：最近一次 C→exact-D writer handoff 在 D ingress 前安全失败，
+> 旧 C 服务已恢复；D 侧尚无 active/prior，Stage 5 certificate 与 visibility closure 均未签发。
+> 这不是可忽略的版本差异。当前现场与后续更新以
+> [`Stage 5 / Stage 6 exact-D 生产闭合记录`](../docs/runbooks/STAGE5_STAGE6_CLOSURE.md) 为准；在该记录更新前，
+> 不得把候选、历史本机 delivery 或单元测试 PASS 宣称为生产放行。
+
+## 研究员数据抓取与存储指南
+
 研究员需要新增研究、抓取论文、运行 Paper Lab、调用 Web/API 或 MCP，以及定位全部数据库和数据文件时，统一从独立章节
 [`研究员数据抓取、导入、检索与存储位置指南`](../docs/runbooks/RESEARCHER_DATA_GUIDE.md)
 开始；该指南把日常操作与仅限授权运维的发布、VM 和回退接口明确分开。
@@ -10,10 +18,13 @@
 
 - `reference/**` 是只读来源，程序只读取并登记原始字节，不在其中写 sidecar、元数据或渲染结果。
 - `D:\quant\industry_demo/**` 只作参考，不是本程序的运行目录。
-- 所有可变状态必须位于项目内、`reference/**` 外的 `--var-root`。
-- `${var_root}/db/platform.sqlite3` 保存对象、来源、运行和 release authority；`${var_root}/db/archive.sqlite3` 保存 Archive 研究、release、Dashboard 与评论。两库物理隔离，但一次 release 消费会交叉核对身份。
+- 开发与候选业务的可变状态必须位于项目内、`reference/**` 外且显式选择的
+  `--var-root`。发布编排的 state/candidates 由 Git 外置配置声明；VM 生产写入则
+  只能位于 exact `D:\quant\quant_platform`，两者都不能借此写入参考区。
+- `${var_root}/db/platform.sqlite3` 保存对象、来源、运行和 release authority；`${var_root}/db/archive.sqlite3` 保存 Archive 研究、release、Dashboard，以及开发/候选环境使用的协作 fallback。生产 live 评论与 Dashboard 可变状态位于 exact-D 外置 `state/comments.sqlite3`，不能把 release 内 Archive 协作表当成 current authority。两库物理隔离，但一次 release 消费会交叉核对身份。
 - `${var_root}/objects/` 保存内容寻址的不可变原始字节和派生对象。两库与对象区共同构成一个一致性状态单元，不得拆分改写或独立切换。
 - `${var_root}/db/research_papers.sqlite3` 与 `${var_root}/db/paper_lab.sqlite3` 分别保存 Archive 论文证据和外部论文精读，两者不与 Archive 业务表混库。
+- `${var_root}/db/research_workspace.sqlite3` 保存研究树、观察、评论和状态历史；正式发布以 seed 进入 exact-D 外置 current state。五库、对象、PDF、导出、候选、release、VM state 与 MCP 镜像的完整位置表见上方独立研究员指南。
 
 以下变量和 CLI 示例只用于开发、验证或构建新的候选，不是 active delivery 的正式启动命令。命令从 `D:\quant\quant_platform` 运行，要求 Python 3.13 及 `pyproject.toml` 中的依赖已经安装：
 
@@ -178,7 +189,12 @@ CLI 的 actor 默认是 `zhang_zhengze`；也可用 `--actor-kind song_dingkun`�
 
 ## Web 与 HTTP 服务
 
-先初始化或回放数据。工作树仅用于本地开发验证，必须显式声明开发运行模式；正式交付必须使用 [`project_state/FINAL_RUNBOOK.md`](../project_state/FINAL_RUNBOOK.md) 中绑定冻结候选、activation seal 和 startup gate 的命令。正式进程固定由 `D:\conda\python.exe -I -B` 启动，不设置 `PYTHONPATH`；首次启动必须完成不带 `--resume-reviewed-runtime` 的 strict bootstrap 并生成有效 receipt，之后同一交付才有资格使用恢复模式。
+先初始化或回放数据。工作树仅用于本地开发验证，必须显式声明开发运行模式。
+[`project_state/FINAL_RUNBOOK.md`](../project_state/FINAL_RUNBOOK.md) 记录的是历史本机 V9/R2
+delivery，其中的 `D:\conda\python.exe -I -B`、strict bootstrap 和 resume 命令只用于复核该
+历史交付，不是当前生产 VM 的启动接口。当前生产只能由受控 publish/writer-handoff/VM deploy
+链路使用 exact `D:\quant\quant_platform\tooling\python\python.exe`，并满足 active + 恰一 prior +
+共享 current D state 合同；研究员不得把两套命令混用。
 
 ```powershell
 python -B .\quant_hub\tools\run_local.py `

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schemas/stage5_release_certificate.schema.json",
+  "title": "Quant Research Hub Stage 5 release certificate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "certificate_id", "issued_at", "result", "scope", "subject", "evidence", "evidence_aggregate_sha256", "certificate_sha256"],
+  "properties": {
+    "schema_version": {"const": "qrh-stage5-release-certificate/v1"},
+    "certificate_id": {"type": "string", "pattern": "^stage5-[0-9a-f]{32}$"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "result": {"const": "pass"},
+    "scope": {"$ref": "#/$defs/scope"},
+    "subject": {"$ref": "release_closure_gate_observation.schema.json#/$defs/subject"},
+    "evidence": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "prefixItems": [
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "full_replay_and_comment_lifecycle"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "failure_and_incremental_matrix"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "web_search_mcp_snapshot_consistency"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "independent_verification"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "shared_state_schema_compatibility"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "active_prior_active_drill"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "retention_closure"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "runbook_drills_and_quality_report"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "revocation_surface"}}},
+        {"$ref": "#/$defs/evidence_ref", "properties": {"gate_role": {"const": "identity_graph_negative_fixtures"}}}
+      ],
+      "items": false
+    },
+    "evidence_aggregate_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+    "certificate_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["continuity_kind", "exact_project_root", "required_intact", "retained_release_count", "state_contract", "out_of_scope"],
+      "properties": {
+        "continuity_kind": {"const": "active_plus_exactly_one_prior_shared_current_d_state"},
+        "exact_project_root": {"const": "D:\\quant\\quant_platform"},
+        "required_intact": {"const": ["production_vm", "exact_d_project_root", "active_and_exactly_one_prior_closures", "object_closure", "shared_current_d_state"]},
+        "retained_release_count": {"const": 2},
+        "state_contract": {"const": "shared_current_d_state_no_restore_no_down_migration"},
+        "out_of_scope": {"const": ["production_vm_total_loss", "exact_d_project_root_total_loss", "object_closure_total_loss", "shared_current_d_state_total_loss"]}
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gate_role", "evidence_id", "evidence_relative_path", "evidence_file_sha256", "evidence_sha256", "observed_at", "producer", "artifact_count", "artifact_aggregate_sha256"],
+      "properties": {
+        "gate_role": {"$ref": "release_closure_gate_observation.schema.json#/$defs/gate_role"},
+        "evidence_id": {"$ref": "release_closure_gate_observation.schema.json#/$defs/id"},
+        "evidence_relative_path": {"$ref": "release_closure_gate_observation.schema.json#/$defs/relative_path"},
+        "evidence_file_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+        "evidence_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"},
+        "observed_at": {"type": "string", "format": "date-time"},
+        "producer": {"$ref": "release_closure_gate_observation.schema.json#/$defs/producer"},
+        "artifact_count": {"type": "integer", "minimum": 7, "maximum": 128},
+        "artifact_aggregate_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}
+      }
+    }
+  }
+}

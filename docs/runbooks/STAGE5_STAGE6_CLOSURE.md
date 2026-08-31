@@ -1,4 +1,4 @@
-# Stage 5 / Stage 6 本地 active/prior 闭合合同
+# Stage 5 / Stage 6 exact-D 生产 active/prior 与 visibility 闭合合同
 
 本文定义发布放行顺序，不表示生产 VM、Windows 服务、writer handoff 或 GitHub visibility
 已经执行。任何现场证据缺失时，对应阶段保持未完成；本地单元测试不能替代现场证据。
@@ -74,6 +74,129 @@
 重读 canonical bytes、复算 hash、核对真实对象和现场身份。任一必需 producer 尚未实现或现场
 证据尚未取得时，certificate 必须 fail closed。
 
+## Typed observation 与实际 CLI
+
+`qrh-release-closure` 是唯一证书闭合入口。每个分类 gate 先由对应现场 observer 写入
+`qrh-closure-gate-observation/v2-managed-inputs`。observation 本身不再携带可自报的 subject、facts、
+observer 或 PASS；它只能索引一个分类 result、四个 exact subject artifact（active pointer、prior
+binding、active/prior manifest）和底层 support artifact。closure 使用
+`validate_active_release`、`validate_local_prior_binding`、`validate_release_manifest` 从实际 bytes
+重建 release/snapshot/state subject，并校验全部路径、schema、canonical bytes、大小、hash、时间和
+输入闭包。result wrapper 的 authority/name/command/cwd/exit code、自哈希或 executable hash 只证明
+“这个 wrapper 自洽”，不能赋予 PASS authority。
+
+每个角色只有在下表所列真实 producer schema 和 replay adapter 已实现且重读底层 receipt/API
+response/指针/manifest/SQLite bundle/测试报告后才可 qualify。当前这些分类 adapter 尚未注册，
+因此 `derive-gate` 明确返回 `non-qualifying`，不会写 gate；`certify-stage5`、`close-visibility` 也不能
+签发。这是有意的 fail-closed 状态，不得用 dummy artifact、旧 observation 或 managed wrapper
+补齐正向测试。
+
+| gate role | 唯一待实现的真实 producer schema | 必须重放的 verifier |
+|---|---|---|
+| `full_replay_and_comment_lifecycle` | `qrh-stage5-browser-sqlite-comment-replay-receipt/v1` | 浏览器、SQLite、source inventory 与 comment relocation |
+| `failure_and_incremental_matrix` | `qrh-stage5-failure-incremental-machine-report/v1` | failure/incremental matrix machine report |
+| `web_search_mcp_snapshot_consistency` | `qrh-stage5-web-search-mcp-snapshot-replay-receipt/v1` | snapshot/continuation replay 加真实 MCP campaign |
+| `independent_verification` | `qrh-stage5-independent-dispatch-verification-receipt/v1` | 独立 dispatch ledger 与 exact input closure |
+| `shared_state_schema_compatibility` | `qrh-stage5-shared-state-compatibility-replay-receipt/v1` | candidate/prior SQLite read/write/CAS/event |
+| `active_prior_active_drill` | `qrh-stage5-active-prior-active-vm-drill-receipt/v1` | activation/rollback receipts 与 VM read/write-set |
+| `retention_closure` | `qrh-stage5-retention-filesystem-audit-receipt/v1` | active/prior/incoming/object filesystem audit |
+| `runbook_drills_and_quality_report` | `qrh-stage5-runbook-drill-quality-receipt/v1` | runbook bytes、drill receipts 与 quality report |
+| `revocation_surface` | `qrh-stage5-revocation-machine-audit-receipt/v1` | source/wheel/config/schema/task/write-set audit |
+| `identity_graph_negative_fixtures` | `qrh-stage5-identity-graph-fixture-report/v1` | identity graph positive/negative fixture replay |
+| `repository_private_observation` | `qrh-stage6-github-repository-api-capture/v1` | authenticated GitHub repository response |
+| `private_controls_revalidation` | `qrh-stage6-github-controls-api-capture/v1` | authenticated plan/Actions/protection/permission responses |
+| `private_exact_sha_ci` | `qrh-stage6-github-exact-sha-ci-api-capture/v1` | authenticated workflow/check-run exact SHA response |
+| `private_candidate_only` | `qrh-stage6-private-candidate-machine-receipt/v1` | candidate receipt 与 zero production switch |
+| `production_identity_unchanged` | `qrh-stage6-production-identity-capture/v1` | before/after active/binding/state exact bytes |
+
+`web_search_mcp_snapshot_consistency` 还有额外硬门禁：facts 必须给出 evidence root 内的
+`mcp_acceptance_evidence_root`，observation 必须托管其 exact `campaign-receipt.json`。closure 会
+调用 `validate_real_acceptance_evidence_root(Path)` 重载 preregistration、config、prompt、两臂
+dispatch intent/raw JSONL/completion 并重放 campaign；Stage 5 只接受未来可信 producer 签发的
+`AUTHORITATIVE_REAL_CODEX_INTEGRATED_GATE`、`status=PASS` 和受信两臂。当前 verifier 对所有
+`REAL_CODEX_EXEC` 磁盘回放固定返回 `REAL_CODEX_EVIDENCE_REPLAY_NON_AUTHORITATIVE`，因此即使功能
+PASS 也必被 closure 拒绝。`PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`、fake/mixed runner、只复制 PASS
+字段或 receipt SHA 不符同样都会阻止 Stage 5 certificate。当前还没有可信 attestation producer；在
+`qrh-stage5-web-search-mcp-snapshot-replay-receipt/v1` adapter 缺失时，不能单独把整个 snapshot
+consistency role 提升为 PASS。
+
+```powershell
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage5/retention_closure.json `
+  --output gates/stage5/retention_closure.json
+
+qrh-release-closure certify-stage5 `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --gate gates/stage5/full_replay_and_comment_lifecycle.json `
+  --gate gates/stage5/failure_and_incremental_matrix.json `
+  --gate gates/stage5/web_search_mcp_snapshot_consistency.json `
+  --gate gates/stage5/independent_verification.json `
+  --gate gates/stage5/shared_state_schema_compatibility.json `
+  --gate gates/stage5/active_prior_active_drill.json `
+  --gate gates/stage5/retention_closure.json `
+  --gate gates/stage5/runbook_drills_and_quality_report.json `
+  --gate gates/stage5/revocation_surface.json `
+  --gate gates/stage5/identity_graph_negative_fixtures.json `
+  --output certificates/stage5.json
+
+qrh-release-closure verify-stage5 `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --certificate certificates/stage5.json
+
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage6/repository_private_observation.json `
+  --output gates/stage6/repository_private_observation.json
+
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage6/private_controls_revalidation.json `
+  --output gates/stage6/private_controls_revalidation.json
+
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage6/private_exact_sha_ci.json `
+  --output gates/stage6/private_exact_sha_ci.json
+
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage6/private_candidate_only.json `
+  --output gates/stage6/private_candidate_only.json
+
+qrh-release-closure derive-gate `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --observation observations/stage6/production_identity_unchanged.json `
+  --output gates/stage6/production_identity_unchanged.json
+
+qrh-release-closure close-visibility `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --stage5-certificate certificates/stage5.json `
+  --gate gates/stage6/repository_private_observation.json `
+  --gate gates/stage6/private_controls_revalidation.json `
+  --gate gates/stage6/private_exact_sha_ci.json `
+  --gate gates/stage6/private_candidate_only.json `
+  --gate gates/stage6/production_identity_unchanged.json `
+  --output receipts/visibility.json
+
+qrh-release-closure verify-visibility `
+  --evidence-root D:\quant\quant_platform\audit\release-closure `
+  --receipt receipts/visibility.json
+```
+
+输出父目录必须预先存在，所有 gate、certificate 与 visibility receipt 都是 create-only canonical
+JSON。schema 分别位于 `config/release_closure_gate_observation.schema.json`、
+`config/release_closure_gate_evidence.schema.json`、`config/stage5_release_certificate.schema.json`
+和 `config/visibility_closure_receipt.schema.json`。这套 CLI 只闭合既有现场证据，不执行浏览器
+回放、切换 release、修改 GitHub visibility 或启动/停止 VM 服务。CLI 会机械拒绝 exact
+`D:\quant\quant_platform` 之外的 evidence root；示例只有在对应真实 adapter 已实现并取得现场
+artifact 后才会成功，当前运行得到 `non-qualifying` 是预期结果。
+
+tracked JSON Schema 已约束 observation 的 role→result schema、gate 的 role→exact assertions，
+以及 certificate/visibility evidence 的角色顺序；它们仍只是结构合同，不是 qualifying verifier。
+即使一个文档通过 JSON Schema，也必须继续通过 runtime 的 canonical byte、subject、artifact closure
+和真实分类 adapter 重放，才能获得 PASS。
+
 ## 当前实现与现场签发边界
 
 - 本地 release identity、v2 `candidate_only`、普通 failure recovery、R0 bootstrap、R0→R1
@@ -90,10 +213,13 @@
   replace、candidate probe 和 transient cleanup 只通过固定父目录相对操作；产品 controller、
   persistence、Windows runtime 均为 live provenance + slots 对象，不能通过实例 method shadow、
   test hook、环境或 alias 注入绕过固定生产调用图。
-- 新 `quant_hub.ops.release_closure` producer/verifier 已实现：Stage 5 强制消费十类 canonical
-  gate evidence，Stage 6 强制消费 Stage 5 certificate 与五类 Private 复验证据；两者都会重读
-  artifact、复算 hash、核对 subject/time/producer/assertions，并以 create-only canonical 文件
-  输出。实现存在不等于已经放行；只有 active/prior、writer handoff、现场 D-root 和功能证据
-  真实闭合后才能签发，当前不得预造 PASS。
-- 已建立的生产 VM 连接只用于只读盘点。未获 VM 写入放行前，不启动/停止服务，不切
-  pointer/binding/writer，不清理 release/state，不改变 GitHub visibility。
+- 新 `quant_hub.ops.release_closure` 已实现 CLI、create-only/canonical/path/hash/time/subject 闭包、
+  real MCP campaign replay 和明确的分类 adapter allow-list；真实分类 adapter 当前仍缺失，所以
+  Stage 5/6 生产签发被机械阻断。补齐 adapter 时必须从底层真实 artifact 重算事实，不能把现有
+  managed result parser 或测试 fixture 改成 PASS authority。当前不得预造 PASS，也不得勾选
+  OpenSpec 6.8 或 7.4。
+- 2026-08-31 的已授权 writer handoff 已真实执行：流程在 D service start/bootstrap comments
+  schema pre-expand 处失败，D ingress 未开放；official rollback 随后成功恢复 exact C listener，
+  并已完成该失败 attempt 的收尾。该事实不等于 Stage 5 放行，也不产生 D active/prior certificate；
+  后续重试必须消费这次 official failure/rollback 证据，先关闭 schema pre-expand 缺陷，并继续遵守
+  exact D 写入边界。GitHub visibility 仍不得在 Stage 5 certificate 前改变。

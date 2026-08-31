@@ -18,13 +18,20 @@ from .evaluation import (
     load_codex_tool_trace_bytes,
     record_acceptance_preregistration,
 )
-from .acceptance_runner import FakeArmRun, run_fake_acceptance_arm
+from .acceptance_runner import (
+    FakeArmRun,
+    RealArmRun,
+    record_real_acceptance_inputs,
+    run_fake_acceptance_arm,
+    run_real_acceptance_arm,
+)
 from .service import KnowledgeMCPService
 
 __all__ = [
     "AuthorityIdentity",
     "FileAuthorityProbe",
     "FakeArmRun",
+    "RealArmRun",
     "KnowledgeMCPService",
     "IntegratedAcceptanceReport",
     "MirrorError",
@@ -38,5 +45,7 @@ __all__ = [
     "evaluate_tool_choice",
     "load_codex_tool_trace_bytes",
     "record_acceptance_preregistration",
+    "record_real_acceptance_inputs",
     "run_fake_acceptance_arm",
+    "run_real_acceptance_arm",
 ]

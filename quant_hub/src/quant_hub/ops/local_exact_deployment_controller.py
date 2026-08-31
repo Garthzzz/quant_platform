@@ -757,6 +757,20 @@ class ProductionExactDeploymentController:
                     else list(prior_versions["write"])
                 ),
             )
+            if (
+                runtime_operation == "bootstrap_first_pair"
+                and database == "comments"
+            ):
+                expand_authorization = (
+                    self._persistence.lock_bootstrap_comment_schema_expand_authorization(
+                        lock,
+                        workspace,
+                    )
+                )
+                runtime.expand_bootstrap_comment_schema(
+                    authorization=expand_authorization,
+                    compatibility_manifest=compatibility,
+                )
             seal = runtime.seal_database(
                 attempt_id=workspace.attempt_id,
                 nonce=workspace.nonce,

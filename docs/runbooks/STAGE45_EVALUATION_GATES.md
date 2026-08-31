@@ -110,12 +110,37 @@ bundle，完成 artifact、source receipt、presentation、ordered rows 与 docu
 三者完全一致，该次验证才成功；入口 hash 返回后、verifier 返回前发生的变化也会 fail closed。
 compare 的 Round4 前后双端验证继续保留，因此内部与外部两个时间窗口均须满足一致性合同。
 
-## MCP fake-only 验收回放
+## MCP fake 与真实 Codex 验收回放
 
 公开测试先调用 `record_acceptance_preregistration` 原子登记 v2-bound prereg，再用
 `run_fake_acceptance_arm` 写入不可覆盖的 dispatch intent，执行纯内存 fake transport，最后写入
 trace-bound completion。runner 固定标记 `FAKE_ONLY_REAL_CODEX_DISABLED`；它不能启动真实 Codex、
-网络或 secret。
+网络或 secret。该路径只验证公开门禁，authority 固定降为
+`PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`。
+
+真实执行与功能回放使用 `qrh-mcp-acceptance preregister/run/verify`。preregister 在运行前以
+create-only staging directory 固化 preregistration ledger、逐 case prompt 和
+`qrh-mcp-real-codex-launch/v2-process-provenance` launch config，复验 closed inventory 后才
+write-through 提交。launch config 同时冻结：OpenAI Authenticode 为 `Valid` 的原生
+`codex.exe`；目标 MCP 的完整 STDIO command/args/cwd/env/env_vars/enabled/required/tools/timeouts；
+native MCP launcher、实际 Python、client config、`quant_hub` package 与 distribution 的完整
+散列 inventory；以及 `execution_scope/evidence_parent`。生产证据父目录只允许位于
+`D:\quant\quant_platform\audit` 内，新 evidence root 必须不存在且不得含 reparse component。
+
+run 固定使用 `shell=False` 和
+`--ignore-user-config --ignore-rules --strict-config --ephemeral --json`。两臂完整 argv 只能在
+目标 `enabled=true/false` 上不同，`required=true` 始终保留；同一 signed Codex 的 app-server
+`config/read(includeLayers=true,cwd=...)` 会重放真实配置栈，只忽略 user layer，任何 active
+packaged/system/enterprise/project/legacy-managed layer 提供 MCP/app/plugin 时直接拒绝，并冻结
+层 version/config hash。Windows runner 在 campaign 全程持有所有
+冻结 runtime 文件的 no-share-write/delete handle，每臂前/中/后重算闭包，查询真实 Codex
+process image；assisted 必须观测目标 native launcher 与 Python 子进程，no-MCP 两者均不得出现。
+stdout/stderr 均为硬上限流式读取；超限、顶层 `error`、非 MCP command/file/web 污染、进程或
+文件身份漂移全部 fail closed。失败只写 non-qualifying `campaign-failure.json`。verify 对 exact
+inventory、intent/raw JSONL/completion 和 v3 receipt 全量重放；fake/real 混用也属于
+non-qualifying。即使两臂全为 `REAL_CODEX_EXEC`、provenance 重放与完整 gate 都 PASS，磁盘
+authority 仍固定为 `REAL_CODEX_EVIDENCE_REPLAY_NON_AUTHORITATIVE`。`verify` 只验证该功能回放，
+不能为 Stage 5 签发权威资格。
 
 raw trace 使用独立 `agent_message_seen`/count 状态，不再用 final text 的真值充当状态机。
 每条 trace 必须恰有一条非空 completed agent message；该消息完成时不能还有其他 open item，
@@ -124,12 +149,13 @@ item 均 fail closed。
 
 最终 `evaluate_preregistered_acceptance` 与 `validate_acceptance_campaign_receipt_bytes` 都必须消费
 prereg ledger、exact config、逐 case exact prompt、两臂 raw JSONL 和 dispatch ledger。validator
-重新运行完整 gate 后要求 receipt byte-for-byte 相等；receipt 冻结逐 case trace status、三维
-score/gain 与 findings。assisted final response 必须是 closed canonical JSON，decision、conditions、
-limitations 每项 claim 都绑定 get 返回的完整
+重新运行完整 gate 后要求 receipt byte-for-byte 相等；v3 dispatch-replay receipt 冻结逐 case
+trace status、runner、三维 score/gain 与 findings。assisted final response 必须是 closed
+canonical JSON，decision、conditions、limitations 每项 claim 都绑定 get 返回的完整
 `object_id/document_version_id/source_sha256/span_id/byte_start/byte_end/citation_id` tuple；跨 locator
-拼接和自由文本 token/marker 堆叠均不得通过。真实 Codex runner 仍 disabled，因此公开 fake PASS
-不是 5.13/5.14 的真实资格证据。
+拼接和自由文本 token/marker 堆叠均不得通过。公开 fake PASS 与全新真实 campaign receipt 都不是
+5.13/5.14 的权威资格证据；当前还缺独立可信执行 attestation/countersignature，必须闭合运行身份、
+隔离运行时、完整进程树与证据时序后，才能新增可供 Stage 5 接受的权威 producer。
 
 ## 资格边界
 

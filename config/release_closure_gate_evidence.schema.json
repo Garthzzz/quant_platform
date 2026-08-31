@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://quant-research-hub.local/schemas/release_closure_gate_evidence.schema.json",
+  "title": "Quant Research Hub derived closure gate evidence v2 managed inputs",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "evidence_id", "gate_role", "subject", "verdict", "assertions", "observed_at", "producer", "artifacts", "evidence_sha256"],
+  "properties": {
+    "schema_version": {"const": "qrh-closure-gate-evidence/v2-managed-inputs"},
+    "evidence_id": {"$ref": "release_closure_gate_observation.schema.json#/$defs/id"},
+    "gate_role": {"$ref": "release_closure_gate_observation.schema.json#/$defs/gate_role"},
+    "subject": {"$ref": "release_closure_gate_observation.schema.json#/$defs/subject"},
+    "verdict": {"const": "pass"},
+    "assertions": {"type": "object", "minProperties": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "producer": {"$ref": "release_closure_gate_observation.schema.json#/$defs/producer"},
+    "artifacts": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 128,
+      "items": {"$ref": "release_closure_gate_observation.schema.json#/$defs/artifact_ref"}
+    },
+    "evidence_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}
+  },
+  "allOf": [
+    {"if": {"properties": {"gate_role": {"const": "full_replay_and_comment_lifecycle"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/full_replay_and_comment_lifecycle"}}}},
+    {"if": {"properties": {"gate_role": {"const": "failure_and_incremental_matrix"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/failure_and_incremental_matrix"}}}},
+    {"if": {"properties": {"gate_role": {"const": "web_search_mcp_snapshot_consistency"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/web_search_mcp_snapshot_consistency"}}}},
+    {"if": {"properties": {"gate_role": {"const": "independent_verification"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/independent_verification"}}}},
+    {"if": {"properties": {"gate_role": {"const": "shared_state_schema_compatibility"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/shared_state_schema_compatibility"}}}},
+    {"if": {"properties": {"gate_role": {"const": "active_prior_active_drill"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/active_prior_active_drill"}}}},
+    {"if": {"properties": {"gate_role": {"const": "retention_closure"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/retention_closure"}}}},
+    {"if": {"properties": {"gate_role": {"const": "runbook_drills_and_quality_report"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/runbook_drills_and_quality_report"}}}},
+    {"if": {"properties": {"gate_role": {"const": "revocation_surface"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/revocation_surface"}}}},
+    {"if": {"properties": {"gate_role": {"const": "identity_graph_negative_fixtures"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/identity_graph_negative_fixtures"}}}},
+    {"if": {"properties": {"gate_role": {"const": "repository_private_observation"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/repository_private_observation"}}}},
+    {"if": {"properties": {"gate_role": {"const": "private_controls_revalidation"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/private_controls_revalidation"}}}},
+    {"if": {"properties": {"gate_role": {"const": "private_exact_sha_ci"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/private_exact_sha_ci"}}}},
+    {"if": {"properties": {"gate_role": {"const": "private_candidate_only"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/private_candidate_only"}}}},
+    {"if": {"properties": {"gate_role": {"const": "production_identity_unchanged"}}, "required": ["gate_role"]}, "then": {"properties": {"assertions": {"$ref": "#/$defs/production_identity_unchanged"}}}}
+  ],
+  "$defs": {
+    "full_replay_and_comment_lifecycle": {"type": "object", "additionalProperties": false, "required": ["browser_result", "sqlite_result", "source_bytes_unchanged", "wrong_comment_attachments"], "properties": {"browser_result": {"const": "pass"}, "sqlite_result": {"const": "pass"}, "source_bytes_unchanged": {"const": true}, "wrong_comment_attachments": {"const": 0}}},
+    "failure_and_incremental_matrix": {"type": "object", "additionalProperties": false, "required": ["failure_matrix_result", "silent_failures"], "properties": {"failure_matrix_result": {"const": "pass"}, "silent_failures": {"const": 0}}},
+    "web_search_mcp_snapshot_consistency": {"type": "object", "additionalProperties": false, "required": ["snapshot_consistency_result", "stale_current_returns", "mcp_acceptance_status", "mcp_acceptance_authority"], "properties": {"snapshot_consistency_result": {"const": "pass"}, "stale_current_returns": {"const": 0}, "mcp_acceptance_status": {"const": "PASS"}, "mcp_acceptance_authority": {"const": "AUTHORITATIVE_REAL_CODEX_INTEGRATED_GATE"}}},
+    "independent_verification": {"type": "object", "additionalProperties": false, "required": ["independent_verdict", "executor_summary_only"], "properties": {"independent_verdict": {"const": "pass"}, "executor_summary_only": {"const": false}}},
+    "shared_state_schema_compatibility": {"type": "object", "additionalProperties": false, "required": ["candidate_read_write", "prior_read_write", "state_replaced", "down_migration_performed"], "properties": {"candidate_read_write": {"const": "pass"}, "prior_read_write": {"const": "pass"}, "state_replaced": {"const": false}, "down_migration_performed": {"const": false}}},
+    "active_prior_active_drill": {"type": "object", "additionalProperties": false, "required": ["sequence_result", "state_identity_unchanged", "legacy_c_writer_restarted", "outside_exact_d_project_reads"], "properties": {"sequence_result": {"const": "pass"}, "state_identity_unchanged": {"const": true}, "legacy_c_writer_restarted": {"const": false}, "outside_exact_d_project_reads": {"const": 0}}},
+    "retention_closure": {"type": "object", "additionalProperties": false, "required": ["retention_result", "retained_release_count", "active_count", "prior_count", "terminal_candidates", "completed_incoming"], "properties": {"retention_result": {"const": "pass"}, "retained_release_count": {"const": 2}, "active_count": {"const": 1}, "prior_count": {"const": 1}, "terminal_candidates": {"const": 0}, "completed_incoming": {"const": 0}}},
+    "runbook_drills_and_quality_report": {"type": "object", "additionalProperties": false, "required": ["runbook_result", "drill_result", "quality_report_result"], "properties": {"runbook_result": {"const": "pass"}, "drill_result": {"const": "pass"}, "quality_report_result": {"const": "pass"}}},
+    "revocation_surface": {"type": "object", "additionalProperties": false, "required": ["revocation_surface_result", "periodic_state_copy_tasks", "outside_d_project_storage", "legacy_protection_exports"], "properties": {"revocation_surface_result": {"const": "pass"}, "periodic_state_copy_tasks": {"const": 0}, "outside_d_project_storage": {"const": 0}, "legacy_protection_exports": {"const": 0}}},
+    "identity_graph_negative_fixtures": {"type": "object", "additionalProperties": false, "required": ["schema_graph_hash_result", "negative_fixtures_rejected"], "properties": {"schema_graph_hash_result": {"const": "pass"}, "negative_fixtures_rejected": {"const": true}}},
+    "repository_private_observation": {"type": "object", "additionalProperties": false, "required": ["repository_visibility", "visibility_changed_at"], "properties": {"repository_visibility": {"const": "private"}, "visibility_changed_at": {"type": "string", "format": "date-time"}}},
+    "private_controls_revalidation": {"type": "object", "additionalProperties": false, "required": ["repository_visibility", "actual_plan", "actions", "branch_protection", "environment_protection", "publish_minimum_permissions", "exact_sha_candidate_capability"], "properties": {"repository_visibility": {"const": "private"}, "actual_plan": {"const": "pass"}, "actions": {"const": "pass"}, "branch_protection": {"const": "pass"}, "environment_protection": {"const": "pass"}, "publish_minimum_permissions": {"const": "pass"}, "exact_sha_candidate_capability": {"const": "pass"}}},
+    "private_exact_sha_ci": {"type": "object", "additionalProperties": false, "required": ["repository_visibility", "commit_sha", "ci_conclusion"], "properties": {"repository_visibility": {"const": "private"}, "commit_sha": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}, "ci_conclusion": {"const": "success"}}},
+    "private_candidate_only": {"type": "object", "additionalProperties": false, "required": ["repository_visibility", "mode", "production_switch", "candidate_result", "commit_sha", "candidate_release_id", "candidate_manifest_sha256"], "properties": {"repository_visibility": {"const": "private"}, "mode": {"const": "candidate_only"}, "production_switch": {"const": "not_performed"}, "candidate_result": {"const": "pass"}, "commit_sha": {"type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}, "candidate_release_id": {"$ref": "release_closure_gate_observation.schema.json#/$defs/id"}, "candidate_manifest_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}}},
+    "production_identity_unchanged": {"type": "object", "additionalProperties": false, "required": ["repository_visibility", "active_pointer_before_sha256", "active_pointer_after_sha256", "binding_before_sha256", "binding_after_sha256", "state_before_sha256", "state_after_sha256"], "properties": {"repository_visibility": {"const": "private"}, "active_pointer_before_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}, "active_pointer_after_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}, "binding_before_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}, "binding_after_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}, "state_before_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}, "state_after_sha256": {"$ref": "release_closure_gate_observation.schema.json#/$defs/sha256"}}}
+  }
+}

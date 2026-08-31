@@ -21,7 +21,9 @@ from urllib.parse import quote
 from .local_deployment_persistence import (
     CrashReleasedFileLock,
     LocalDeploymentPersistence,
+    LocalDeploymentPersistenceError,
     LockedAttemptWorkspace,
+    LockedBootstrapCommentSchemaExpandAuthorization,
     PRODUCTION_VM_ROOT_TEXT,
 )
 from .local_release_identity import canonical_bytes, identity_sha256
@@ -92,6 +94,9 @@ _BUSINESS_TABLES = {
         "research_workspace_sync_run",
     ),
 }
+_LEGACY_COMMENT_BUSINESS_TABLES = tuple(
+    table for table in _BUSINESS_TABLES["comments"] if table != "comment_target"
+)
 
 
 class LocalDeploymentRuntimeError(RuntimeError):
@@ -452,6 +457,310 @@ def _observe_file(path: Path, *, allow_posix_test_only: bool) -> _FileObservatio
                 raise LocalDeploymentRuntimeError("SQLite observation descriptor 关闭失败") from error
 
 
+class _MutableSqliteIdentityGuardSet:
+    """Pin mutable SQLite members against path replacement for one transaction.
+
+    Windows handles share read/write but deliberately do not share delete, so a
+    pathname cannot be renamed or replaced while SQLite mutates it.  POSIX is
+    test-only here; held descriptors plus repeated ``lstat``/``database_list``
+    identity checks make deterministic replacement fail before commit.
+    """
+
+    __slots__ = (
+        "_paths",
+        "_allow_posix_test_only",
+        "_windows_handles",
+        "_posix_descriptors",
+        "_initial_metadata",
+        "_initial_file_hashes",
+        "_posix_connection_fd_baseline",
+    )
+
+    def __init__(self, paths: list[Path], *, allow_posix_test_only: bool):
+        self._paths = list(paths)
+        self._allow_posix_test_only = allow_posix_test_only
+        self._windows_handles: dict[Path, int] = {}
+        self._posix_descriptors: dict[Path, int] = {}
+        self._initial_metadata: dict[Path, os.stat_result] = {}
+        self._initial_file_hashes: dict[Path, str] = {}
+        self._posix_connection_fd_baseline: set[int] | None = None
+
+    def __enter__(self) -> "_MutableSqliteIdentityGuardSet":
+        try:
+            if os.name == "nt":
+                import ctypes
+                from ctypes import wintypes
+
+                generic_read = 0x80000000
+                file_share_read = 0x00000001
+                file_share_write = 0x00000002
+                open_existing = 3
+                open_reparse = 0x00200000
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                create_file = kernel32.CreateFileW
+                create_file.argtypes = [
+                    wintypes.LPCWSTR,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    ctypes.c_void_p,
+                    wintypes.DWORD,
+                    wintypes.DWORD,
+                    wintypes.HANDLE,
+                ]
+                create_file.restype = wintypes.HANDLE
+                invalid = ctypes.c_void_p(-1).value
+                for path in self._paths:
+                    initial = _validate_component(path, directory=False)
+                    handle = create_file(
+                        str(path),
+                        generic_read,
+                        file_share_read | file_share_write,
+                        None,
+                        open_existing,
+                        open_reparse,
+                        None,
+                    )
+                    handle_value = int(handle)
+                    if handle_value == invalid:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    self._windows_handles[path] = handle_value
+                    _volume_hash, file_hash = _windows_raw_handle_observation(
+                        handle_value,
+                        path,
+                    )
+                    confirmed = _validate_component(path, directory=False)
+                    if not _same_file(initial, confirmed):
+                        raise LocalDeploymentRuntimeError(
+                            "mutable SQLite guard acquisition 身份漂移"
+                        )
+                    self._initial_metadata[path] = confirmed
+                    self._initial_file_hashes[path] = file_hash
+            elif self._allow_posix_test_only:
+                flags = (
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                for path in self._paths:
+                    descriptor = os.open(path, flags)
+                    self._posix_descriptors[path] = descriptor
+                    pinned = os.fstat(descriptor)
+                    current = _validate_component(path, directory=False)
+                    if not _same_file(pinned, current):
+                        raise LocalDeploymentRuntimeError(
+                            "mutable SQLite test guard acquisition 身份漂移"
+                        )
+                    self._initial_metadata[path] = pinned
+            else:
+                raise LocalDeploymentRuntimeError(
+                    "mutable SQLite identity guard 产品路径只允许 Windows"
+                )
+            self.assert_paths_unchanged()
+            return self
+        except BaseException as error:
+            try:
+                self.__exit__(None, None, None)
+            except BaseException as close_error:
+                raise LocalDeploymentRuntimeError(
+                    "mutable SQLite identity guard acquisition/cleanup 未闭合"
+                ) from close_error
+            if isinstance(error, LocalDeploymentRuntimeError):
+                raise
+            raise LocalDeploymentRuntimeError(
+                "mutable SQLite identity guard acquisition 失败"
+            ) from error
+
+    def assert_paths_unchanged(self) -> None:
+        for path in self._paths:
+            current = _validate_component(path, directory=False)
+            initial = self._initial_metadata[path]
+            if os.name == "nt":
+                handle = self._windows_handles[path]
+                _volume_hash, file_hash = _windows_raw_handle_observation(handle, path)
+                if (
+                    file_hash != self._initial_file_hashes[path]
+                    or not _same_file(initial, current)
+                ):
+                    raise LocalDeploymentRuntimeError(
+                        "mutable SQLite Windows file identity 漂移"
+                    )
+            else:
+                pinned = os.fstat(self._posix_descriptors[path])
+                if (
+                    not _same_file(initial, pinned)
+                    or not _same_file(pinned, current)
+                    or not stat.S_ISREG(pinned.st_mode)
+                    or getattr(pinned, "st_nlink", 1) != 1
+                ):
+                    raise LocalDeploymentRuntimeError(
+                        "mutable SQLite test file identity 漂移"
+                    )
+
+    def capture_connection_open_baseline(self) -> None:
+        """Record test-only process FDs immediately before sqlite3_open."""
+
+        if os.name == "nt":
+            return
+        proc_fds = Path("/proc/self/fd")
+        try:
+            names = os.listdir(proc_fds)
+            baseline: set[int] = set()
+            for name in names:
+                if not name.isdecimal():
+                    continue
+                descriptor = int(name)
+                try:
+                    os.fstat(descriptor)
+                except OSError:
+                    continue
+                baseline.add(descriptor)
+            self._posix_connection_fd_baseline = baseline
+        except OSError as error:
+            raise LocalDeploymentRuntimeError(
+                "POSIX test runtime 无法绑定 SQLite connection descriptor"
+            ) from error
+
+    def _assert_posix_connection_main_identity(self, main_path: Path) -> None:
+        if os.name == "nt":
+            return
+        baseline = self._posix_connection_fd_baseline
+        if baseline is None:
+            raise LocalDeploymentRuntimeError(
+                "POSIX test SQLite connection 缺少 pre-open descriptor baseline"
+            )
+        initial = self._initial_metadata[main_path]
+        matches = 0
+        allowed_paths = {
+            os.path.normcase(os.path.abspath(str(main_path))): main_path,
+            os.path.normcase(os.path.abspath(str(main_path) + "-wal")): Path(
+                str(main_path) + "-wal"
+            ),
+            os.path.normcase(os.path.abspath(str(main_path) + "-shm")): Path(
+                str(main_path) + "-shm"
+            ),
+        }
+        try:
+            names = os.listdir("/proc/self/fd")
+        except OSError as error:
+            raise LocalDeploymentRuntimeError(
+                "POSIX test SQLite connection descriptor 不可枚举"
+            ) from error
+        for name in names:
+            if not name.isdecimal() or int(name) in baseline:
+                continue
+            try:
+                metadata = os.fstat(int(name))
+            except OSError:
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                continue
+            try:
+                target_text = os.readlink(f"/proc/self/fd/{name}")
+            except OSError as error:
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection descriptor target 不可解析"
+                ) from error
+            if target_text.endswith(" (deleted)"):
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection 打开了已删除的 regular file identity"
+                )
+            target_key = os.path.normcase(os.path.abspath(target_text))
+            target_path = allowed_paths.get(target_key)
+            if target_path is None:
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection 打开了未钉扎的 regular file identity"
+                )
+            try:
+                current = os.lstat(target_path)
+            except OSError as error:
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection member path 不可闭合"
+                ) from error
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or getattr(current, "st_nlink", 1) != 1
+                or not _same_file(metadata, current)
+            ):
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection member path identity 漂移"
+                )
+            originally_pinned = self._initial_metadata.get(target_path)
+            if originally_pinned is not None and not _same_file(
+                originally_pinned, metadata
+            ):
+                raise LocalDeploymentRuntimeError(
+                    "POSIX test SQLite connection member identity 与 pin 不同"
+                )
+            if target_path == main_path:
+                if not _same_file(initial, metadata):
+                    raise LocalDeploymentRuntimeError(
+                        "POSIX test SQLite connection main identity 与 pin 不同"
+                    )
+                matches += 1
+        if matches < 1:
+            raise LocalDeploymentRuntimeError(
+                "POSIX test SQLite connection 实际 main identity 与 pinned path 不同"
+            )
+
+    def assert_connection_identity(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        main_path: Path,
+    ) -> None:
+        self.assert_paths_unchanged()
+        rows = connection.execute("PRAGMA database_list").fetchall()
+        attached = [row for row in rows if str(row[1]) != "temp"]
+        if len(attached) != 1 or str(attached[0][1]) != "main":
+            raise LocalDeploymentRuntimeError(
+                "mutable SQLite connection 含非合同 attached database"
+            )
+        database_path = str(attached[0][2])
+        try:
+            observed = Path(database_path).resolve(strict=True)
+            expected = main_path.resolve(strict=True)
+        except OSError as error:
+            raise LocalDeploymentRuntimeError(
+                "mutable SQLite database_list path 不可闭合"
+            ) from error
+        if os.path.normcase(str(observed)) != os.path.normcase(str(expected)):
+            raise LocalDeploymentRuntimeError(
+                "mutable SQLite database_list 未绑定 fixed main"
+            )
+        self._assert_posix_connection_main_identity(main_path)
+        self.assert_paths_unchanged()
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type, exc, traceback
+        close_error: BaseException | None = None
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            while self._windows_handles:
+                path, handle = self._windows_handles.popitem()
+                del path
+                if not close_handle(wintypes.HANDLE(handle)) and close_error is None:
+                    close_error = ctypes.WinError(ctypes.get_last_error())
+        else:
+            while self._posix_descriptors:
+                _path, descriptor = self._posix_descriptors.popitem()
+                try:
+                    os.close(descriptor)
+                except OSError as error:
+                    if close_error is None:
+                        close_error = error
+        if close_error is not None:
+            raise LocalDeploymentRuntimeError(
+                "mutable SQLite identity guard 关闭失败"
+            ) from close_error
+
+
 def _schema_sha256(connection: sqlite3.Connection) -> str:
     rows = [
         [None if value is None else str(value) for value in row]
@@ -548,6 +857,17 @@ def _business_summary(connection: sqlite3.Connection, database: str) -> dict[str
     return {**summary_material, "summary_sha256": identity_sha256(summary_material)}
 
 
+def _legacy_comment_business_sha256(connection: sqlite3.Connection) -> str:
+    """Identity of v2 facts which an additive target expansion must preserve."""
+
+    return identity_sha256(
+        [
+            _table_digest(connection, table)
+            for table in _LEGACY_COMMENT_BUSINESS_TABLES
+        ]
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ConnectionInspection:
     raw_user_version: int
@@ -573,18 +893,28 @@ def _inspect_connection(
         raise LocalDeploymentRuntimeError("SQLite integrity/quick/FK 检查失败")
     raw_user_version = _count(connection, "PRAGMA user_version")
     if database == "comments":
-        store_markers = [
-            int(row[0])
-            for row in connection.execute(
-                "SELECT version FROM comment_store_schema ORDER BY version"
+        try:
+            from quant_hub.collaboration.comment_store import (
+                _require_approved_comment_target_schema,
             )
-        ]
-        target_markers = [
-            int(row[0])
-            for row in connection.execute(
-                "SELECT version FROM comment_target_schema ORDER BY version"
-            )
-        ]
+
+            _require_approved_comment_target_schema(connection)
+            store_markers = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_store_schema ORDER BY version"
+                )
+            ]
+            target_markers = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_target_schema ORDER BY version"
+                )
+            ]
+        except (RuntimeError, sqlite3.DatabaseError) as error:
+            raise LocalDeploymentRuntimeError(
+                "comments logical marker/DDL 缺失、漂移或不可读"
+            ) from error
         if store_markers != [1, 2] or target_markers != [3]:
             raise LocalDeploymentRuntimeError("comments logical marker 不是 v2+[3]")
         logical_schema = {
@@ -938,6 +1268,186 @@ class _RuntimeCore:
             capture_backup=False,
         )
         return seal
+
+    def expand_bootstrap_comment_schema(
+        self,
+        *,
+        authorization: LockedBootstrapCommentSchemaExpandAuthorization,
+        compatibility_manifest: SqliteCompatibilityManifest,
+    ) -> Mapping[str, object]:
+        """Expand exact legacy comments v2 only during first-pair bootstrap.
+
+        The normal seal path remains strictly read-only and therefore keeps
+        ordinary activation/rollback fail-closed on a legacy or partial
+        schema.  Writer handoff owns recovery of the complete D state if a
+        later bootstrap phase fails.
+        """
+
+        # Authorization is checked before resolving or opening the fixed state
+        # path.  A direct call, None/fake object, released lock/workspace, or
+        # missing/drifted journal therefore cannot touch SQLite.
+        if type(authorization) is not LockedBootstrapCommentSchemaExpandAuthorization:
+            raise LocalDeploymentRuntimeError(
+                "bootstrap comments expand 缺少 exact locked authorization"
+            )
+        try:
+            latest = authorization._assert_live()
+        except LocalDeploymentPersistenceError as error:
+            raise LocalDeploymentRuntimeError(
+                "bootstrap comments expand locked authorization 已失效"
+            ) from error
+        attempt_id = str(latest["attempt"])
+        nonce = str(latest["nonce"])
+        operation = str(latest["operation"])
+        database_name = "comments"
+        state_identity_sha256 = str(
+            latest["state_plan"]["state_identity_sha256"]
+        )
+        compatibility = compatibility_manifest.as_dict()
+        logical, expected_ledger = self._schema_contract(database_name)
+        expected_contract = identity_sha256(
+            {"logical_schema": logical, "migration_ledger": expected_ledger}
+        )
+        candidate_compatibility = compatibility["candidate_compatibility"]
+        if (
+            compatibility["operation"] != operation
+            or compatibility["database_name"] != database_name
+            or compatibility["schema_contract_sha256"] != expected_contract
+            or compatibility["prior_compatibility"] != {"status": "absent"}
+            or candidate_compatibility["release_id"]
+            != latest["candidate"]["release_id"]
+            or candidate_compatibility["release_manifest_sha256"]
+            != latest["candidate"]["manifest_sha256"]
+        ):
+            raise LocalDeploymentRuntimeError(
+                "bootstrap comments compatibility contract 不闭合"
+            )
+
+        path = self._database_path(database_name)
+        sidecars = {
+            role: Path(str(path) + suffix)
+            for role, suffix in (("main", ""), ("wal", "-wal"), ("shm", "-shm"))
+        }
+        journal = Path(str(path) + "-journal")
+        if os.path.lexists(journal):
+            raise LocalDeploymentRuntimeError(
+                "bootstrap comments expand 不接受 rollback journal"
+            )
+        present = {role: os.path.lexists(member) for role, member in sidecars.items()}
+        if not present["main"] or present["wal"] != present["shm"]:
+            raise LocalDeploymentRuntimeError(
+                "bootstrap comments expand 要求完整 main 或 WAL triplet"
+            )
+        guarded_paths = [
+            member for role, member in sidecars.items() if present[role]
+        ]
+        with _MutableSqliteIdentityGuardSet(
+            guarded_paths,
+            allow_posix_test_only=self._allow_posix_test_only,
+        ) as identity_guard:
+            for member in guarded_paths:
+                _observe_file(
+                    member,
+                    allow_posix_test_only=self._allow_posix_test_only,
+                )
+
+            try:
+                identity_guard.capture_connection_open_baseline()
+                encoded = quote(path.as_posix(), safe="/:")
+                connection = sqlite3.connect(
+                    f"file:{encoded}?mode=rw",
+                    uri=True,
+                    timeout=10.0,
+                    isolation_level=None,
+                )
+            except (OSError, sqlite3.DatabaseError) as error:
+                raise LocalDeploymentRuntimeError(
+                    "bootstrap comments mutable SQLite open 失败"
+                ) from error
+            connection.row_factory = sqlite3.Row
+            try:
+                connection.execute("PRAGMA foreign_keys=ON")
+                identity_guard.assert_connection_identity(
+                    connection,
+                    main_path=path,
+                )
+                store_markers = [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM comment_store_schema ORDER BY version"
+                    )
+                ]
+                if store_markers != [1, 2]:
+                    raise LocalDeploymentRuntimeError(
+                        "bootstrap comments source 不是 exact legacy/core v2"
+                    )
+                core_before = _legacy_comment_business_sha256(connection)
+                from quant_hub.collaboration.comment_store import (
+                    expand_legacy_comment_target_schema,
+                )
+
+                try:
+                    backfilled = expand_legacy_comment_target_schema(connection)
+                except (RuntimeError, sqlite3.DatabaseError) as error:
+                    raise LocalDeploymentRuntimeError(
+                        "bootstrap comments v2→v2+[3] 原子扩展失败"
+                    ) from error
+                inspection = _inspect_connection(
+                    connection,
+                    database=database_name,
+                    expected_migration_ledger=expected_ledger,
+                )
+                core_after = _legacy_comment_business_sha256(connection)
+                if core_after != core_before:
+                    raise LocalDeploymentRuntimeError(
+                        "bootstrap comments expand 改变了 v2 current/event facts"
+                    )
+                try:
+                    authorization._assert_live()
+                except LocalDeploymentPersistenceError as error:
+                    raise LocalDeploymentRuntimeError(
+                        "bootstrap comments expand commit 前 authorization 已失效"
+                    ) from error
+                identity_guard.assert_connection_identity(
+                    connection,
+                    main_path=path,
+                )
+                if connection.in_transaction:
+                    connection.commit()
+                identity_guard.assert_connection_identity(
+                    connection,
+                    main_path=path,
+                )
+            finally:
+                connection.close()
+
+            identity_guard.assert_paths_unchanged()
+            if os.path.lexists(journal):
+                raise LocalDeploymentRuntimeError(
+                    "bootstrap comments expand 遗留 rollback journal"
+                )
+            after_present = {
+                role: os.path.lexists(member) for role, member in sidecars.items()
+            }
+            if (
+                not after_present["main"]
+                or after_present["wal"] != after_present["shm"]
+                or after_present != present
+            ):
+                raise LocalDeploymentRuntimeError(
+                    "bootstrap comments expand 终态 SQLite member 不闭合"
+                )
+        return {
+            "attempt_id": attempt_id,
+            "nonce": nonce,
+            "operation": operation,
+            "database_name": database_name,
+            "state_identity_sha256": state_identity_sha256,
+            "logical_schema": inspection.logical_schema,
+            "backfilled_comment_targets": backfilled,
+            "legacy_business_sha256": core_after,
+            "status": "expanded_or_already_current",
+        }
 
     def create_isolated_copy(
         self,
@@ -1612,6 +2122,9 @@ class ProductionWindowsDeploymentRuntime:
     def seal_database(self, **kwargs: object) -> StateDatabaseSeal:
         return self._core.seal_database(**kwargs)  # type: ignore[arg-type]
 
+    def expand_bootstrap_comment_schema(self, **kwargs: object) -> Mapping[str, object]:
+        return self._core.expand_bootstrap_comment_schema(**kwargs)  # type: ignore[arg-type]
+
     def create_isolated_copy(self, **kwargs: object) -> IsolatedCopyResult:
         return self._core.create_isolated_copy(**kwargs)  # type: ignore[arg-type]
 
@@ -1662,6 +2175,9 @@ class TestOnlyWindowsDeploymentRuntimeAdapter:
 
     def seal_database(self, **kwargs: object) -> StateDatabaseSeal:
         return self._core.seal_database(**kwargs)  # type: ignore[arg-type]
+
+    def expand_bootstrap_comment_schema(self, **kwargs: object) -> Mapping[str, object]:
+        return self._core.expand_bootstrap_comment_schema(**kwargs)  # type: ignore[arg-type]
 
     def create_isolated_copy(self, **kwargs: object) -> IsolatedCopyResult:
         return self._core.create_isolated_copy(**kwargs)  # type: ignore[arg-type]

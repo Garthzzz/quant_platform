@@ -14,6 +14,19 @@ import unicodedata
 
 from quant_hub.knowledge.contracts import canonical_json
 
+from .acceptance_contracts import (
+    PUBLIC_SYNTHETIC_ACCEPTANCE_AUTHORITY,
+    REAL_CODEX_EVIDENCE_REPLAY_AUTHORITY,
+    REAL_CODEX_RUNNER,
+    build_real_codex_command,
+    build_real_request_material,
+    observe_static_provenance,
+    real_dispatch_paths,
+    stable_read_file,
+    validate_mcp_process_observation,
+    validate_process_observation,
+    validate_real_codex_launch_config_bytes,
+)
 from .mirror import AuthorityIdentity
 
 
@@ -29,7 +42,7 @@ READ_TOOLS = {
 }
 CODEX_TRACE_MAX_BYTES = 32 * 1024 * 1024
 ACCEPTANCE_PREREGISTRATION_SCHEMA = "qrh-mcp-acceptance-preregistration/v2-bound"
-ACCEPTANCE_CAMPAIGN_RECEIPT_SCHEMA = "qrh-mcp-acceptance-campaign-receipt/v2-raw-replay"
+ACCEPTANCE_CAMPAIGN_RECEIPT_SCHEMA = "qrh-mcp-acceptance-campaign-receipt/v3-dispatch-replay"
 MAX_TARGET_CALLS_PER_CASE = 6
 MAX_TARGET_CALLS_PER_CAMPAIGN = 48
 MAX_ACCEPTANCE_CASES = 24
@@ -40,6 +53,17 @@ MAX_ACCEPTANCE_CAMPAIGN_TRACE_BYTES = 256 * 1024 * 1024
 STRUCTURED_ACCEPTANCE_RESPONSE_SCHEMA = "qrh-mcp-structured-acceptance-response/v1"
 ACCEPTANCE_PREREGISTRATION_LEDGER_SCHEMA = "qrh-mcp-preregistration-ledger/v1"
 ACCEPTANCE_FAKE_DISPATCH_SCHEMA = "qrh-mcp-fake-dispatch-receipt/v1"
+ACCEPTANCE_REAL_DISPATCH_SCHEMA = "qrh-mcp-real-codex-dispatch-receipt/v2-process-provenance"
+
+
+def _replay_authority_for_runners(runner_kinds: set[str]) -> str:
+    """Classify replay evidence without ever minting release authority."""
+
+    return (
+        REAL_CODEX_EVIDENCE_REPLAY_AUTHORITY
+        if runner_kinds == {REAL_CODEX_RUNNER}
+        else PUBLIC_SYNTHETIC_ACCEPTANCE_AUTHORITY
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +168,13 @@ def load_codex_tool_trace_bytes(
         row_type = row.get("type")
         if row_type not in {
             "thread.started", "turn.started", "item.started", "item.completed",
-            "item.failed", "turn.completed", "turn.failed",
+            "item.failed", "turn.completed", "turn.failed", "error",
         }:
             raise ValueError(f"Codex trace line {ordinal} has unknown event type")
         if turn_terminal:
             raise ValueError("Codex turn terminal event must be unique and last")
+        if row_type == "error":
+            raise ValueError("Codex trace contains a top-level error event")
         if row_type == "thread.started":
             if position != 0 or thread_started or turn_started:
                 raise ValueError("Codex thread.started state is invalid")
@@ -191,7 +217,10 @@ def load_codex_tool_trace_bytes(
                 raise ValueError("Codex final agent message must be the last item")
             if item_id in active_items or item_id in closed_items:
                 raise ValueError(f"Codex trace line {ordinal} item start is duplicate")
-            if item.get("type") not in {"mcp_tool_call", "agent_message", "reasoning"}:
+            if item.get("type") not in {
+                "mcp_tool_call", "agent_message", "reasoning", "command_execution",
+                "file_change", "web_search", "plan_update",
+            }:
                 raise ValueError(f"Codex trace line {ordinal} item type is unknown")
             if item.get("type") == "mcp_tool_call" and (
                 not isinstance(item.get("server"), str)
@@ -244,9 +273,12 @@ def load_codex_tool_trace_bytes(
             agent_message_seen = True
             final_response = text
             continue
-        if item.get("type") == "reasoning":
+        if item.get("type") in {"reasoning", "plan_update"}:
             if item_failed:
-                failed.append(f"line_{ordinal}:reasoning:failed")
+                failed.append(f"line_{ordinal}:{item.get('type')}:failed")
+            continue
+        if item.get("type") in {"command_execution", "file_change", "web_search"}:
+            failed.append(f"line_{ordinal}:non_mcp_item:{item.get('type')}")
             continue
         if item.get("type") != "mcp_tool_call":
             raise ValueError(f"Codex trace line {ordinal} item type is unknown")
@@ -385,7 +417,11 @@ def _load_preregistration_ledger(
     ledger_path: Path, preregistration: bytes
 ) -> Mapping[str, object]:
     try:
-        payload = Path(ledger_path).read_bytes()
+        payload = stable_read_file(
+            Path(ledger_path),
+            kind="acceptance preregistration ledger",
+            maximum=1024 * 1024,
+        )
         value = json.loads(
             payload.decode("utf-8", errors="strict"),
             object_pairs_hook=_reject_duplicate_json_keys,
@@ -1014,6 +1050,12 @@ class IntegratedAcceptanceCaseReport:
     case_id: str
     assisted_trace_sha256: str
     no_mcp_trace_sha256: str
+    assisted_dispatch_intent_sha256: str
+    assisted_dispatch_completion_sha256: str
+    no_mcp_dispatch_intent_sha256: str
+    no_mcp_dispatch_completion_sha256: str
+    assisted_runner: str
+    no_mcp_runner: str
     assisted_trace_status: str
     no_mcp_trace_status: str
     assisted_dispatched_at: str
@@ -1127,7 +1169,7 @@ def _validate_fake_dispatch(
         arm=arm,
     )
     try:
-        if intent_path.read_bytes() != intent_payload:
+        if stable_read_file(intent_path, kind="real dispatch intent", maximum=2 * 1024 * 1024) != intent_payload:
             raise ValueError("fake dispatch intent ledger bytes differ")
         if completion_path.read_bytes() != completion_payload:
             raise ValueError("fake dispatch completion ledger bytes differ")
@@ -1191,9 +1233,214 @@ def _validate_fake_dispatch(
     if not registered_at < dispatched_at <= completed_at:
         raise ValueError("fake dispatch did not follow preregistration")
     return {
+        "runner": "FAKE_ONLY_REAL_CODEX_DISABLED",
         "dispatched_at": intent["dispatched_at"],
         "completed_at": completion["completed_at"],
     }
+
+
+def _validate_real_dispatch(
+    *,
+    intent_payload: bytes,
+    completion_payload: bytes,
+    dispatch_ledger_root: Path,
+    preregistration: bytes,
+    preregistration_ledger_value: Mapping[str, object],
+    registered: Mapping[str, object],
+    case_id: str,
+    arm: str,
+    prompt_bytes: bytes,
+    config_bytes: bytes,
+    trace_bytes: bytes,
+) -> dict[str, str]:
+    intent_path, trace_path, completion_path = real_dispatch_paths(
+        dispatch_ledger_root,
+        run_id=str(registered["run_id"]),
+        case_id=case_id,
+        arm=arm,
+    )
+    try:
+        if stable_read_file(
+            intent_path, kind="real dispatch intent", maximum=2 * 1024 * 1024
+        ) != intent_payload:
+            raise ValueError("real dispatch intent ledger bytes differ")
+        if stable_read_file(trace_path, kind="real dispatch trace", maximum=CODEX_TRACE_MAX_BYTES) != trace_bytes:
+            raise ValueError("real dispatch raw JSONL ledger bytes differ")
+        if stable_read_file(completion_path, kind="real dispatch completion", maximum=2 * 1024 * 1024) != completion_payload:
+            raise ValueError("real dispatch completion ledger bytes differ")
+        intent = json.loads(
+            intent_payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+        completion = json.loads(
+            completion_payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("real dispatch ledger is invalid") from error
+    config = validate_real_codex_launch_config_bytes(
+        config_bytes, server_name=str(registered["server_name"])
+    )
+    command = build_real_codex_command(
+        config,
+        server_name=str(registered["server_name"]),
+        model=str(registered["model"]),
+        arm=arm,
+    )
+    request = build_real_request_material(
+        run_id=str(registered["run_id"]),
+        case_id=case_id,
+        arm=arm,
+        authority_identity=registered["authority_identity"],
+        server_name=str(registered["server_name"]),
+        model=str(registered["model"]),
+        prompt_bytes=prompt_bytes,
+        config_bytes=config_bytes,
+        command=command,
+    )
+    request_sha256 = hashlib.sha256(
+        canonical_json(request).encode("utf-8")
+    ).hexdigest()
+    intent_fields = {
+        "schema_version", "record_type", "runner", "run_id", "case_id",
+        "arm", "dispatched_at", "preregistration_sha256",
+        "preregistration_ledger_sha256", "request", "request_sha256",
+        "provenance_before",
+    }
+    completion_fields = {
+        "schema_version", "record_type", "runner", "run_id", "case_id",
+        "arm", "dispatched_at", "completed_at", "intent_sha256",
+        "request_sha256", "status", "exit_code", "trace_bytes",
+        "trace_sha256", "stderr_bytes", "stderr_sha256",
+        "process_observation", "provenance_during", "provenance_after",
+        "mcp_process_observation",
+    }
+    common = {
+        "schema_version": ACCEPTANCE_REAL_DISPATCH_SCHEMA,
+        "runner": REAL_CODEX_RUNNER,
+        "run_id": registered["run_id"],
+        "case_id": case_id,
+        "arm": arm,
+    }
+    if (
+        not isinstance(intent, dict)
+        or set(intent) != intent_fields
+        or not isinstance(completion, dict)
+        or set(completion) != completion_fields
+        or canonical_json(intent).encode("utf-8") != intent_payload
+        or canonical_json(completion).encode("utf-8") != completion_payload
+        or any(intent.get(name) != value for name, value in common.items())
+        or any(completion.get(name) != value for name, value in common.items())
+        or intent.get("record_type") != "INTENT"
+        or completion.get("record_type") != "COMPLETE"
+        or intent.get("preregistration_sha256")
+        != hashlib.sha256(preregistration).hexdigest()
+        or intent.get("preregistration_ledger_sha256")
+        != hashlib.sha256(
+            canonical_json(dict(preregistration_ledger_value)).encode("utf-8")
+        ).hexdigest()
+        or intent.get("request") != request
+        or intent.get("request_sha256") != request_sha256
+        or completion.get("intent_sha256")
+        != hashlib.sha256(intent_payload).hexdigest()
+        or completion.get("request_sha256") != request_sha256
+        or completion.get("status") != "completed"
+        or completion.get("exit_code") != 0
+        or completion.get("trace_bytes") != len(trace_bytes)
+        or completion.get("trace_sha256")
+        != hashlib.sha256(trace_bytes).hexdigest()
+        or type(completion.get("stderr_bytes")) is not int
+        or completion["stderr_bytes"] < 0
+        or completion["stderr_bytes"] > 1024 * 1024
+        or not _is_sha256(completion.get("stderr_sha256"))
+        or completion.get("dispatched_at") != intent.get("dispatched_at")
+        or not isinstance(intent.get("dispatched_at"), str)
+        or not isinstance(completion.get("completed_at"), str)
+    ):
+        raise ValueError("real dispatch evidence binding is invalid")
+    provenance_before = intent.get("provenance_before")
+    provenance_during = completion.get("provenance_during")
+    provenance_after = completion.get("provenance_after")
+    process_observation = completion.get("process_observation")
+    mcp_process_observation = completion.get("mcp_process_observation")
+    if (
+        not isinstance(provenance_before, dict)
+        or not isinstance(provenance_during, dict)
+        or not isinstance(provenance_after, dict)
+        or provenance_before != provenance_during
+        or provenance_before != provenance_after
+        or provenance_after != observe_static_provenance(config)
+        or not isinstance(process_observation, dict)
+    ):
+        raise ValueError("real dispatch provenance closure is invalid")
+    validate_process_observation(config, process_observation, provenance_during)
+    validate_mcp_process_observation(
+        config, mcp_process_observation, provenance_during, arm=arm
+    )
+    registered_at = _parse_utc_timestamp(
+        str(preregistration_ledger_value["registered_at"])
+    )
+    dispatched_at = _parse_utc_timestamp(intent["dispatched_at"])
+    completed_at = _parse_utc_timestamp(completion["completed_at"])
+    if not registered_at < dispatched_at <= completed_at:
+        raise ValueError("real dispatch did not follow preregistration")
+    return {
+        "runner": REAL_CODEX_RUNNER,
+        "dispatched_at": intent["dispatched_at"],
+        "completed_at": completion["completed_at"],
+    }
+
+
+def _validate_acceptance_dispatch(
+    *,
+    intent_payload: bytes,
+    completion_payload: bytes,
+    dispatch_ledger_root: Path,
+    preregistration: bytes,
+    preregistration_ledger_value: Mapping[str, object],
+    registered: Mapping[str, object],
+    case_id: str,
+    arm: str,
+    prompt_bytes: bytes,
+    config_bytes: bytes,
+    trace_bytes: bytes,
+) -> dict[str, str]:
+    try:
+        header = json.loads(
+            intent_payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("acceptance dispatch intent is invalid") from error
+    schema = header.get("schema_version") if isinstance(header, dict) else None
+    if schema == ACCEPTANCE_FAKE_DISPATCH_SCHEMA:
+        return _validate_fake_dispatch(
+            intent_payload=intent_payload,
+            completion_payload=completion_payload,
+            dispatch_ledger_root=dispatch_ledger_root,
+            preregistration_ledger_value=preregistration_ledger_value,
+            registered=registered,
+            case_id=case_id,
+            arm=arm,
+            prompt_bytes=prompt_bytes,
+            config_bytes=config_bytes,
+            trace_bytes=trace_bytes,
+        )
+    if schema == ACCEPTANCE_REAL_DISPATCH_SCHEMA:
+        return _validate_real_dispatch(
+            intent_payload=intent_payload,
+            completion_payload=completion_payload,
+            dispatch_ledger_root=dispatch_ledger_root,
+            preregistration=preregistration,
+            preregistration_ledger_value=preregistration_ledger_value,
+            registered=registered,
+            case_id=case_id,
+            arm=arm,
+            prompt_bytes=prompt_bytes,
+            config_bytes=config_bytes,
+            trace_bytes=trace_bytes,
+        )
+    raise ValueError("acceptance dispatch schema is unsupported")
 
 
 def evaluate_preregistered_acceptance(
@@ -1247,6 +1494,7 @@ def evaluate_preregistered_acceptance(
 
     findings: list[str] = []
     reports: list[IntegratedAcceptanceCaseReport] = []
+    runner_kinds: set[str] = set()
     should_call_count = should_not_call_count = 0
     minimum_gain = float(registered["minimum_net_gain_each_dimension"])
     for definition in definitions:
@@ -1273,10 +1521,11 @@ def evaluate_preregistered_acceptance(
             raise ValueError("acceptance cases require immutable raw trace bytes")
         assisted_trace_sha256 = hashlib.sha256(case.assisted_trace_bytes).hexdigest()
         no_mcp_trace_sha256 = hashlib.sha256(case.no_mcp_trace_bytes).hexdigest()
-        assisted_dispatch = _validate_fake_dispatch(
+        assisted_dispatch = _validate_acceptance_dispatch(
             intent_payload=case.assisted_dispatch_intent,
             completion_payload=case.assisted_dispatch_completion,
             dispatch_ledger_root=dispatch_ledger_root,
+            preregistration=preregistration,
             preregistration_ledger_value=ledger_value,
             registered=registered,
             case_id=case_id,
@@ -1285,10 +1534,11 @@ def evaluate_preregistered_acceptance(
             config_bytes=config_bytes,
             trace_bytes=case.assisted_trace_bytes,
         )
-        no_mcp_dispatch = _validate_fake_dispatch(
+        no_mcp_dispatch = _validate_acceptance_dispatch(
             intent_payload=case.no_mcp_dispatch_intent,
             completion_payload=case.no_mcp_dispatch_completion,
             dispatch_ledger_root=dispatch_ledger_root,
+            preregistration=preregistration,
             preregistration_ledger_value=ledger_value,
             registered=registered,
             case_id=case_id,
@@ -1296,6 +1546,9 @@ def evaluate_preregistered_acceptance(
             prompt_bytes=case.prompt_bytes,
             config_bytes=config_bytes,
             trace_bytes=case.no_mcp_trace_bytes,
+        )
+        runner_kinds.update(
+            (assisted_dispatch["runner"], no_mcp_dispatch["runner"])
         )
         assisted_trace = load_codex_tool_trace_bytes(
             case.assisted_trace_bytes, server_name=server_name
@@ -1309,14 +1562,25 @@ def evaluate_preregistered_acceptance(
             "model": registered["model"],
             "config_sha256": registered["config_sha256"],
         }
-        for arm_name, trace in (("assisted", assisted_trace), ("no_mcp", no_mcp_trace)):
+        for arm_name, trace, dispatch in (
+            ("assisted", assisted_trace, assisted_dispatch),
+            ("no_mcp", no_mcp_trace, no_mcp_dispatch),
+        ):
             actual = {
                 "run_id": trace.run_id,
                 "case_id": trace.case_id,
                 "model": trace.model,
                 "config_sha256": trace.config_sha256,
             }
-            if actual != expected_bindings or trace.arm != arm_name:
+            bindings_absent = all(value is None for value in actual.values()) and trace.arm is None
+            if (
+                dispatch["runner"] == "FAKE_ONLY_REAL_CODEX_DISABLED"
+                and (actual != expected_bindings or trace.arm != arm_name)
+            ) or (
+                dispatch["runner"] == REAL_CODEX_RUNNER
+                and not bindings_absent
+                and (actual != expected_bindings or trace.arm != arm_name)
+            ):
                 findings.append(f"{case_id}:{arm_name}:run_binding_mismatch")
         if case.expected_identity is not None and case.expected_identity != expected_identity:
             findings.append(f"{case_id}:caller_identity_differs_from_preregistration")
@@ -1391,6 +1655,20 @@ def evaluate_preregistered_acceptance(
                 case_id=case_id,
                 assisted_trace_sha256=assisted_trace_sha256,
                 no_mcp_trace_sha256=no_mcp_trace_sha256,
+                assisted_dispatch_intent_sha256=hashlib.sha256(
+                    case.assisted_dispatch_intent
+                ).hexdigest(),
+                assisted_dispatch_completion_sha256=hashlib.sha256(
+                    case.assisted_dispatch_completion
+                ).hexdigest(),
+                no_mcp_dispatch_intent_sha256=hashlib.sha256(
+                    case.no_mcp_dispatch_intent
+                ).hexdigest(),
+                no_mcp_dispatch_completion_sha256=hashlib.sha256(
+                    case.no_mcp_dispatch_completion
+                ).hexdigest(),
+                assisted_runner=assisted_dispatch["runner"],
+                no_mcp_runner=no_mcp_dispatch["runner"],
                 assisted_trace_status=assisted_gate.status,
                 no_mcp_trace_status=control_gate.status,
                 assisted_dispatched_at=assisted_dispatch["dispatched_at"],
@@ -1417,10 +1695,18 @@ def evaluate_preregistered_acceptance(
         )
     if should_call_count == 0 or should_not_call_count == 0:
         findings.append("suite:positive_and_negative_cases_required")
+    if len(runner_kinds) != 1:
+        findings.append("suite:mixed_dispatch_runners")
+    # A runner label, serialized PID/image observations and replayable JSONL do
+    # not constitute a trusted execution attestation.  Preserve useful real-
+    # Codex functional evidence, but never let disk-replayed material authorize
+    # Stage 5/visibility.  A future authority must be issued by a separately
+    # trusted attestor and must not be derived in this replay evaluator.
+    authority = _replay_authority_for_runners(runner_kinds)
     campaign_value = {
         "schema_version": ACCEPTANCE_CAMPAIGN_RECEIPT_SCHEMA,
-        "producer": "quant_hub.knowledge_mcp.evaluation/v3-raw-replay",
-        "authority": "AUTHORITATIVE_INTEGRATED_GATE",
+        "producer": "quant_hub.knowledge_mcp.evaluation/v5-provenance-replay",
+        "authority": authority,
         "preregistration": {
             "bytes": len(preregistration),
             "sha256": hashlib.sha256(preregistration).hexdigest(),
@@ -1437,12 +1723,18 @@ def evaluate_preregistered_acceptance(
                 "assisted_trace_sha256": report.assisted_trace_sha256,
                 "no_mcp_trace_sha256": report.no_mcp_trace_sha256,
                 "assisted_dispatch": {
+                    "runner": report.assisted_runner,
                     "dispatched_at": report.assisted_dispatched_at,
                     "completed_at": report.assisted_completed_at,
+                    "intent_sha256": report.assisted_dispatch_intent_sha256,
+                    "completion_sha256": report.assisted_dispatch_completion_sha256,
                 },
                 "no_mcp_dispatch": {
+                    "runner": report.no_mcp_runner,
                     "dispatched_at": report.no_mcp_dispatched_at,
                     "completed_at": report.no_mcp_completed_at,
+                    "intent_sha256": report.no_mcp_dispatch_intent_sha256,
+                    "completion_sha256": report.no_mcp_dispatch_completion_sha256,
                 },
                 "assisted_trace_status": report.assisted_trace_status,
                 "no_mcp_trace_status": report.no_mcp_trace_status,
@@ -1465,7 +1757,7 @@ def evaluate_preregistered_acceptance(
         should_not_call_count=should_not_call_count,
         case_reports=tuple(reports),
         findings=tuple(findings),
-        authority="AUTHORITATIVE_INTEGRATED_GATE",
+        authority=authority,
         campaign_receipt=campaign_receipt,
     )
 
@@ -1514,6 +1806,7 @@ def validate_acceptance_campaign_receipt_bytes(
 __all__ = [
     "ACCEPTANCE_CAMPAIGN_RECEIPT_SCHEMA",
     "ACCEPTANCE_FAKE_DISPATCH_SCHEMA",
+    "ACCEPTANCE_REAL_DISPATCH_SCHEMA",
     "ACCEPTANCE_PREREGISTRATION_SCHEMA",
     "ACCEPTANCE_PREREGISTRATION_LEDGER_SCHEMA",
     "AcceptanceCaseDefinition",

@@ -1,5 +1,10 @@
 # 研究员数据抓取、导入、检索与存储位置指南
 
+> 当前放行状态（2026-08-31）：最近一次 C→exact-D writer handoff 在 D ingress 前安全失败，
+> 旧 C 服务已恢复；D 侧尚无 active/prior，Stage 5 certificate 与 visibility closure 均未签发。
+> 当前现场及后续变更见 [`STAGE5_STAGE6_CLOSURE.md`](STAGE5_STAGE6_CLOSURE.md)。在该记录更新前，
+> 候选、历史本机 delivery、测试 PASS 和失败 handoff receipt 都不是生产放行证明。
+
 > 适用对象：量化研究员、论文研究员、平台维护人员。  
 > 项目根：`D:\quant\quant_platform`。  
 > 本文只记录当前源码中存在的入口和路径，不包含账号、口令、密钥或其他秘密。  
@@ -211,7 +216,24 @@ doi:10.xxxx/xxxxx
 https://doi.org/10.xxxx/xxxxx
 ```
 
-论文官网、出版社或学术服务的明确论文链接，以及带作者、题名、年份的参考文献行也可形成候选线索。代码围栏和行内代码中的 DOI/arXiv 文本会被保护，不能用来形成正式论文线索。
+普通 Markdown 论文链接只在目标主机属于以下白名单时形成候选：
+
+```text
+ssrn.com
+ideas.repec.org
+openreview.net
+jstor.org
+aclanthology.org
+proceedings.mlr.press
+link.springer.com
+sciencedirect.com
+onlinelibrary.wiley.com
+academic.oup.com
+```
+
+列表符号、编号或 `[数字]` 开头且含 18xx/19xx/20xx 年份的行会形成较弱的
+`formal_reference` 未解析线索；这不表示系统已经识别出作者或题名。代码围栏和
+行内代码中的 DOI/arXiv 文本会被保护，不能用来形成正式论文线索。
 
 线索只表示“需要核验”。后续 Evidence 流程才会分别核验：
 
@@ -247,7 +269,52 @@ D:\quant\quant_platform\project_state\workers\crossref_identity_review\
 D:\quant\quant_platform\project_state\workers\arxiv_expansion_materials\
 ```
 
-前者保存 Crossref 身份核验材料，后者保存 arXiv 扩展材料。新发现的论文应先经过 Archive 线索提取、元数据核验和材料包审阅，再调用此脚本生成导入计划；不要把下载目录或任意 PDF 目录直接塞给它。
+前者保存 Crossref 身份核验材料，后者保存 arXiv 扩展材料。默认命令只用于
+回放 2026-07-15 这批固定历史材料；它还依赖以下受审阅文件：
+
+```text
+project_state\workers\crossref_identity_review\accepted_decisions.jsonl
+project_state\workers\crossref_identity_review\rights_resource_offers.jsonl
+project_state\workers\independent_identity_verifier\item_verdicts.jsonl
+project_state\workers\u055_open_pdf_acquisition\manifest.json
+project_state\workers\arxiv_expansion_materials\manifest.json
+project_state\workers\arxiv_expansion_materials\reading_records.json
+project_state\workers\arxiv_expansion_materials\total_delivery_manifest.json
+project_state\workers\arxiv_expansion_materials\total_resolution_seed.json
+project_state\workers\arxiv_expansion_materials\identity_review\method_origin_candidate_inputs.json
+project_state\workers\independent_arxiv_verifier_v2\verdict_v4.json
+```
+
+新发现的论文应先经过 Archive 线索提取、元数据核验和材料包审阅，再调用此
+脚本生成导入计划；不要把下载目录或任意 PDF 目录直接塞给它。若替换为新材料，
+必须同时显式传入全部适用的 source 参数：
+
+```text
+--crossref-decisions（可重复）
+--crossref-rights
+--crossref-identity-verdicts
+--crossref-fulltext
+--arxiv-materials
+--arxiv-readings
+--arxiv-total-delivery
+--arxiv-resolution-seed
+--arxiv-method-origin-inputs
+--arxiv-independent-verdict
+--reconciliation-overrides（若本批存在显式协调裁决）
+```
+
+并用本次真实审核信息覆盖：
+
+```text
+--review-id
+--reviewed-by
+--reviewed-at
+--provenance-urn
+```
+
+plan 和后续 `--apply` 必须复用同一组 source 与审核身份参数。不能沿用历史默认
+时间或 provenance 给新材料盖章；也不能只替换其中一个材料文件，把其余历史
+默认输入误当成同一批审核。
 
 受控导入的正确做法是先生成静态计划，确认后才对隔离候选应用：
 
@@ -279,13 +346,22 @@ if (Test-Path -LiteralPath $CandidateVar) {
 
 ```powershell
 Set-Location D:\quant\quant_platform
-$Delivery = `
+$ReleaseRoot = `
   'D:\quant\quant_platform_publish_runtime\candidates\release-REPLACE_ME'
+$Delivery = Join-Path $ReleaseRoot 'runtime'
 $OutputRoot = `
   'D:\quant\quant_platform\quant_hub\var\paper_fetch_review_01'
 
-if (-not (Test-Path -LiteralPath $Delivery -PathType Container)) {
-  throw "请把 Delivery 改成已审阅 delivery：$Delivery"
+if (-not (Test-Path -LiteralPath $ReleaseRoot -PathType Container)) {
+  throw "请把 ReleaseRoot 改成已审阅 release：$ReleaseRoot"
+}
+if (-not (Test-Path -LiteralPath `
+  (Join-Path $Delivery 'db\research_papers.sqlite3') -PathType Leaf)) {
+  throw "release runtime 缺少 Evidence 数据库：$Delivery"
+}
+if (-not (Test-Path -LiteralPath `
+  (Join-Path $Delivery 'research_papers') -PathType Container)) {
+  throw "release runtime 缺少 research_papers 资源区：$Delivery"
 }
 if (Test-Path -LiteralPath $OutputRoot) {
   throw "抓取输出必须是新的不存在目录：$OutputRoot"
@@ -300,11 +376,17 @@ if (Test-Path -LiteralPath $OutputRoot) {
 该工具：
 
 - 读取 delivery 中的 `db\research_papers.sqlite3`；
-- 复用已核验 PDF，或尝试公开的 arXiv/OpenAlex/Semantic Scholar/Crossref OA URL；
-- 检查 PDF 文件头、EOF、大小和下载稳定性；
+- 复用已核验 PDF，或尝试公开的 arXiv/OpenAlex/Semantic Scholar URL，以及
+  Crossref 暴露的 PDF/fulltext URL；Crossref 返回链接本身不证明 OA 或本地保存权利；
+- 单次下载上限为 120 MiB，并检查 HTTP 结果、最小大小、`%PDF-` 文件头和尾部
+  `%%EOF`；它不做第二次下载或内容稳定性复验；
 - 输出 `ACQUISITION_MANIFEST.json`；工具自身会创建目录但不会强制它原先为空，
   所以上面的包装检查不可省略；
-- 不会因为“下载成功”就自动证明权利允许或 Evidence 已放行。
+- 查询只要求论文身份已核验，不会用 `rights_status` 自动做下载前 fail-closed；
+  因此输出只能进入受限审阅暂存，下载成功不会自动证明权利允许或 Evidence 已
+  放行；
+- 不得省略 `--delivery` 或 `--output`。源码默认值是历史 delivery 和正式
+  Paper Lab drop，不能作为新抓取任务的安全默认目标。
 
 `$OutputRoot` 是物化/审阅暂存，不是 Evidence authority。审阅后按用途分流：
 
@@ -360,6 +442,9 @@ if (Test-Path -LiteralPath $PaperLabVar) {
   --var-root $PaperLabVar
 ```
 
+这里的“只扫描”是指不改名、不读取正文和不建立精读任务；首次调用仍可能创建
+所选 `var-root` 的运行目录和数据库。它不是文件系统零写入命令。
+
 再做 dry run，确认将要读取的候选：
 
 ```powershell
@@ -371,7 +456,61 @@ if (Test-Path -LiteralPath $PaperLabVar) {
   --dry-run
 ```
 
-正式运行去掉 `--dry-run`；中断恢复使用 `--resume`。流程依次形成 problem、method、experiment、synthesis 等受审阅阶段，只有独立审核凭据满足发布门禁才可 publish。
+正式运行去掉 `--dry-run`，但这一步只登记 PDF、建立 `reading_run` 队列，并把
+任务写到：
+
+```text
+<var_root>\paper_lab\tasks\<run_id>.json
+```
+
+命令输出的 `tasks[].manifest_path` 才是下一步 `--task` 应使用的精确路径。
+它不会在该命令内自动执行 problem、method、experiment、synthesis。拿到任务
+manifest 后，先检查将调用的 Codex 命令：
+
+```powershell
+$Task = Join-Path $PaperLabVar 'paper_lab\tasks\RUN_ID.json'
+
+if (-not (Test-Path -LiteralPath $Task -PathType Leaf)) {
+  throw "请用 paper-lab run 输出的真实 manifest_path 替换 RUN_ID：$Task"
+}
+
+.\quant_hub\.venv\Scripts\python.exe -B `
+  .\quant_hub\tools\paper_lab_execute.py `
+  --task $Task `
+  --project-root D:\quant\quant_platform `
+  --archive-root D:\quant\quant_platform\reference\archive `
+  --var-root $PaperLabVar `
+  --dry-run
+```
+
+确认后去掉 `paper_lab_execute.py` 的 `--dry-run`，才会按顺序执行四个阶段。阶段
+输出先写入 `<var_root>\paper_lab\staging\<run_id>\*.json`，通过 schema、来源
+locator 和状态校验后再提交到数据库。完整生命周期是：
+
+```text
+scan
+→ paper-lab run --dry-run
+→ paper-lab run（登记并建立 task）
+→ paper_lab_execute.py --task <manifest>（四阶段执行）
+→ awaiting_review
+→ 独立 reviewer 签发并提交 review certificate
+→ releasable
+→ paper-lab publish --run-id <run_id>
+```
+
+中断后建立下一次任务使用 `paper-lab run --resume`。当前没有供普通研究员自签
+独立审核 PASS 的 CLI；producer 不能自己调用 `review_run` 冒充独立 reviewer。
+只有受信审核流程以 exact run artifact 和 requirements manifest 签发证书，且
+`PaperLabService.review_run(...)` 验证通过后，才允许执行：
+
+```powershell
+.\quant_hub\.venv\Scripts\python.exe -B -m quant_hub.cli `
+  paper-lab publish `
+  --run-id RUN_ID `
+  --project-root D:\quant\quant_platform `
+  --archive-root D:\quant\quant_platform\reference\archive `
+  --var-root $PaperLabVar
+```
 
 常用只读查询：
 
@@ -382,7 +521,9 @@ if (Test-Path -LiteralPath $PaperLabVar) {
   --keyword transformer
 ```
 
-可组合的过滤条件以 `paper-lab query --help` 为准，包括 rating、model、market、时间、source、keyword 和 status。`paper-lab legacy-import` 只用于从只读 `reference\proj2` 做一次性、可重复迁移，不是日常投递命令。
+可组合的过滤条件以 `paper-lab query --help` 为准，包括 rating、model、market、
+时间、source、keyword 和 status。`paper-lab legacy-import` 只用于从只读
+`reference\proj2` 做一次性、可重复迁移，不是日常投递命令。
 
 Paper Lab 的结构化数据和生成资产分别位于：
 
@@ -393,7 +534,9 @@ Paper Lab 的结构化数据和生成资产分别位于：
 
 ### 4.6 通过 Web 阅读、评论和维护进度
 
-本地正式浏览入口使用已审核 delivery；启动命令和 exact seal 参数以 [`../../quant_hub/README.md`](../../quant_hub/README.md) 为准。正式约定入口是：
+本地浏览可使用已审核的历史 delivery 或明确的开发模式；两者与当前生产 VM exact-D
+部署接口不同。历史本机 V9/R2 命令和当前 exact-D production tooling 的边界以
+[`../../quant_hub/README.md`](../../quant_hub/README.md) 及本指南第 7 节为准。约定浏览入口是：
 
 ```text
 http://localhost:8765/
@@ -405,6 +548,11 @@ http://localhost:8765/
 - `/research-updates`：研究更新时间线；
 - `/research/{research_id}`：研究主页；
 - `/research/{research_id}/documents/{document_id}`：研究文档；
+- `/research/{research_id}/documents/{document_id}/chapters/{chapter_slug}`：研究文档章节；
+- `/research/{research_id}/supplements/{supplement_id}` 与末尾 `/source`：补充材料及其受控原文；
+- `/knowledge/research/{document_id}/`：通用新研究当前版；
+- `/knowledge/research/{document_id}/versions/{version_id}/`：通用新研究历史版；
+- `/knowledge/research/{document_id}/versions/{version_id}/source`：通用新研究受控原文；
 - `/paper-lab/`、`/paper-lab/papers/{paper_id}`、`/paper-lab/designer`；
 - `/evidence/`、`/evidence/papers/{paper_id}`、`/evidence/citations/{citation_id}`；
 - `/evidence/library/{paper_id}.pdf`：通过受控路由打开允许展示的 PDF。
@@ -415,25 +563,34 @@ http://localhost:8765/
 GET /api/v1/session
 GET /api/v1/dashboard
 GET /api/v1/topics
+GET /api/v1/dashboard-topics
+GET /api/v1/dashboard-topics/{topic_id}
+GET /api/v1/research-updates
 GET /api/v1/research
 GET /api/v1/search
 GET /api/v1/research/{research_id}
 GET /api/v1/research/{research_id}/comments
 GET /api/v1/research/{research_id}/documents/{document_id}/source
+GET /api/v1/archive/assets/{asset_id}
 
 GET /api/v1/evidence/papers
 GET /api/v1/evidence/papers/{paper_id}
 GET /api/v1/evidence/documents/{document_sha256}/citations
 GET /api/v1/evidence/citations/{citation_id}
+GET /api/v1/evidence/citation-entries/{ledger_entry_id}
 GET /api/v1/evidence/resources/{resource_id}
 
 GET /api/v1/paper-lab/papers
 GET /api/v1/paper-lab/papers/{paper_id}
+GET /api/v1/paper-lab/versions/{paper_version_id}/content
+GET /api/v1/paper-lab/notes/{note_id}/content
 GET /api/v1/paper-lab/components
 GET /api/v1/paper-lab/blueprints
+GET /api/v1/paper-lab/blueprints/{blueprint_id}
 
 GET /api/v1/research-tree
 GET /api/v1/research-nodes/{node_id}
+GET /api/v1/research-nodes/{node_id}/comments
 ```
 
 常用写 API 按业务分组如下：
@@ -442,6 +599,7 @@ GET /api/v1/research-nodes/{node_id}
 POST   /api/v1/research/{research_id}/comments
 PATCH  /api/v1/comments/{comment_id}
 DELETE /api/v1/comments/{comment_id}
+POST   /api/v1/research-updates/{update_id}/annotations
 
 POST   /api/v1/dashboard-topics
 PATCH  /api/v1/dashboard-topics/{topic_id}
@@ -455,10 +613,15 @@ POST   /api/v1/research/{research_id}/completion-decisions
 POST   /api/v1/research-tree/sync
 POST   /api/v1/research-projects
 PATCH  /api/v1/research-nodes/{node_id}
-GET    /api/v1/research-nodes/{node_id}/comments
 POST   /api/v1/research-nodes/{node_id}/comments
 PATCH  /api/v1/research-node-comments/{comment_id}
 DELETE /api/v1/research-node-comments/{comment_id}
+
+PATCH  /api/v1/paper-lab/papers/{paper_id}
+POST   /api/v1/paper-lab/blueprints/validate
+POST   /api/v1/paper-lab/blueprints
+
+POST   /knowledge/research/{document_id}/comments
 ```
 
 评论和进度写入应通过 UI 或 API，不要改 SQLite。JSON 写请求必须：
@@ -468,8 +631,20 @@ DELETE /api/v1/research-node-comments/{comment_id}
 - 携带启动器允许的精确同源 `Origin`；
 - 携带返回的 `X-CSRF-Token`；
 - 携带 8–128 字符的 `Idempotency-Key`；
-- 修改/删除评论时使用服务端返回的单一强 ETag 作为精确 `If-Match`；不能
-  自行拼接 revision，也不能使用弱 ETag 或 `*`。
+- 普通评论、research-update annotation、Dashboard topic、research node 和 node
+  comment 的并发敏感写入，
+  使用对应 GET/创建响应返回的单一强 ETag 作为精确 `If-Match`；不能自行拼接
+  revision，也不能使用弱 ETag 或 `*`；
+- Paper Lab 论文字段更新不使用 `If-Match`，而是在 JSON 内传详情响应中的整数
+  `expected_version`；版本变化时服务返回 409，客户端应重新读取后合并；
+- 创建操作不得附带不适用的 `If-Match`；验证蓝图不会保存蓝图，保存必须另调
+  `POST /api/v1/paper-lab/blueprints`。
+
+通用新研究评论接口位于 `/knowledge` 前缀下，不属于 `/api/v1`。它同样要求同一
+session、精确同源 `Origin`、`X-CSRF-Token` 和 `Idempotency-Key`；JSON 需给出当前
+`version_id`、评论者和 `content`，只有需要块级/区间锚定时才增加受支持的
+`target_kind`（`block` 或 `span`）与 `anchor_span_id`。
+不要把历史页面的 `version_id` 冒充当前版，也不要自行生成锚点身份。
 
 评论者只允许：
 
@@ -480,6 +655,62 @@ DELETE /api/v1/research-node-comments/{comment_id}
 ```
 
 API 没有扫描、候选构建、证书签发或 release 激活接口。这些操作不能用普通 HTTP 请求绕过。
+
+下面是可直接复制的 PowerShell 读取与写入示例。先把 `$Base`、`$ResearchId`
+和正文改成真实值；`$Base` 必须与服务启动时的 trusted origin 精确一致。
+
+```powershell
+$Base = 'http://localhost:8765'
+$Query = [uri]::EscapeDataString('时序交叉验证')
+
+# 只读检索：不需要 CSRF 或 Idempotency-Key。
+$Search = Invoke-RestMethod -Method Get -Uri "$Base/api/v1/search?q=$Query&limit=5"
+$Search.data
+
+# 建立一次 session，之后的写请求始终复用同一 cookie jar。
+$WebSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+$Session = Invoke-RestMethod -Method Get -Uri "$Base/api/v1/session" -WebSession $WebSession
+$Csrf = $Session.data.csrf_token
+$ResearchId = 'res_REPLACE_WITH_32_HEX'
+
+$CommentHeaders = @{
+  Origin = $Base
+  'X-CSRF-Token' = $Csrf
+  'Idempotency-Key' = "comment-$([guid]::NewGuid().ToString('N'))"
+}
+$CommentBody = @{
+  actor = @{ actor_kind = 'zhang_zhengze' }
+  content = '请补充样本外稳定性检验。'
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method Post `
+  -Uri "$Base/api/v1/research/$ResearchId/comments" `
+  -WebSession $WebSession -Headers $CommentHeaders `
+  -ContentType 'application/json; charset=utf-8' -Body $CommentBody
+
+$TopicHeaders = @{
+  Origin = $Base
+  'X-CSRF-Token' = $Csrf
+  'Idempotency-Key' = "topic-$([guid]::NewGuid().ToString('N'))"
+}
+$TopicBody = @{
+  actor = @{ actor_kind = 'song_dingkun' }
+  title = '样本外组合稳定性'
+  state = 'planned'
+  note = '待补充不同市场阶段的回放。'
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod -Method Post `
+  -Uri "$Base/api/v1/dashboard-topics" `
+  -WebSession $WebSession -Headers $TopicHeaders `
+  -ContentType 'application/json; charset=utf-8' -Body $TopicBody
+```
+
+修改或删除对象时，先用对应 GET 取回服务端 `ETag`，再把该值原样放入
+`If-Match`；不要从 revision 自行拼接。同一逻辑 command 重试必须复用原
+`Idempotency-Key`，只有新 command 才生成新 key。通用新研究评论的 JSON 不是上面的
+nested `actor`，而是顶层 `actor_kind`、可选 `display_name`、`version_id` 和 `content`；
+请严格按本节前文的 `/knowledge` 合同调用。
 
 ### 4.7 在其他项目中安装和使用知识 MCP
 
@@ -510,19 +741,27 @@ if (-not (Test-Path -LiteralPath $TargetProject -PathType Container)) {
 安装后检查：
 
 ```powershell
-codex mcp list
+codex -C $TargetProject mcp list --json
 
 .\.venv\Scripts\python.exe -m quant_hub.knowledge_mcp.cli doctor `
   --client-config `
   "$env:LOCALAPPDATA\QuantResearchHub\quant-research-knowledge\client.json"
 ```
 
+project scope 配置位于 `$TargetProject\.codex\config.toml`，所以 `codex mcp list`
+必须在目标项目语境运行；留在 `quant_hub` 目录会检查错项目。`doctor` 对 VM
+authority 只读，但不是本机零写入：若发现可验证的新三元组，它可能下载知识
+artifact，并原子更新本机 mirror/pointer。退出状态包括 `fresh`、`stale`、
+`unavailable` 和 `transition_pending`；后者表示转换尚未完成，CLI 返回退出码 2，
+不能当成 fresh。
+
 最稳妥的检索顺序：
 
 1. `search_quant_knowledge`：用自然语言问题搜索，并尽量给 `task_context`；
 2. 只对搜索结果 `next_action` 中真正需要的 1–3 个 `object_id` 调用 `get_quant_knowledge`；
 3. 快照变化时先调用 `list_knowledge_updates`，再重新执行 search → get；
-4. 默认尊重 fresh/stale/unavailable 状态，不在无明确理由时设置 `allow_stale=true`。
+4. 默认尊重 fresh/stale/unavailable/transition_pending 状态，不在无明确理由时
+   设置 `allow_stale=true`。
 
 工具参数摘要：
 
@@ -534,7 +773,185 @@ codex mcp list
 - `list_knowledge_updates` 必须给 `from_snapshot_id`；可选 `limit`、
   `budget_chars`、`cursor` 和 `allow_stale`。
 
-推荐 `task_context` 明确 market、frequency、data、objective、assumption。`search` 的 `limit` 为 1–20，`get/search` 的字符预算为 500–50000；更新列表的 `limit` 为 1–200。
+推荐 `task_context` 明确 market、frequency、data、objective、assumption。
+`search` 的 `limit` 为 1–20，`get/search` 的字符预算为 500–50000；更新列表的
+`limit` 为 1–200。
+
+#### `^src`、Evidence 与 MCP 的真实数据链
+
+完整路径是：
+
+```text
+原始 Markdown 字节
+→ 原生 ^src marker 或受审阅 citation overlay
+→ Evidence citation/resource 断言
+→ release content/mcp_search.json
+→ 本机只读 knowledge mirror
+→ search_quant_knowledge 返回候选 object_id
+→ get_quant_knowledge 返回 canonical source_citations
+```
+
+这里有五条不能混淆的边界：
+
+1. `^src:{citation_id}` 是展示层定位符，不是 PDF、来源原文或“模型已经证明”的
+   标记；`citation_id` 必须来自受审阅 Evidence，不能手写。
+2. 本机 mirror 只保存签名/散列闭合的 MCP 检索 artifact 和身份指针，不复制
+   release SQLite、Evidence PDF 或完整 source object。
+3. `search_quant_knowledge` 的 snippet 只用于选择候选，不能直接充当最终证据；
+   最终结论只引用 `get_quant_knowledge` 返回的 `source_citations`。
+4. canonical locator 至少绑定 object、document version、source hash、span、精确
+   byte range 和 citation IDs；任一身份变化都应重新 search → get。
+5. overlay 只改变展示/引用投影，不改写原始 Archive Markdown 字节。找不到
+   Evidence 绑定时保留待核验状态，不能把文本相似当成正式引用。
+
+### 4.8 授权运维：真实 Codex/MCP 对照验收
+
+这一节不是研究员日常检索命令。它供授权验收人员回答一个更严格的问题：同一组
+研究任务在启用目标知识 MCP 和仅禁用该 MCP 两种条件下，是否产生可重放的质量净增益。
+入口是安装后提供的 `qrh-mcp-acceptance`，源码分别位于：
+
+```text
+quant_hub/src/quant_hub/knowledge_mcp/acceptance_cli.py
+quant_hub/src/quant_hub/knowledge_mcp/acceptance_contracts.py
+quant_hub/src/quant_hub/knowledge_mcp/acceptance_runner.py
+quant_hub/src/quant_hub/knowledge_mcp/evaluation.py
+```
+
+验收前必须先准备三份 canonical JSON 和逐 case prompt；`--evidence-root` 指向一个尚不存在、
+不纳入 Git 跟踪的目录：
+
+- preregistration：绑定 run、authority 三元组、server、model、配置散列、任务顺序、
+  工具预算和三项质量 marker；
+- launch config：绑定原生 Codex、目标 MCP 的完整 STDIO 配置、MCP Python/client config、
+  安装包完整 inventory、工作目录、执行范围与 evidence 父目录；
+- prompts manifest：把每个 `case_id` 映射到实际 prompt 文件；prompt bytes 必须与
+  preregistration 中的长度和 SHA-256 完全一致。
+
+**当前没有一键 acceptance 输入生成器。** `qrh-mcp-acceptance` 只负责验证并冻结已
+准备的输入，不会替操作者推导 authority、选择 case 或发明散列。禁止从本文的
+JSON 示例、单元测试 fixture 或旧 campaign 手抄字段，也不得人工填写 SHA-256、
+inventory 或 Authenticode 结果。授权编排脚本必须直接调用下列实现：
+
+- `knowledge_mcp/evaluation.py::build_acceptance_preregistration()`：由真实 prompt bytes、
+  case 合同和 authority identity 生成 canonical preregistration；
+- `knowledge_mcp/acceptance_contracts.py::collect_openai_authenticode()`、
+  `pin_runtime_closure()` 和 `validate_real_codex_launch_config_bytes()`：采集/固定运行时
+  bytes，并验证 launch config；
+- 同文件的 `build_real_codex_command()` 和 `build_real_request_material()`：从已验证
+  config 生成双臂命令与 dispatch 身份；
+- `knowledge_mcp/acceptance_runner.py::record_real_acceptance_inputs()`：重读上述 bytes 并以
+  create-only staging 闭合整个输入根。
+
+这些是可组合的底层 builder/validator，不是已完成的生产输入编排器。在项目
+补上受审核的一键生成器之前，授权人员应把一次性编排脚本和它读取的原始
+authority/prompt 一起纳入当次审核；不能把测试 `_fixture()` 当生产工具。
+
+launch config 的 schema 是 `qrh-mcp-real-codex-launch/v2-process-provenance`，闭合字段一个也
+不能增减。下面展示字段含义；正式文件必须用 UTF-8 closed canonical JSON 序列化，所有
+SHA-256 和 runtime file 行都要从实际 bytes 机械生成，不能照抄占位符：
+
+```json
+{
+  "schema_version": "qrh-mcp-real-codex-launch/v2-process-provenance",
+  "execution_scope": "local",
+  "evidence_parent": "<evidence-root的绝对父目录>",
+  "codex_executable": "<OpenAI签名的原生codex.exe绝对路径>",
+  "codex_executable_sha256": "<64位小写hex>",
+  "codex_authenticode": {
+    "status": "Valid",
+    "signer_subject": "<Get-AuthenticodeSignature返回的OpenAI subject>",
+    "signer_thumbprint": "<40或64位大写hex>"
+  },
+  "working_directory": "<实际研究或回测项目绝对路径>",
+  "sandbox": "read-only",
+  "timeout_seconds": 900,
+  "skip_git_repo_check": false,
+  "mcp_server": {
+    "command": "<qrh-knowledge-mcp.exe绝对路径>",
+    "command_sha256": "<64位小写hex>",
+    "args": ["serve-stdio", "--client-config", "<client-config绝对路径>"],
+    "cwd": "<MCP工作目录绝对路径>",
+    "env": {
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "PYTHONNOUSERSITE": "1",
+      "PYTHONPATH": "<installed quant_hub package目录的父目录>",
+      "PYTHONSAFEPATH": "1",
+      "PYTHONUTF8": "1"
+    },
+    "env_vars": [],
+    "enabled": true,
+    "required": true,
+    "enabled_tools": [
+      "search_quant_knowledge",
+      "get_quant_knowledge",
+      "list_knowledge_updates"
+    ],
+    "default_tools_approval_mode": "writes",
+    "startup_timeout_sec": 20,
+    "tool_timeout_sec": 60,
+    "client_config_path": "<同一个client-config绝对路径>",
+    "client_config_sha256": "<64位小写hex>",
+    "python_executable": "<launcher实际绑定的python.exe绝对路径>",
+    "python_executable_sha256": "<64位小写hex>",
+    "runtime_closures": [
+      {
+        "name": "quant_hub_package",
+        "root": "<installed quant_hub package绝对目录>",
+        "files": [{"relative_path": "__init__.py", "sha256": "<实际hex>"}]
+      },
+      {
+        "name": "quant_hub_distribution",
+        "root": "<quant_research_hub-*.dist-info绝对目录>",
+        "files": [{"relative_path": "METADATA", "sha256": "<实际hex>"}]
+      }
+    ]
+  }
+}
+```
+
+`runtime_closures[].files` 必须列出 root 下全部文件，按 `/` 风格 UTF-8 相对路径严格递增，
+不能只列示例中的一行。`codex_executable` 必须由 `shell=False` 直接启动，Windows 只接受
+OpenAI Authenticode `Valid` 的 `.exe`，不接受 `.ps1/.cmd/.bat` 或把 `sys.executable` 改名
+冒充 Codex。MCP command 也必须是 native `qrh-knowledge-mcp.exe`，并同时冻结其实际
+`python.exe`、client config、package 与 `.dist-info`；`PYTHONPATH` 必须指向冻结 package root
+的父目录，`PYTHONSAFEPATH/PYTHONNOUSERSITE` 必须为 `1`，`env_vars` 必须为空，避免从 cwd、
+user site 或继承环境加载另一份同名运行时。
+
+`execution_scope=production_exact_d` 时，`evidence_parent` 必须机械解析到
+`D:\quant\quant_platform\audit` 内；`local` 也只能写到显式父目录的直接子目录。任一路径含
+symlink/junction/reparse、目标根已存在、inventory 有额外文件，都会拒绝。`timeout_seconds`
+只能是 1–3600 的整数；非 Git 工作目录才把 `skip_git_repo_check` 设为 `true`，它不改变
+trust 或 MCP 权限。
+
+正式顺序固定为：
+
+```powershell
+qrh-mcp-acceptance preregister `
+  --preregistration <绝对路径>\preregistration.json `
+  --launch-config <绝对路径>\launch-config.json `
+  --prompts-manifest <绝对路径>\prompts-manifest.json `
+  --evidence-root <不纳入Git跟踪的绝对路径>\mcp-acceptance\<run_id>
+
+qrh-mcp-acceptance run `
+  --evidence-root <不纳入Git跟踪的绝对路径>\mcp-acceptance\<run_id>
+
+qrh-mcp-acceptance verify `
+  --evidence-root <不纳入Git跟踪的绝对路径>\mcp-acceptance\<run_id>
+```
+
+`preregister` 先在 sibling staging directory 以不可覆盖方式写入并 fsync 全部输入，闭合
+inventory 后才 write-through 提交；`run` 对每个 case 依次运行 assisted 和 no-MCP 两臂，
+使用 `shell=False` 调用真实 `codex exec --json --ignore-user-config --ignore-rules`。两臂完整
+配置只能在目标 `enabled=true/false` 上不同，`required=true` 保持不变；同一 signed Codex 的
+app-server 会现场读取包含 packaged/system/enterprise/project/legacy-managed 的配置层，只排除
+`--ignore-user-config` 对应的 user layer；active 非 user 层引入 MCP/app/plugin 时直接失败。
+Windows runner 全程固定 Codex/MCP/Python/config/
+package bytes，查询真实 Codex、MCP launcher 和 Python process image，并以硬上限并行流式读取
+stdout/stderr。`verify` 从 closed inventory、原始 JSONL、intent/completion、prompt、config
+和 ledger 全量重放，不相信自报 PASS。当前即使真实两臂功能测试通过，也只会得到
+`REAL_CODEX_EVIDENCE_REPLAY_NON_AUTHORITATIVE`：它证明封闭回放自洽，但不是 Stage 5 资格证据。
+公开 fake 或 real/fake 混用只能得到 `PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`。平台尚缺独立可信
+attestation/countersignature，研究员不得把上述任一磁盘 receipt 当成生产放行授权。
 
 ## 5. 所有数据库与数据文件在哪里
 
@@ -570,7 +987,7 @@ release 的 `runtime\db`；第五个是开发/候选研究工作区库，正式�
 | SQLite | 负责什么 |
 | --- | --- |
 | `<var_root>\db\platform.sqlite3` | 对象、来源、pipeline、候选、审核、outbox |
-| `<var_root>\db\archive.sqlite3` | 研究、版本、搜索、topic、Dashboard、评论投影 |
+| `<var_root>\db\archive.sqlite3` | 研究、版本、搜索、topic、Dashboard；自带协作表供开发 fallback/候选快照使用，生产 live 评论不是这里的 release 副本 |
 | `<var_root>\db\research_papers.sqlite3` | Archive 论文、线索、元数据、获取、权利、引用 |
 | `<var_root>\db\paper_lab.sqlite3` | 外部论文阅读、笔记、阶段、审核、架构蓝图 |
 | `<var_root>\db\research_workspace.sqlite3` | 研究树、状态、观察、评论和历史 |
@@ -583,6 +1000,9 @@ release 的 `runtime\db`；第五个是开发/候选研究工作区库，正式�
 | Evidence PDF | `<var_root>\research_papers\objects\<2>\<2>\<sha>.pdf` |
 | Evidence TXT 清单 | `<var_root>\research_papers\exports\*.txt` |
 | Paper Lab 资产 | `<var_root>\paper_lab\assets\**` |
+| Paper Lab durable task | `<var_root>\paper_lab\tasks\<run_id>.json` |
+| Paper Lab 阶段暂存 | `<var_root>\paper_lab\staging\<run_id>\*.json` |
+| proj2 兼容只读快照 | `<var_root>\paper_lab\legacy_snapshot\**`（仅执行 legacy import 后存在，工具维护，禁止手改） |
 | 增量来源视图 | `<var_root>\integration\source_views\**` |
 | 跨域 Evidence 命令 | `<var_root>\integration\evidence_commands\**` |
 | 回放证据 | `<var_root>\replay\evidence\**` |
@@ -629,11 +1049,18 @@ D:\quant\quant_platform_publish_runtime\state\semantic_jobs.sqlite3
 D:\quant\quant_platform_publish_runtime\state\publish_state.json
 D:\quant\quant_platform_publish_runtime\state\semantic_promotion_receipts\
 D:\quant\quant_platform_publish_runtime\state\.semantic_authority_promotion.lock
+D:\quant\quant_platform_publish_runtime\state\audit\*.json
+D:\quant\quant_platform_publish_runtime\state\publish_state.lock
 ```
 
 `semantic_jobs.sqlite3` 是已经提升的语义 authority；`publish_state.json` 记录发布
-编排状态；promotion receipts 和 lock 分别闭合提升审计与单写者边界。这些都是
-工具维护数据，不应人工编辑。
+编排状态；promotion receipts 和 lock 分别闭合提升审计与单写者边界；`audit`
+保存发布编排收据；`publish_state.lock` 只在运行中短暂存在。这些都是工具维护
+数据，不应人工编辑或因“当前没进程”而手工删除。
+
+配置还声明 `runtime_base` 与 `runtime_base_manifest_sha256`。它们是候选组装时
+按散列核验的只读基线输入，不是 active authority、生产 state 或额外恢复根；
+实际位置必须从当前外置配置读取，不能把本文示例路径写死到脚本。
 
 具体 state/candidate 根仍以外置配置的解析结果为准；不要仅凭本文路径把某个
 临时候选当成 authority。
@@ -688,9 +1115,13 @@ chapter_manifests\**\*.json
 
 它们是密封的 schema/展示契约，不是研究员可编辑正文。
 
-`content\source_objects\sha256\<digest>` 没有文件扩展名是设计行为；它由 manifest 和散列解析。`reference\archive\.keep` 也不表示 release 内有一份可编辑 Archive 副本。
+`content\source_objects\sha256\<digest>` 没有文件扩展名是设计行为；它由
+manifest 和散列解析。`reference\archive\.keep` 也不表示 release 内有一份
+可编辑 Archive 副本。
 
-release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。生产 Web 启动所需的模板、静态资源、presentation manifest 和 launcher 都由 release manifest 闭合，不应从工作树临时混搭。
+release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。生产 Web 启动
+所需的模板、静态资源、presentation manifest 和 launcher 都由 release manifest
+闭合，不应从工作树临时混搭。
 
 ### 5.4 VM 生产态：exact-D active/prior/state/audit
 
@@ -712,7 +1143,7 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\control\service_install_candidate.json` | 服务安装候选证据 |
 | `<VM_ROOT>\control\exact_runtime_tooling.json` | 固定工具链身份 |
 | `<VM_ROOT>\control\tooling_update_pending.json` | 工具链更新的短生命周期 journal；仅由 tooling updater 创建和维护，成功收尾后清理，禁止手工编辑或删除 |
-| `<VM_ROOT>\tooling\python\Lib\site-packages\quant_hub\migrations\research_workspace\*.sql` | controller 使用的 6 个 workspace 迁移；由密封 candidate 原子安装并纳入整包 inventory/tooling claim，禁止手工复制或修改 |
+| exact-D workspace 迁移（完整路径见下） | controller 的 6 个迁移；密封安装并纳入 inventory；禁止手改 |
 | `<VM_ROOT>\control\writer_handoff_pending.json` | handoff 进行中的受控 journal；只由 handoff 工具维护 |
 | `<VM_ROOT>\control\writer-handoff-intents\*.json` | writer handoff 意图 |
 | `<VM_ROOT>\state\comments.sqlite3` | 当前生产评论与 Dashboard 外置状态 |
@@ -731,7 +1162,15 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\tooling\python\` | exact-D 固定 Python 和 `quant_hub` 包 |
 | `<VM_ROOT>\objects\` | 历史/运维声明的 D 根对象区；当前服务读取 release 内的 `runtime\objects`，两处均不得手工修改 |
 
-每个 VM release 自身仍携带上一节列出的 `runtime\db`、`runtime\objects`、`runtime\research_papers` 和 `content\*.json`。生产服务把不可变 active release 与同一个 `<VM_ROOT>\state` 组合运行。
+表中 exact-D workspace 迁移的完整位置是：
+
+```text
+<VM_ROOT>\tooling\python\Lib\site-packages\quant_hub\migrations\research_workspace\*.sql
+```
+
+每个 VM release 自身仍携带上一节列出的 `runtime\db`、`runtime\objects`、
+`runtime\research_papers` 和 `content\*.json`。生产服务把不可变 active release
+与同一个 `<VM_ROOT>\state` 组合运行。
 
 生产连续性只以 exact-D 的 active、恰一 prior 和二者共用的当前 D state 为
 准。VM 现有 `C:\quant_platform`、`C:\quant_platform_data` 及其服务在 writer
@@ -774,6 +1213,34 @@ user scope 才会管理：
 
 镜像文件由 MCP 更新协议维护。不要手工把旧 `current.json` 指向一个未确认 release，也不要编辑 `mcp_search.json` 伪造 freshness。
 
+### 5.6 真实 MCP 验收证据根
+
+验收根必须是不纳入 Git 跟踪的新空目录，由 `--evidence-root` 显式指定；它不是生产
+数据库，也不进入 release。本机可使用受保护的外置目录；若在生产 VM 运行，则该目录
+必须位于 `<VM_ROOT>\audit\...` 等 exact-D 根内的 ignored 路径，不能写到 D 根外或 C 盘。
+Stage 5 closure 使用时，它还必须是 closure evidence root 下的相对子目录。一次已预注册
+并运行的根目录包含：
+
+```text
+<evidence_root>\preregistration.json
+<evidence_root>\preregistration.ledger.json
+<evidence_root>\launch-config.json
+<evidence_root>\input-manifest.json
+<evidence_root>\cases\<case-key>.prompt.bin
+<evidence_root>\dispatch\<arm-key>.intent.json
+<evidence_root>\dispatch\<arm-key>.trace.jsonl
+<evidence_root>\dispatch\<arm-key>.complete.json
+<evidence_root>\campaign-receipt.json
+```
+
+四个顶层输入和 `cases` 在 sibling staging directory 中一次闭合后才提交；`dispatch` 保存每个
+case 两臂的执行意图、原始 Codex JSONL 与完成收据；成功或完整评测失败的 real campaign 才有
+v3 dispatch-replay `campaign-receipt.json`。若某臂未完成 provenance/trace 门禁，顶层改为
+`campaign-failure.json`，其 authority 固定为 `PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`，不能送入
+Stage 5 作为 PASS。verifier 要求目录实际文件集合与预期集合完全相等，任何日志、手工说明、
+重复 receipt 或隐藏的额外文件都会使整根 non-qualifying。
+这些文件都是审核证据，不能手改、补写、复用旧 run 或从 Git 提交中反推生成。
+
 ## 6. 代码和接口地图
 
 下面是排查行为时应先看的真实实现，不必从生成文件反推规则：
@@ -781,29 +1248,59 @@ user scope 才会管理：
 | 领域 | 源码入口 |
 | --- | --- |
 | 路径和数据库配置 | `quant_hub/src/quant_hub/config.py` |
+| Flask 应用配置与外置 state 装配 | `quant_hub/src/quant_hub/app.py` |
 | 主 CLI | `quant_hub/src/quant_hub/cli.py` |
 | 增量 intake 工具 | `quant_hub/tools/run_incremental_intake.py` |
 | 增量编排 | `quant_hub/src/quant_hub/integration/` |
 | 论文线索提取 | `quant_hub/src/quant_hub/integration/clues.py` |
 | Archive 解析/引用 marker | `quant_hub/src/quant_hub/archive/markdown.py` |
+| Archive 发现、原文读取与 release 目录 | `quant_hub/src/quant_hub/archive/discovery.py`、`source_reader.py` 与 `catalog.py` |
+| Archive 数据库/业务服务 | `quant_hub/src/quant_hub/archive/database.py` 与 `service.py` |
 | Evidence 入库/服务 | `quant_hub/src/quant_hub/evidence/` |
+| Evidence provider 与权利状态 | `quant_hub/src/quant_hub/evidence/providers.py`、`resources.py` 与 `ingest.py` |
+| Crossref/arXiv 受审核 manifest builder | `quant_hub/src/quant_hub/evidence/canonicalization_builders.py` |
 | Evidence TXT 导出 | `quant_hub/src/quant_hub/evidence/export.py` |
 | PDF 物化抓取 | `quant_hub/tools/fetch_evidence_papers.py` |
 | Paper Lab 扫描 | `quant_hub/src/quant_hub/paper_lab/scanner.py` |
 | Paper Lab 工作流 | `quant_hub/src/quant_hub/paper_lab/` |
 | Web/API 主路由 | `quant_hub/src/quant_hub/web/routes.py` |
+| 通用新研究 Web/评论路由 | `quant_hub/src/quant_hub/generic_research/web.py` |
 | Evidence Web/API | `quant_hub/src/quant_hub/evidence/web.py` |
 | Paper Lab Web/API | `quant_hub/src/quant_hub/paper_lab/web.py` |
 | 评论/进度协作 | `quant_hub/src/quant_hub/collaboration/` |
+| 评论者身份合同 | `quant_hub/src/quant_hub/archive/contracts.py` 与 `quant_hub/src/quant_hub/collaboration/service.py` |
 | 研究树工作区 | `quant_hub/src/quant_hub/research_workspace/` |
 | MCP CLI/stdio | `quant_hub/src/quant_hub/knowledge_mcp/` |
-| 发布器 | `quant_hub/src/quant_hub/ops/publish.py` |
+| MCP 安装、客户端配置与镜像协议 | `quant_hub/src/quant_hub/knowledge_mcp/install.py` 与 `mirror.py` |
+| MCP stdio 工具调度/检索服务 | `quant_hub/src/quant_hub/knowledge_mcp/server.py` 与 `service.py` |
+| MCP 真实对照验收 CLI | `quant_hub/src/quant_hub/knowledge_mcp/acceptance_cli.py` |
+| MCP 验收输入/命令闭包 | `quant_hub/src/quant_hub/knowledge_mcp/acceptance_contracts.py` |
+| MCP 验收执行与证据写入 | `quant_hub/src/quant_hub/knowledge_mcp/acceptance_runner.py` |
+| MCP 验收重放与判分 | `quant_hub/src/quant_hub/knowledge_mcp/evaluation.py` |
+| 发布编排入口 | `quant_hub/src/quant_hub/ops/publish.py` |
+| Git 外发布配置与候选闭包 | `quant_hub/src/quant_hub/ops/publish_runtime.py` |
+| 候选文件 inventory/release 组装 | `quant_hub/src/quant_hub/ops/release_builder.py` 与 `quant_hub/tools/assemble_reviewed_delivery.py` |
+| writer handoff 状态机 | `quant_hub/src/quant_hub/ops/writer_handoff.py` |
+| Stage 5/6 exact-D 证据闭合 | `quant_hub/src/quant_hub/ops/release_closure.py` |
 | VM 部署 CLI | `quant_hub/src/quant_hub/ops/vm_deploy_cli.py` |
 | VM 路径/状态实现 | `quant_hub/src/quant_hub/ops/local_deployment_persistence.py` |
+| exact-D 服务装配 | `quant_hub/src/quant_hub/ops/service_entry.py` 与 `quant_hub/src/quant_hub/ops/local_exact_runtime_server.py` |
 | VM 固定工具链原子更新器 | `quant_hub/tools/update_vm_tooling.py` |
 | 本地审核启动器 | `quant_hub/tools/run_local.py` |
 
-数据库 schema 不靠 README 口述；最终 authority 是 `quant_hub/migrations/<domain>` 中的迁移和对应 repository/service 代码。
+这里没有一个包办所有配置的 `AppConfig` 类。五个业务库和对象路径由
+`config.py` 的 `Settings` 定义；Flask 运行配置由 `app.py` 的 `app.config` 消费；生产
+exact-D 再由 `service_entry.py` 和 `local_exact_runtime_server.py` 注入并闭合
+`COMMENT_DATABASE_PATH`、`RESEARCH_WORKSPACE_DATABASE_PATH`、
+`GENERIC_RESEARCH_RELEASE_ROOT`、`TRUSTED_ORIGINS` 等关键值。
+
+数据库 schema 不靠 README 口述。platform、archive、research_papers、paper_lab 和
+research_workspace 以 `quant_hub/migrations/<domain>` 的迁移和对应 repository/service
+代码为 authority；独立生产评论库的基础/扩展 schema authority 在
+`quant_hub/src/quant_hub/collaboration/comment_store.py`。固定评论者与防冒充语义还由
+`archive/contracts.py`、`collaboration/service.py` 及 archive/workspace 迁移共同强制，
+不能只看裸 `comments.sqlite3` 的表约束。生产 live 评论和 Dashboard authority 是
+`<VM_ROOT>\state\comments.sqlite3`，release 内 `archive.sqlite3` 的协作表不是 current state。
 发布时，`runtime_contract\migrations\research_workspace\` 是 release 内的密封来源；
 VM tooling updater 会逐文件核对 release manifest 后，将这 6 个文件安装到上表的
 site-packages 路径，并把它们计入 `quant_hub` 整包 inventory。生产 runtime 只接受
@@ -873,7 +1370,9 @@ handoff、固定工具链更新和失败处置见 [`WRITER_HANDOFF.md`](WRITER_H
 
 ### 8.1 “PDF 已经下载，为什么论文还不是正式状态？”
 
-下载成功只证明网络传输和 PDF 结构检查通过。继续检查论文身份、元数据证据、权利状态、`resource_id`、review certificate 和 release activation。`ACQUISITION_MANIFEST.json` 不是发布证书。
+下载成功只证明网络传输和 PDF 结构检查通过。继续检查论文身份、元数据证据、
+权利状态、`resource_id`、review certificate 和 release activation。
+`ACQUISITION_MANIFEST.json` 不是发布证书。
 
 ### 8.2 “新 Markdown 已放进目录，为什么首页没有？”
 
@@ -883,11 +1382,16 @@ handoff、固定工具链更新和失败处置见 [`WRITER_HANDOFF.md`](WRITER_H
 
 ### 8.3 “Paper Lab 没发现 PDF”
 
-确认文件在 `quant_hub\paper_lab\papers` 顶层、扩展名为 `.pdf`、是普通文件、文件头为 `%PDF-`，再看 scan 的 quarantined/rejected 原因。不要为了通过扫描而修改散列对象或数据库行。
+确认文件在 `quant_hub\paper_lab\papers` 顶层、扩展名为 `.pdf`、是普通文件、
+文件头为 `%PDF-`，再看 scan 的 quarantined/rejected 原因。不要为了通过扫描而
+修改散列对象或数据库行。
 
 ### 8.4 “MCP 搜不到最新结果”
 
-先运行 `doctor`，检查状态是 fresh、stale 还是 unavailable；检查 `pending_transition.json`，再执行 `list_knowledge_updates` 和新的 search → get。不要手工改 `current.json`。
+先运行 `doctor`，检查状态是 fresh、stale、unavailable 还是
+transition_pending；检查
+`pending_transition.json`，再执行 `list_knowledge_updates` 和新的 search → get。
+不要手工改 `current.json`。
 
 ### 8.5 “Web 写请求返回 403/409”
 
@@ -920,5 +1424,6 @@ binding、release manifest、audit receipts 和当前 D state。只有完整通�
 - [`KNOWLEDGE_MCP.md`](KNOWLEDGE_MCP.md)：MCP 安装、doctor、同步和故障处置。
 - [`KNOWLEDGE_COMPILATION.md`](KNOWLEDGE_COMPILATION.md)：语义编译候选、人工复核和放行。
 - [`WRITER_HANDOFF.md`](WRITER_HANDOFF.md)：exact-D writer handoff、固定工具链和回退边界。
-- [`../../quant_hub/src/quant_hub/evidence/REVIEWED_MATERIAL_IMPORT.md`](../../quant_hub/src/quant_hub/evidence/REVIEWED_MATERIAL_IMPORT.md)：受审阅论文材料导入规则。
+- [`Evidence 受审阅材料导入规则`](../../quant_hub/src/quant_hub/evidence/REVIEWED_MATERIAL_IMPORT.md)：
+  受审阅论文材料导入规则。
 - [`../../研究修订工作区/README.md`](../../研究修订工作区/README.md)：修订工作区的原文保护和交付规则。

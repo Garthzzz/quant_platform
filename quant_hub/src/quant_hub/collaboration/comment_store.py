@@ -318,6 +318,85 @@ BEFORE DELETE ON comment_target BEGIN
 END;
 """
 
+_COMMENT_TARGET_OBJECT_NAMES = (
+    "comment_target",
+    "comment_target_comment_identity",
+    "comment_target_document_idx",
+    "comment_target_no_delete",
+    "comment_target_no_update",
+    "comment_target_origin_version_idx",
+    "comment_target_schema",
+)
+_COMMENT_TARGET_NAMED_OBJECT_SHAPE = {
+    "comment_target": ("table", "comment_target"),
+    "comment_target_comment_identity": ("trigger", "comment_target"),
+    "comment_target_document_idx": ("index", "comment_target"),
+    "comment_target_no_delete": ("trigger", "comment_target"),
+    "comment_target_no_update": ("trigger", "comment_target"),
+    "comment_target_origin_version_idx": ("index", "comment_target"),
+    "comment_target_schema": ("table", "comment_target_schema"),
+}
+
+
+def _comment_target_schema_rows(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str | None], ...]:
+    placeholders = ",".join("?" for _item in _COMMENT_TARGET_OBJECT_NAMES)
+    return tuple(
+        (str(row[0]), str(row[1]), str(row[2]), None if row[3] is None else str(row[3]))
+        for row in connection.execute(
+            f"""
+            SELECT type,name,tbl_name,sql
+            FROM sqlite_master
+            WHERE name IN ({placeholders})
+               OR lower(tbl_name) IN ('comment_target','comment_target_schema')
+               OR lower(name) GLOB 'comment_target*'
+            ORDER BY type,name,tbl_name
+            """,
+            _COMMENT_TARGET_OBJECT_NAMES,
+        )
+    )
+
+
+def _approved_comment_target_schema_rows() -> tuple[
+    tuple[str, str, str, str | None], ...
+]:
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        reference.executescript(_SCHEMA)
+        reference.executescript(_COMMENT_TARGET_SCHEMA)
+        return _comment_target_schema_rows(reference)
+    finally:
+        reference.close()
+
+
+def _comment_target_schema_sha256(
+    rows: tuple[tuple[str, str, str, str | None], ...],
+) -> str:
+    raw = json.dumps(
+        rows,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _require_approved_comment_target_schema(connection: sqlite3.Connection) -> None:
+    observed = _comment_target_schema_rows(connection)
+    observed_named_shape = {
+        name: (object_type, table_name)
+        for object_type, name, table_name, _sql in observed
+        if name in _COMMENT_TARGET_OBJECT_NAMES
+    }
+    approved = _approved_comment_target_schema_rows()
+    if (
+        observed_named_shape != _COMMENT_TARGET_NAMED_OBJECT_SHAPE
+        or observed != approved
+        or _comment_target_schema_sha256(observed)
+        != _comment_target_schema_sha256(approved)
+    ):
+        raise RuntimeError("评论锚点扩展 schema 不是批准的 exact DDL")
+
 _MISCLASSIFIED_PROGRESS_NODE_IDS = (
     "rnode_e2a54085f3cd423e8521dceb9d75b403",
     "rnode_38506735478543cfa6a6c1368fc1e298",
@@ -766,6 +845,75 @@ def _backfill_legacy_comment_targets(connection: sqlite3.Connection) -> int:
     return len(rows)
 
 
+def expand_legacy_comment_target_schema(connection: sqlite3.Connection) -> int:
+    """Atomically expand an exact legacy v2 comment store to v2+[3].
+
+    This deliberately accepts an already-open connection rather than a path.
+    Deployment owns the fixed-D path, writer fence, file lifecycle, final
+    verification and commit.  A successful legacy expansion intentionally
+    leaves its transaction open so the caller can verify and then commit or
+    roll it back atomically.  A current v2+[3] store is an idempotent no-op,
+    while partial extension material fails closed instead of being repaired.
+    """
+
+    if connection.in_transaction:
+        raise RuntimeError("评论锚点 schema 扩展要求独立事务边界")
+    store_versions = [
+        int(row[0])
+        for row in connection.execute(
+            "SELECT version FROM comment_store_schema ORDER BY version"
+        )
+    ]
+    if store_versions != [1, 2]:
+        raise RuntimeError(f"不支持的持久评论库 schema：{store_versions}")
+
+    present_objects = _comment_target_schema_rows(connection)
+    if present_objects:
+        _require_approved_comment_target_schema(connection)
+        extension_versions = [
+            int(row[0])
+            for row in connection.execute(
+                "SELECT version FROM comment_target_schema ORDER BY version"
+            )
+        ]
+        if extension_versions != [COMMENT_TARGET_SCHEMA_VERSION]:
+            raise RuntimeError(
+                f"不支持的评论锚点扩展 schema：{extension_versions}"
+            )
+        missing_targets = int(
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM comment AS comment_row
+                WHERE NOT EXISTS(
+                    SELECT 1 FROM comment_target AS target
+                    WHERE target.comment_id=comment_row.comment_id
+                )
+                """
+            ).fetchone()[0]
+        )
+        if missing_targets:
+            raise RuntimeError("当前评论锚点 schema 存在未回填 legacy comment")
+        return 0
+
+    try:
+        # executescript normally commits a pending transaction first.  The
+        # explicit BEGIN here is therefore the sole boundary and intentionally
+        # has no COMMIT in the script; marker/backfill join the same transaction.
+        connection.executescript("BEGIN IMMEDIATE;\n" + _COMMENT_TARGET_SCHEMA)
+        connection.execute(
+            "INSERT INTO comment_target_schema(version,applied_at) VALUES(?,?)",
+            (COMMENT_TARGET_SCHEMA_VERSION, utc_now()),
+        )
+        backfilled = _backfill_legacy_comment_targets(connection)
+        _require_approved_comment_target_schema(connection)
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    return backfilled
+
+
 def initialize_comment_store(
     database_path: Path,
     *,
@@ -896,6 +1044,7 @@ __all__ = [
     "COMMENT_TARGET_SCHEMA_VERSION",
     "comment_connection",
     "comment_store_state",
+    "expand_legacy_comment_target_schema",
     "initialize_comment_store",
     "resolve_broadcast_data_root",
 ]
