@@ -219,6 +219,7 @@ jobs:
         shell: pwsh
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONIOENCODING: "utf-8"
           PYTHONUTF8: "1"
         run: |
           $wheelRoot = Join-Path $env:RUNNER_TEMP "qrh-wheel"
@@ -437,7 +438,7 @@ jobs:
             "quant_hub.ops.tooling_update_host",
             "quant_hub.ops.vm_bootstrap_cli"
           )) {
-            & $venvPython -I -B -m $module --help | Out-Null
+            & $venvPython -X utf8 -I -B -m $module --help | Out-Null
             if ($LASTEXITCODE -ne 0) {
               throw "wheel module smoke failed: $module"
             }
