@@ -95,6 +95,22 @@ _KEY_FILES = (
     ("local_release_identity", "ops/local_release_identity.py"),
     ("windows_service_host", "ops/windows_service.py"),
 )
+_WORKSPACE_MIGRATION_FILES = (
+    "0001_research_workspace.down.sql",
+    "0001_research_workspace.up.sql",
+    "0002_project_semantics.down.sql",
+    "0002_project_semantics.up.sql",
+    "0003_project_creation_command.down.sql",
+    "0003_project_creation_command.up.sql",
+)
+_WORKSPACE_MIGRATION_SOURCE_PREFIX = (
+    "runtime_contract/migrations/research_workspace/"
+)
+_WORKSPACE_CODE_MIGRATION_SOURCE_PREFIX = (
+    "runtime_contract/code/migrations/research_workspace/"
+)
+_WORKSPACE_MIGRATION_PACKAGE_PREFIX = "migrations/research_workspace/"
+_WORKSPACE_LEGACY_MIGRATION_PREFIX = "migrations/research_workspace/"
 
 
 class ToolingUpdateError(RuntimeError):
@@ -178,11 +194,25 @@ def _regular_files(root: Path) -> dict[str, tuple[int, str]]:
 
 
 def _package_inventory_sha256(records: Mapping[str, tuple[int, str]]) -> str:
+    """Service-install inventory used by windows_service and PowerShell."""
+
     payload = "".join(
         f"{name}\t{size}\t{digest}\n"
         for name, (size, digest) in sorted(records.items())
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _tooling_package_inventory_sha256(
+    records: Mapping[str, tuple[int, str]],
+) -> str:
+    """Exact-runtime tooling inventory used by the guarded scanner."""
+
+    inventory = [
+        {"relative_path": name, "bytes": size, "sha256": digest}
+        for name, (size, digest) in sorted(records.items())
+    ]
+    return hashlib.sha256(_canonical(inventory)).hexdigest()
 
 
 def _identity_sha256(value: object) -> str:
@@ -203,7 +233,10 @@ def _file_claim(
 
 
 def _build_tooling_claim(
-    root: Path, package_records: Mapping[str, tuple[int, str]]
+    root: Path,
+    package_records: Mapping[str, tuple[int, str]],
+    *,
+    package_inventory_sha256: str | None = None,
 ) -> Mapping[str, object]:
     value: dict[str, object] = {
         "schema_version": _TOOLING_SCHEMA,
@@ -222,7 +255,11 @@ def _build_tooling_claim(
         "relative_path": "tooling/python/Lib/site-packages/quant_hub",
         "inventory_algorithm": _PACKAGE_ALGORITHM,
         "entry_count": len(package_records),
-        "inventory_sha256": _package_inventory_sha256(package_records),
+        "inventory_sha256": (
+            package_inventory_sha256
+            if package_inventory_sha256 is not None
+            else _tooling_package_inventory_sha256(package_records)
+        ),
     }
     package["package_sha256"] = _identity_sha256(package)
     value["package"] = package
@@ -277,32 +314,88 @@ def _read_candidate_manifest(
         raise ToolingUpdateError("candidate release inventory is absent")
     prefix = "runtime_contract/code/src/quant_hub/"
     expected: dict[str, tuple[int, str]] = {}
+    expected_migrations: dict[str, tuple[int, str]] = {}
+    expected_code_migrations: dict[str, tuple[int, str]] = {}
     for item in files:
         if not isinstance(item, dict) or set(item) != {"path", "bytes", "sha256"}:
             raise ToolingUpdateError("candidate release inventory entry differs")
         name = item.get("path")
-        if not isinstance(name, str) or not name.startswith(prefix):
+        if not isinstance(name, str):
             continue
-        relative = name[len(prefix) :]
+        if name.startswith(prefix):
+            relative = name[len(prefix) :]
+            destination = relative
+            target = expected
+        elif name.startswith(_WORKSPACE_MIGRATION_SOURCE_PREFIX):
+            relative = name[len(_WORKSPACE_MIGRATION_SOURCE_PREFIX) :]
+            destination = _WORKSPACE_MIGRATION_PACKAGE_PREFIX + relative
+            target = expected_migrations
+        elif name.startswith(_WORKSPACE_CODE_MIGRATION_SOURCE_PREFIX):
+            relative = name[len(_WORKSPACE_CODE_MIGRATION_SOURCE_PREFIX) :]
+            destination = _WORKSPACE_MIGRATION_PACKAGE_PREFIX + relative
+            target = expected_code_migrations
+        elif name.startswith(_WORKSPACE_LEGACY_MIGRATION_PREFIX):
+            raise ToolingUpdateError("candidate workspace migration layout differs")
+        else:
+            continue
         size = item.get("bytes")
         digest = item.get("sha256")
         if (
             not relative
-            or relative in expected
+            or (target is not expected and "/" in relative)
+            or destination in target
             or isinstance(size, bool)
             or not isinstance(size, int)
             or size < 0
             or not isinstance(digest, str)
         ):
             raise ToolingUpdateError("candidate package inventory entry differs")
-        expected[relative] = (size, _sha(digest, "candidate file hash"))
+        target[destination] = (size, _sha(digest, "candidate file hash"))
     if not expected:
         raise ToolingUpdateError("candidate package inventory is empty")
+    expected_migration_paths = {
+        _WORKSPACE_MIGRATION_PACKAGE_PREFIX + name
+        for name in _WORKSPACE_MIGRATION_FILES
+    }
+    if set(expected_migrations) != expected_migration_paths:
+        raise ToolingUpdateError("candidate workspace migration inventory differs")
+    if expected_code_migrations and expected_code_migrations != expected_migrations:
+        raise ToolingUpdateError("candidate code migration mirror differs")
+    if set(expected).intersection(expected_migrations):
+        raise ToolingUpdateError("candidate tooling destination inventory collides")
     source = _guard_chain(
         candidate, candidate / "runtime_contract" / "code" / "src" / "quant_hub"
     )
     if _regular_files(source) != expected:
         raise ToolingUpdateError("candidate package bytes differ from release inventory")
+    migration_source = _guard_chain(
+        candidate,
+        candidate / "runtime_contract" / "migrations" / "research_workspace",
+    )
+    source_migrations = {
+        _WORKSPACE_MIGRATION_PACKAGE_PREFIX + name: record
+        for name, record in _regular_files(migration_source).items()
+    }
+    if source_migrations != expected_migrations:
+        raise ToolingUpdateError(
+            "candidate workspace migration bytes differ from release inventory"
+        )
+    code_migration_source = (
+        candidate / "runtime_contract" / "code" / "migrations" / "research_workspace"
+    )
+    if expected_code_migrations:
+        code_migration_source = _guard_chain(candidate, code_migration_source)
+        source_code_migrations = {
+            _WORKSPACE_MIGRATION_PACKAGE_PREFIX + name: record
+            for name, record in _regular_files(code_migration_source).items()
+        }
+        if source_code_migrations != expected_code_migrations:
+            raise ToolingUpdateError(
+                "candidate code migration mirror bytes differ from release inventory"
+            )
+    elif os.path.lexists(code_migration_source):
+        raise ToolingUpdateError("candidate code migration mirror is unsealed")
+    expected.update(expected_migrations)
     return value, expected
 
 
@@ -311,11 +404,16 @@ def _write_atomic(path: Path, value: Mapping[str, object], *, suffix: str) -> No
     if temporary.exists():
         raise ToolingUpdateError("tooling update temporary file already exists")
     raw = _canonical(value)
-    with temporary.open("xb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary.exists():
+            temporary.unlink()
+        raise
 
 
 def _write_atomic_new(
@@ -370,9 +468,9 @@ def _validate_installed_bindings(
     expected_package = _guard_chain(root, package)
     if install.get("quant_hub_package_root") != str(expected_package):
         raise ToolingUpdateError("installed tooling package path differs")
-    if _package_inventory_sha256(package_records) != install.get(
+    if install.get(
         "quant_hub_package_inventory_sha256"
-    ):
+    ) != _package_inventory_sha256(package_records):
         raise ToolingUpdateError("installed tooling package binding differs")
     for field, relative in _INSTALL_PATH_BINDINGS.items():
         expected = _guard_chain(root, root.joinpath(*relative.split("/")))
@@ -388,13 +486,18 @@ def _validate_installed_bindings(
 
 def _copy_package(
     source: Path,
+    migration_source: Path,
     destination: Path,
     expected: Mapping[str, tuple[int, str]],
 ) -> None:
     destination.mkdir()
     try:
         for name, (size, digest) in sorted(expected.items()):
-            source_path = source.joinpath(*name.split("/"))
+            if name.startswith(_WORKSPACE_MIGRATION_PACKAGE_PREFIX):
+                source_name = name[len(_WORKSPACE_MIGRATION_PACKAGE_PREFIX) :]
+                source_path = migration_source / source_name
+            else:
+                source_path = source.joinpath(*name.split("/"))
             target = destination.joinpath(*name.split("/"))
             target.parent.mkdir(parents=True, exist_ok=True)
             raw = source_path.read_bytes()
@@ -552,6 +655,7 @@ def update_vm_tooling(
     attempt_id: str,
     allow_test_root: bool = False,
     service_stopped_probe: Callable[[], bool] = _service_stopped,
+    fail_after_package_to_prior: bool = False,
     fail_after_package_swap: bool = False,
     fail_after_claims_swap: bool = False,
 ) -> Mapping[str, object]:
@@ -567,7 +671,11 @@ def update_vm_tooling(
         raise ToolingUpdateError("test tooling update cannot target production D")
     if not allow_test_root and service_stopped_probe is not _service_stopped:
         raise ToolingUpdateError("production service-state probe is not injectable")
-    if (fail_after_package_swap or fail_after_claims_swap) and not allow_test_root:
+    if (
+        fail_after_package_to_prior
+        or fail_after_package_swap
+        or fail_after_claims_swap
+    ) and not allow_test_root:
         raise ToolingUpdateError("tooling update fault injection is test-only")
     _guard_chain(root, root)
     candidate = _guard_chain(root, root / "incoming" / f"{release}.partial")
@@ -580,6 +688,9 @@ def update_vm_tooling(
         raise ToolingUpdateError("D service must be STOPPED before tooling update")
 
     source = candidate / "runtime_contract" / "code" / "src" / "quant_hub"
+    migration_source = (
+        candidate / "runtime_contract" / "migrations" / "research_workspace"
+    )
     package = _guard_chain(
         root,
         root / "tooling" / "python" / "Lib" / "site-packages" / "quant_hub",
@@ -614,7 +725,14 @@ def update_vm_tooling(
         raise ToolingUpdateError("service install candidate is unreadable") from error
     old_inventory = _regular_files(package)
     install = _validate_installed_bindings(root, install, package, old_inventory)
-    expected_old_tooling = _build_tooling_claim(root, old_inventory)
+    expected_old_toolings = (
+        _build_tooling_claim(root, old_inventory),
+        _build_tooling_claim(
+            root,
+            old_inventory,
+            package_inventory_sha256=_package_inventory_sha256(old_inventory),
+        ),
+    )
     tooling_raw: bytes | None = None
     if not tooling_bootstrap:
         try:
@@ -622,10 +740,10 @@ def update_vm_tooling(
             tooling = json.loads(tooling_raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ToolingUpdateError("exact runtime tooling claim is unreadable") from error
-        if tooling_raw != _canonical(tooling) or tooling != expected_old_tooling:
+        if tooling_raw != _canonical(tooling) or tooling not in expected_old_toolings:
             raise ToolingUpdateError("exact runtime tooling claim differs from live bytes")
 
-    _copy_package(source, stage, expected)
+    _copy_package(source, migration_source, stage, expected)
     updated = dict(install)
     updated["quant_hub_package_inventory_sha256"] = (
         _package_inventory_sha256(expected)
@@ -648,11 +766,15 @@ def update_vm_tooling(
         "authority": "coordination_only",
     }
     _write_atomic(journal_path, journal, suffix=attempt)
+    prior_renamed = False
     package_swapped = False
     candidate_swapped = False
     tooling_swapped = False
     try:
         os.replace(package, prior)
+        prior_renamed = True
+        if fail_after_package_to_prior:
+            raise ToolingUpdateError("injected failure after package moved to prior")
         os.replace(stage, package)
         package_swapped = True
         journal["phase"] = "package_swapped"
@@ -692,6 +814,7 @@ def update_vm_tooling(
                 os.replace(install_prior, install_path)
             if package_swapped:
                 _remove_tree(package)
+            if prior_renamed:
                 os.replace(prior, package)
             _remove_tree(stage)
             if install_prior.exists():

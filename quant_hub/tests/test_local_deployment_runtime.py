@@ -18,6 +18,7 @@ from quant_hub.ops.local_deployment_runtime import (
     LocalDeploymentRuntimeError,
     ProductionWindowsDeploymentRuntime,
     TestOnlyWindowsDeploymentRuntimeAdapter as RuntimeAdapter,
+    _resolve_product_workspace_migration_root,
 )
 from quant_hub.ops.local_runtime_evidence import (
     DeploymentCanaryEvidence,
@@ -114,6 +115,40 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
             RuntimeAdapter.for_test_only(  # type: ignore[arg-type]
                 str(self.root)
             )
+
+    def test_product_migration_layout_resolver_requires_exactly_one_complete_layout(self) -> None:
+        project = self.root / "layout-project"
+        module_file = project / "src" / "quant_hub" / "ops" / "runtime.py"
+        module_file.parent.mkdir(parents=True)
+        module_file.write_bytes(b"runtime\n")
+        source_layout = project / "migrations" / "research_workspace"
+        installed_layout = (
+            project / "src" / "quant_hub" / "migrations" / "research_workspace"
+        )
+
+        with self.assertRaisesRegex(LocalDeploymentRuntimeError, "absent or ambiguous"):
+            _resolve_product_workspace_migration_root(module_file)
+
+        source_layout.mkdir(parents=True)
+        for path in self.migration_root.iterdir():
+            if path.is_file():
+                shutil.copyfile(path, source_layout / path.name)
+        self.assertEqual(
+            source_layout.resolve(),
+            _resolve_product_workspace_migration_root(module_file),
+        )
+
+        installed_layout.mkdir(parents=True)
+        for path in self.migration_root.iterdir():
+            if path.is_file():
+                shutil.copyfile(path, installed_layout / path.name)
+        with self.assertRaisesRegex(LocalDeploymentRuntimeError, "absent or ambiguous"):
+            _resolve_product_workspace_migration_root(module_file)
+        shutil.rmtree(source_layout)
+        self.assertEqual(
+            installed_layout.resolve(),
+            _resolve_product_workspace_migration_root(module_file),
+        )
 
     def test_bootstrap_compatibility_seals_current_state_without_a_prior(self) -> None:
         for database, version in (("comments", 2), ("research_workspace", 3)):

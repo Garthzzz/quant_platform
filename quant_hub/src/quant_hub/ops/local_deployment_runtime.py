@@ -63,6 +63,11 @@ _WORKSPACE_MIGRATION_FILES = (
         "0003_project_creation_command.down.sql",
     ),
 )
+_WORKSPACE_MIGRATION_NAMES = {
+    name
+    for _, _, up_name, down_name in _WORKSPACE_MIGRATION_FILES
+    for name in (up_name, down_name)
+}
 _BUSINESS_TABLES = {
     "comments": (
         "actor",
@@ -91,6 +96,41 @@ _BUSINESS_TABLES = {
 
 class LocalDeploymentRuntimeError(RuntimeError):
     """固定 runtime 的机械观察无法闭合时抛出。"""
+
+
+def _resolve_product_workspace_migration_root(module_file: Path) -> Path:
+    """只接受 runtime 代码邻近位置中唯一完整的迁移布局。"""
+
+    try:
+        module_path = module_file.resolve(strict=True)
+        candidates = (
+            module_path.parents[3] / "migrations" / "research_workspace",
+            module_path.parents[1] / "migrations" / "research_workspace",
+        )
+    except (OSError, IndexError, RuntimeError) as error:
+        raise LocalDeploymentRuntimeError(
+            "product runtime workspace migration layout is unavailable"
+        ) from error
+    matches: list[Path] = []
+    for candidate in candidates:
+        try:
+            if not candidate.is_dir():
+                continue
+            entries = list(os.scandir(candidate))
+            if {entry.name for entry in entries} != _WORKSPACE_MIGRATION_NAMES:
+                continue
+            if not all(entry.is_file(follow_symlinks=False) for entry in entries):
+                continue
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved not in matches:
+            matches.append(resolved)
+    if len(matches) != 1:
+        raise LocalDeploymentRuntimeError(
+            "product runtime workspace migration layout is absent or ambiguous"
+        )
+    return matches[0]
 
 
 def _is_reparse(metadata: os.stat_result) -> bool:
@@ -1551,8 +1591,8 @@ class ProductionWindowsDeploymentRuntime:
     @classmethod
     def load_exact_d(cls) -> "ProductionWindowsDeploymentRuntime":
         project = Path(PRODUCTION_VM_ROOT_TEXT)
-        migration_root = project / "quant_hub" / "migrations" / "research_workspace"
         try:
+            migration_root = _resolve_product_workspace_migration_root(Path(__file__))
             core = _RuntimeCore(
                 root=project,
                 migration_root=migration_root,
@@ -1560,7 +1600,7 @@ class ProductionWindowsDeploymentRuntime:
                 allow_posix_test_only=False,
                 _construction_token=_CONSTRUCTION_TOKEN,
             )
-        except (OSError, ValueError) as error:
+        except (LocalDeploymentRuntimeError, OSError, ValueError) as error:
             raise LocalDeploymentRuntimeError(
                 "产品 runtime exact Windows D root 不可用"
             ) from error

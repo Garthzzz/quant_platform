@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from quant_hub.ops.local_exact_runtime_tooling_scanner import (
+    TestOnlyExactRuntimeToolingAdapter,
+)
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "update_vm_tooling.py"
@@ -29,6 +34,19 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.candidate = self.root / "incoming" / f"{self.release_id}.partial"
         self.source = (
             self.candidate / "runtime_contract" / "code" / "src" / "quant_hub"
+        )
+        self.migration_source = (
+            self.candidate
+            / "runtime_contract"
+            / "migrations"
+            / "research_workspace"
+        )
+        self.code_migration_source = (
+            self.candidate
+            / "runtime_contract"
+            / "code"
+            / "migrations"
+            / "research_workspace"
         )
         self.package = (
             self.root
@@ -62,11 +80,37 @@ class VMToolingUpdateTests(unittest.TestCase):
             new.parent.mkdir(parents=True, exist_ok=True)
             old.write_bytes(f"old:{relative}\n".encode("utf-8"))
             new.write_bytes(f"new:{relative}\n".encode("utf-8"))
+        self.migration_source.mkdir(parents=True)
+        self.code_migration_source.mkdir(parents=True)
+        for name in module._WORKSPACE_MIGRATION_FILES:
+            raw = f"migration:{name}\n".encode("utf-8")
+            (self.migration_source / name).write_bytes(raw)
+            (self.code_migration_source / name).write_bytes(raw)
         updater = self.candidate / "runtime_contract" / "code" / "tools" / SCRIPT.name
         updater.parent.mkdir(parents=True)
         updater.write_bytes(SCRIPT.read_bytes())
         inventory_files = []
         for path in sorted(self.source.rglob("*")):
+            if path.is_file():
+                relative = path.relative_to(self.candidate).as_posix()
+                inventory_files.append(
+                    {
+                        "path": relative,
+                        "bytes": path.stat().st_size,
+                        "sha256": _hash(path),
+                    }
+                )
+        for path in sorted(self.migration_source.rglob("*")):
+            if path.is_file():
+                relative = path.relative_to(self.candidate).as_posix()
+                inventory_files.append(
+                    {
+                        "path": relative,
+                        "bytes": path.stat().st_size,
+                        "sha256": _hash(path),
+                    }
+                )
+        for path in sorted(self.code_migration_source.rglob("*")):
             if path.is_file():
                 relative = path.relative_to(self.candidate).as_posix()
                 inventory_files.append(
@@ -96,6 +140,7 @@ class VMToolingUpdateTests(unittest.TestCase):
         runtime = control / "deployment_runtime.json"
         runtime.write_bytes(b"runtime")
         old_records = module._regular_files(self.package)
+        old_inventory_hash = module._package_inventory_sha256(old_records)
         install = {
             "schema_version": module.INSTALL_SCHEMA,
             "service_name": module.SERVICE_NAME,
@@ -115,16 +160,20 @@ class VMToolingUpdateTests(unittest.TestCase):
             "deployment_runtime": str(runtime),
             "deployment_runtime_sha256": _hash(runtime),
             "quant_hub_package_root": str(self.package),
-            "quant_hub_package_inventory_sha256": module._package_inventory_sha256(
-                old_records
-            ),
+            "quant_hub_package_inventory_sha256": old_inventory_hash,
             "start_type": "automatic",
         }
         self.install_path = control / "service_install_candidate.json"
         self.install_path.write_bytes(module._canonical(install))
         self.tooling_path = control / "exact_runtime_tooling.json"
         self.tooling_path.write_bytes(
-            module._canonical(module._build_tooling_claim(self.root, old_records))
+            module._canonical(
+                module._build_tooling_claim(
+                    self.root,
+                    old_records,
+                    package_inventory_sha256=old_inventory_hash,
+                )
+            )
         )
         self.old_package = {
             name: path.read_bytes()
@@ -136,6 +185,28 @@ class VMToolingUpdateTests(unittest.TestCase):
         }
         self.old_install = self.install_path.read_bytes()
         self.old_tooling = self.tooling_path.read_bytes()
+
+    def expected_installed(self) -> dict[str, tuple[int, str]]:
+        expected = module._regular_files(self.source)
+        expected.update(
+            {
+                module._WORKSPACE_MIGRATION_PACKAGE_PREFIX + name: record
+                for name, record in module._regular_files(
+                    self.migration_source
+                ).items()
+            }
+        )
+        return expected
+
+    def rewrite_manifest(self, inventory_files: list[dict[str, object]]) -> None:
+        manifest = {
+            "schema_version": "qrh-release-manifest/v2",
+            "release_id": self.release_id,
+            "inventory": {"files": inventory_files},
+        }
+        self.manifest_raw = module._canonical(manifest)
+        (self.candidate / "release_manifest.json").write_bytes(self.manifest_raw)
+        self.manifest_hash = hashlib.sha256(self.manifest_raw).hexdigest()
 
     def update(self, **changes):
         arguments = {
@@ -164,7 +235,7 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.assertNotIn("quant_hub", imports)
         before = module._snapshot(self.root)
         result = self.update()
-        expected = module._regular_files(self.source)
+        expected = self.expected_installed()
         self.assertEqual(expected, module._regular_files(self.package))
         install = json.loads(self.install_path.read_text(encoding="utf-8"))
         self.assertEqual(
@@ -172,9 +243,21 @@ class VMToolingUpdateTests(unittest.TestCase):
             install["quant_hub_package_inventory_sha256"],
         )
         tooling = json.loads(self.tooling_path.read_text(encoding="utf-8"))
+        scanner_inventory = [
+            {"relative_path": name, "bytes": size, "sha256": digest}
+            for name, (size, digest) in sorted(expected.items())
+        ]
+        self.assertEqual(
+            hashlib.sha256(module._canonical(scanner_inventory)).hexdigest(),
+            tooling["package"]["inventory_sha256"],
+        )
         self.assertEqual(
             module._build_tooling_claim(self.root, expected), tooling
         )
+        verified = TestOnlyExactRuntimeToolingAdapter.for_test_only(
+            self.root
+        ).verify_persisted()
+        self.assertEqual(tooling, verified.as_dict())
         self.assertEqual(tooling["tooling_sha256"], result["exact_runtime_tooling_sha256"])
         self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
         audit_path = module._finalize_audit(
@@ -205,6 +288,93 @@ class VMToolingUpdateTests(unittest.TestCase):
             },
         )
 
+    def test_missing_workspace_migration_record_fails_closed(self) -> None:
+        manifest = json.loads(self.manifest_raw.decode("utf-8"))
+        omitted = (
+            module._WORKSPACE_MIGRATION_SOURCE_PREFIX
+            + module._WORKSPACE_MIGRATION_FILES[0]
+        )
+        files = [
+            item
+            for item in manifest["inventory"]["files"]
+            if item["path"] != omitted
+        ]
+        self.rewrite_manifest(files)
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "workspace migration inventory"
+        ):
+            self.update()
+
+    def test_extra_workspace_migration_fails_closed(self) -> None:
+        extra = self.migration_source / "9999_extra.sql"
+        extra.write_bytes(b"extra\n")
+        manifest = json.loads(self.manifest_raw.decode("utf-8"))
+        files = list(manifest["inventory"]["files"])
+        files.append(
+            {
+                "path": extra.relative_to(self.candidate).as_posix(),
+                "bytes": extra.stat().st_size,
+                "sha256": _hash(extra),
+            }
+        )
+        self.rewrite_manifest(files)
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "workspace migration inventory"
+        ):
+            self.update()
+
+    def test_changed_workspace_migration_bytes_fail_closed(self) -> None:
+        target = self.migration_source / module._WORKSPACE_MIGRATION_FILES[0]
+        target.write_bytes(b"changed-after-seal\n")
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "workspace migration bytes"
+        ):
+            self.update()
+
+    def test_changed_code_migration_mirror_fails_closed(self) -> None:
+        target = self.code_migration_source / module._WORKSPACE_MIGRATION_FILES[0]
+        target.write_bytes(b"changed-code-mirror-after-seal\n")
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "code migration mirror bytes"
+        ):
+            self.update()
+
+    def test_absent_optional_code_migration_mirror_is_accepted(self) -> None:
+        manifest = json.loads(self.manifest_raw.decode("utf-8"))
+        files = [
+            item
+            for item in manifest["inventory"]["files"]
+            if not item["path"].startswith(
+                module._WORKSPACE_CODE_MIGRATION_SOURCE_PREFIX
+            )
+        ]
+        self.rewrite_manifest(files)
+        for path in self.code_migration_source.iterdir():
+            path.unlink()
+        self.code_migration_source.rmdir()
+        self.code_migration_source.parent.rmdir()
+        self.update()
+        self.assertEqual(self.expected_installed(), module._regular_files(self.package))
+
+    def test_legacy_workspace_migration_layout_fails_closed(self) -> None:
+        manifest = json.loads(self.manifest_raw.decode("utf-8"))
+        files = list(manifest["inventory"]["files"])
+        files.append(
+            {
+                "path": (
+                    module._WORKSPACE_LEGACY_MIGRATION_PREFIX
+                    + module._WORKSPACE_MIGRATION_FILES[0]
+                ),
+                "bytes": 1,
+                "sha256": hashlib.sha256(b"x").hexdigest(),
+            }
+        )
+        self.rewrite_manifest(files)
+        with self.assertRaisesRegex(
+            module.ToolingUpdateError, "workspace migration layout"
+        ):
+            self.update()
+
     def test_failure_after_package_swap_restores_package_and_both_claims(self) -> None:
         with self.assertRaisesRegex(module.ToolingUpdateError, "injected failure"):
             self.update(fail_after_package_swap=True)
@@ -221,10 +391,36 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
         self.assertFalse(any(self.package.parent.glob("quant_hub.update-*")))
 
+    def test_failure_between_package_renames_restores_live_package(self) -> None:
+        with self.assertRaisesRegex(module.ToolingUpdateError, "moved to prior"):
+            self.update(fail_after_package_to_prior=True)
+        self.assertEqual(
+            self.old_package,
+            {
+                item.relative_to(self.package).as_posix(): item.read_bytes()
+                for item in self.package.rglob("*")
+                if item.is_file()
+            },
+        )
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+        self.assertFalse(any(self.package.parent.glob("quant_hub.update-*")))
+        self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
+
+    def test_atomic_replace_failure_removes_partial_file(self) -> None:
+        target = self.root / "control" / "atomic-test.json"
+        with (
+            patch.object(module.os, "replace", side_effect=OSError("replace failed")),
+            self.assertRaisesRegex(OSError, "replace failed"),
+        ):
+            module._write_atomic(target, {"status": "test"}, suffix="fault")
+        self.assertFalse(target.exists())
+        self.assertFalse((target.parent / ".atomic-test.json.fault.partial").exists())
+
     def test_missing_old_claim_bootstraps_after_strict_live_verification(self) -> None:
         self.tooling_path.unlink()
         result = self.update()
-        expected = module._regular_files(self.source)
+        expected = self.expected_installed()
         tooling = json.loads(self.tooling_path.read_text(encoding="utf-8"))
         self.assertEqual(module._build_tooling_claim(self.root, expected), tooling)
         self.assertEqual(tooling["tooling_sha256"], result["exact_runtime_tooling_sha256"])

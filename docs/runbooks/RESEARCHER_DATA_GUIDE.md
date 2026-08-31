@@ -712,6 +712,7 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\control\service_install_candidate.json` | 服务安装候选证据 |
 | `<VM_ROOT>\control\exact_runtime_tooling.json` | 固定工具链身份 |
 | `<VM_ROOT>\control\tooling_update_pending.json` | 工具链更新的短生命周期 journal；仅由 tooling updater 创建和维护，成功收尾后清理，禁止手工编辑或删除 |
+| `<VM_ROOT>\tooling\python\Lib\site-packages\quant_hub\migrations\research_workspace\*.sql` | controller 使用的 6 个 workspace 迁移；由密封 candidate 原子安装并纳入整包 inventory/tooling claim，禁止手工复制或修改 |
 | `<VM_ROOT>\control\writer_handoff_pending.json` | handoff 进行中的受控 journal；只由 handoff 工具维护 |
 | `<VM_ROOT>\control\writer-handoff-intents\*.json` | writer handoff 意图 |
 | `<VM_ROOT>\state\comments.sqlite3` | 当前生产评论与 Dashboard 外置状态 |
@@ -799,9 +800,18 @@ user scope 才会管理：
 | 发布器 | `quant_hub/src/quant_hub/ops/publish.py` |
 | VM 部署 CLI | `quant_hub/src/quant_hub/ops/vm_deploy_cli.py` |
 | VM 路径/状态实现 | `quant_hub/src/quant_hub/ops/local_deployment_persistence.py` |
+| VM 固定工具链原子更新器 | `quant_hub/tools/update_vm_tooling.py` |
 | 本地审核启动器 | `quant_hub/tools/run_local.py` |
 
 数据库 schema 不靠 README 口述；最终 authority 是 `quant_hub/migrations/<domain>` 中的迁移和对应 repository/service 代码。
+发布时，`runtime_contract\migrations\research_workspace\` 是 release 内的密封来源；
+VM tooling updater 会逐文件核对 release manifest 后，将这 6 个文件安装到上表的
+site-packages 路径，并把它们计入 `quant_hub` 整包 inventory。生产 runtime 只接受
+源码树邻近布局或已安装 tooling 布局中的唯一完整一套；缺失、额外、字节变化或
+两套同时出现都会拒绝继续，不能用手工复制绕过。
+若 release 同时包含 `runtime_contract\code\migrations\research_workspace\`，它只是
+密封源码树随附的镜像；更新器会要求它与上述正式来源逐文件一致，但不会把镜像
+当成第二套生产 authority。部分合法 assembler 输出不带该镜像，正式来源仍必须完整。
 
 ## 7. 仅限授权运维：发布、激活和回退
 
