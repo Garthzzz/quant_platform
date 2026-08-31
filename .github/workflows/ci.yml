@@ -172,6 +172,9 @@ jobs:
             $moduleExit = $LASTEXITCODE
             if ($moduleExit -ne 0) {
               $failedModuleCount += 1
+              Write-Output "::group::Failed unittest module $testModule"
+              Get-Content -LiteralPath $unitLog
+              Write-Output "::endgroup::"
               $failureIdentifiers += @(
               Select-String -LiteralPath $unitLog -Pattern '(?<identifier>(?:FAIL|ERROR): [A-Za-z0-9_.]+ \([A-Za-z0-9_.]+\))' |
                 ForEach-Object { $_.Matches[0].Groups['identifier'].Value } |

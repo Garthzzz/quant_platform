@@ -2534,7 +2534,10 @@ class ToolChoiceEvaluationTests(unittest.TestCase):
         )
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        ledger_root = Path(temporary.name)
+        # Hosted Windows runners may expose TEMP through a junction.  Resolve
+        # the fixture root so the test exercises the canonical path accepted
+        # by the production no-reparse reader instead of weakening that reader.
+        ledger_root = Path(temporary.name).resolve()
         preregistration_ledger = ledger_root / "preregistration.json"
         record_acceptance_preregistration(
             preregistration, ledger_path=preregistration_ledger

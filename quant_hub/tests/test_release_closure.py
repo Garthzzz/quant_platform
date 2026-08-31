@@ -319,7 +319,14 @@ class ReleaseClosureTests(unittest.TestCase):
         output.parent.mkdir()
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        # The product CLI accepts only D:\quant\quant_platform.  Keep that
+        # boundary covered separately, and isolate it here so this test reaches
+        # the managed-adapter fail-closed branch on hosted checkout paths too.
+        with (
+            patch.object(closure, "_cli_evidence_root", return_value=self.root),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
             code = closure.main(
                 [
                     "derive-gate",

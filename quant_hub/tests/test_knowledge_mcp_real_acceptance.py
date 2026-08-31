@@ -223,7 +223,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_v2_config_freezes_full_target_and_arm_only_changes_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             _preregistration, config_bytes, _prompts, _provenance = self._fixture(root)
             config = validate_real_codex_launch_config_bytes(
                 config_bytes, server_name=SERVER
@@ -278,7 +278,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_patched_popen_and_sys_executable_cannot_sign_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             evidence_root, _prereg, _config, _prompts, provenance = self._record(root)
             with (
                 patch(
@@ -312,7 +312,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_preregister_cli_stages_closed_inputs_before_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             preregistration, config, prompts, provenance = self._fixture(root)
             preregistration_path = root / "preregistration-source.json"
             config_path = root / "launch-source.json"
@@ -364,7 +364,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_campaign_pin_failure_writes_nonqualifying_top_level_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             evidence_root, _prereg, _config, _prompts, provenance = self._record(root)
             with (
                 patch(
@@ -387,7 +387,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_unexpected_runtime_error_after_dispatch_writes_failure_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             evidence_root, _prereg, _config, _prompts, provenance = self._record(root)
             with (
                 patch(
@@ -414,7 +414,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_campaign_pin_close_error_has_one_failure_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             evidence_root, _prereg, _config, _prompts, provenance = self._record(root)
             with (
                 patch(
@@ -440,7 +440,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_extra_file_and_existing_root_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             evidence_root, preregistration, config, prompts, provenance = self._record(root)
             (evidence_root / "opaque-pass.json").write_bytes(b"{}")
             with (
@@ -463,7 +463,7 @@ class RealAcceptanceRunnerTests(unittest.TestCase):
 
     def test_config_rejects_script_open_control_and_unbound_client(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             _preregistration, config_bytes, _prompts, _provenance = self._fixture(root)
             base = json.loads(config_bytes)
             for mutate in (
