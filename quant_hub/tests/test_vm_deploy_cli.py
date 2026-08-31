@@ -127,6 +127,30 @@ class Hooks:
 
 
 class VMDeployCLITests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "bootstrap boundary is Windows-only")
+    def test_bootstrap_boundary_excludes_observer_powershell_from_legacy_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = windows_runtime(Path(directory).resolve())
+            observed_commands: list[str] = []
+
+            def completed(command, **_kwargs):
+                observed_commands.append(command[-1])
+                return mock.Mock(returncode=0, stdout=b"[]", stderr=b"")
+
+            with mock.patch.object(
+                WindowsServiceRuntime,
+                "_query_service_state",
+                return_value="STOPPED",
+            ), mock.patch(
+                "quant_hub.ops.vm_deploy_cli.subprocess.run", side_effect=completed
+            ):
+                evidence = runtime.observe_bootstrap_boundary()
+
+        self.assertEqual([], evidence["ingress"]["listener_pids"])
+        self.assertEqual([], evidence["legacy_c_writer"]["process_pids"])
+        self.assertEqual(2, len(observed_commands))
+        self.assertIn("$_.ProcessId -ne $PID", observed_commands[1])
+
     def test_candidate_live_sqlite_pin_blocks_path_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()

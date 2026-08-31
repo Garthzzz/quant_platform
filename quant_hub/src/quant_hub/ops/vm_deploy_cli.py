@@ -1935,7 +1935,7 @@ class WindowsServiceRuntime:
         )
         legacy_value = powershell_json(
             "@(Get-CimInstance Win32_Process -ErrorAction Stop|"
-            "Where-Object {$_.CommandLine -and "
+            "Where-Object {$_.ProcessId -ne $PID -and $_.CommandLine -and "
             "($_.CommandLine -match '(?i)C:\\\\quant_platform(?:_data)?(?:\\\\|$)')}|"
             "Select-Object -ExpandProperty ProcessId -Unique|Sort-Object)|"
             "ConvertTo-Json -Compress"
