@@ -231,7 +231,7 @@ active delivery 只接受已审核且可由 receipt／event／版本闭包复核
 | `POST /api/v1/topics/{topic_id}/research-links` | 建立显式 Topic–research 关联。 |
 | `POST /api/v1/topics/{topic_id}/state-events` | 写 `planned`／`paused` Topic 事件。 |
 | `POST /api/v1/research/{research_id}/work-state-events` | 写 `planned`／`in_progress`／`paused` 工作事件。 |
-| `POST /api/v1/research/{research_id}/completion-decisions` | 完成或撤销；当前只接受明确的人类 actor，裸 `review_urn` 会以 409 拒绝。 |
+| `POST /api/v1/research/{research_id}/completion-decisions` | 完成可使用明确的人类 actor，或消费与当前 release/subject 匹配的可验证 PASS review certificate；撤销当前只接受人类 actor，裸 `review_urn` 会以 409 拒绝。 |
 | `POST /api/v1/research/{research_id}/comments` | 创建评论。 |
 | `PATCH /api/v1/comments/{comment_id}` | 按 revision 乐观并发修改评论。 |
 | `DELETE /api/v1/comments/{comment_id}` | 按 revision 软删除评论。 |

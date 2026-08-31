@@ -344,6 +344,11 @@ if (Test-Path -LiteralPath $CandidateVar) {
 
 需要从一个已审阅 delivery 物化公开 PDF 时，运维可运行：
 
+> 下例的 `D:\quant\quant_platform_publish_runtime\...` 只适用于本地发布主机的 Git 外
+> candidate 根，禁止在生产 VM 使用。若在生产 VM 执行任何抓取，`--delivery` 和 `--output`
+> 解析后的实际写入必须全部位于 exact `D:\quant\quant_platform` 内；不得写 C 盘、`D:\`、
+> `D:\quant` 或其他上级/同级目录。
+
 ```powershell
 Set-Location D:\quant\quant_platform
 $ReleaseRoot = `
@@ -653,7 +658,7 @@ POST   /knowledge/research/{document_id}/comments
 | `POST /api/v1/topics/{topic_id}/research-links` | `actor,research_id,link_kind,provenance_urn`；可选 `dashboard_primary,display_rank`；`link_kind` 仅 `primary/supporting` | 不发 `If-Match` | `200` |
 | `POST /api/v1/topics/{topic_id}/state-events` | `actor,state`；可选 `note`；`state` 仅 `planned/paused` | 不发 `If-Match` | `201` |
 | `POST /api/v1/research/{research_id}/work-state-events` | `actor,state`；可选 `note`；`state` 仅 `planned/in_progress/paused` | 不发 `If-Match` | `201` |
-| `POST /api/v1/research/{research_id}/completion-decisions` | `decision,reason`，并且只给 `actor` 或 `review_urn` 之一；完成时给 `research_release_id`，撤销时给 `target_decision_id` | 不发 `If-Match` | `201` |
+| `POST /api/v1/research/{research_id}/completion-decisions` | `decision,reason`，并且只给 `actor` 或 `review_urn` 之一；完成时给 `research_release_id`，撤销时给 `target_decision_id`。`review_urn` 完成必须解析为与当前 release/subject 匹配的可验证 PASS certificate；撤销当前只接受人类 `actor`，裸 `review_urn` 返回 `409` | 不发 `If-Match` | 成功 `201`；证书未登记、损坏、identity 失配或裸 review 撤销为 `409` |
 | `POST /api/v1/research/{research_id}/comments` | `actor,content`；可选严格锚点对象 `target` | 不发 `If-Match` | `201` |
 | `PATCH /api/v1/comments/{comment_id}` | `actor,content` | 从 `GET /api/v1/research/{research_id}/comments` 对应项取得 `etag` | `200` |
 | `DELETE /api/v1/comments/{comment_id}` | `actor` | 同上 | `200` |
@@ -1257,9 +1262,20 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\audit\deployment_attempts\` | 部署尝试日志/证据 |
 | `<VM_ROOT>\audit\receipts\` | 幂等和部署收据 |
 | `<VM_ROOT>\audit\events\` | 生产事件审计 |
+| `<VM_ROOT>\audit\writer-handoff\success\*.json` | writer handoff 成功 receipt；create-only，不能人工补写 |
+| `<VM_ROOT>\audit\writer-handoff\failure\*.json` | writer handoff 失败/official rollback receipt；只证明所记录失败收敛，不授权 handoff |
+| `<VM_ROOT>\audit\release-closure\results\stage5\revocation-surface.json` | revocation 本地功能闭包结果；不是外部信任根 |
+| `<VM_ROOT>\audit\release-closure\observations\stage5\*.json` | Stage 5 分类 observation |
+| `<VM_ROOT>\audit\release-closure\observations\stage6\*.json` | Stage 6 分类 observation |
+| `<VM_ROOT>\audit\release-closure\gates\stage5\*.json` | 从真实 adapter 重放派生的 Stage 5 gate；缺 adapter 时不得产生 qualifying PASS |
+| `<VM_ROOT>\audit\release-closure\gates\stage6\*.json` | 从真实 adapter 重放派生的 Stage 6 gate；缺 adapter 时不得产生 qualifying PASS |
+| `<VM_ROOT>\audit\release-closure\certificates\stage5.json` | 只有全部 Stage 5 gate 合格时才允许形成；当前未签发 |
+| `<VM_ROOT>\audit\release-closure\receipts\visibility.json` | Stage 6 visibility closure receipt；当前未签发 |
 | `<VM_ROOT>\locks\local_deployment.lock` | 单写者部署锁 |
 | `<VM_ROOT>\logs\` | 服务与运维日志 |
 | `<VM_ROOT>\tmp\` | 受边界检查的临时目录 |
+| `<VM_ROOT>\tmp\writer-handoff\<attempt_id>\checkpoints\` | 活动 handoff 的 final-C/pre-D SQLite checkpoint；终态按 journal 清理，不是恢复根 |
+| `<VM_ROOT>\tmp\writer-handoff\<attempt_id>\restore-proof\` | checkpoint 内存恢复证明暂存；只由 handoff 工具维护 |
 | `<VM_ROOT>\tooling\python\` | exact-D 固定 Python 和 `quant_hub` 包 |
 | `<VM_ROOT>\objects\` | 历史/运维声明的 D 根对象区；当前服务读取 release 内的 `runtime\objects`，两处均不得手工修改 |
 
@@ -1411,7 +1427,7 @@ site-packages 路径，并把它们计入 `quant_hub` 整包 inventory。生产 
 密封源码树随附的镜像；更新器会要求它与上述正式来源逐文件一致，但不会把镜像
 当成第二套生产 authority。部分合法 assembler 输出不带该镜像，正式来源仍必须完整。
 
-### 6.8 Windows 服务宿主、原生依赖和固定工具链位置
+### 6.1 Windows 服务宿主、原生依赖和固定工具链位置
 
 生产 Windows 服务不是从任意 Python 环境或系统 `PATH` 启动。当前 v2 合同把服务宿主及其
 两个直接原生依赖固定在同一目录，并逐文件记录 SHA-256：
@@ -1582,7 +1598,11 @@ binding、release manifest、audit receipts 和当前 D state。只有完整通�
 - [`../../quant_hub/README.md`](../../quant_hub/README.md)：CLI、Web/API、回放和本地启动总入口。
 - [`KNOWLEDGE_MCP.md`](KNOWLEDGE_MCP.md)：MCP 安装、doctor、同步和故障处置。
 - [`KNOWLEDGE_COMPILATION.md`](KNOWLEDGE_COMPILATION.md)：语义编译候选、人工复核和放行。
+- [`STAGE45_EVALUATION_GATES.md`](STAGE45_EVALUATION_GATES.md)：Stage 4/5 检索评测与资格门禁。
 - [`WRITER_HANDOFF.md`](WRITER_HANDOFF.md)：exact-D writer handoff、固定工具链和回退边界。
+- [`STAGE5_STAGE6_CLOSURE.md`](STAGE5_STAGE6_CLOSURE.md)：生产现场状态、Stage 5/6 证据闭合与未完成边界。
+- [`../verification/RESEARCHER_DATA_GUIDE_REVIEW_20260901.md`](../verification/RESEARCHER_DATA_GUIDE_REVIEW_20260901.md)：
+  当前文档哈希、机械验证和两轮只读审核记录；只有状态为 `PASS` 且哈希匹配时才可引用。
 - [`Evidence 受审阅材料导入规则`](../../quant_hub/src/quant_hub/evidence/REVIEWED_MATERIAL_IMPORT.md)：
   受审阅论文材料导入规则。
 - [`../../研究修订工作区/README.md`](../../研究修订工作区/README.md)：修订工作区的原文保护和交付规则。

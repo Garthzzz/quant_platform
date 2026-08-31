@@ -1,5 +1,7 @@
 # 本地 Codex stdio 量化知识 MCP
 
+> 研究员总入口：[`RESEARCHER_DATA_GUIDE.md`](RESEARCHER_DATA_GUIDE.md)。本文件只展开 MCP 安装、同步与排错。
+
 本版只有客户端本地 stdio：Codex 在研究员机器上把已安装的
 `quant-research-hub` package 作为子进程启动。server 不监听端口、不连接
 HTTP MCP、不打开 VM SQLite，也不向 VM 写入。它只读取用户级 immutable

@@ -1,5 +1,7 @@
 # Stage 5 / Stage 6 exact-D 生产 active/prior 与 visibility 闭合合同
 
+> 研究员总入口：[`RESEARCHER_DATA_GUIDE.md`](RESEARCHER_DATA_GUIDE.md)。本文件是生产现场状态与闭合入口。
+
 本文定义发布放行顺序，不表示生产 VM、Windows 服务、writer handoff 或 GitHub visibility
 已经执行。任何现场证据缺失时，对应阶段保持未完成；本地单元测试不能替代现场证据。
 

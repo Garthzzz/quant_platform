@@ -162,6 +162,9 @@ _EXACT_SCM_PYTHON_CLASS = (
 _EXACT_SCM_HOST_EXECUTABLE = (
     r"D:\quant\quant_platform\tooling\python\pythonservice.exe"
 )
+_LEGACY_EXACT_SCM_HOST_EXECUTABLE = (
+    r"D:\quant\quant_platform\tooling\python\Lib\site-packages\win32\pythonservice.exe"
+)
 _EXACT_SCM_CHILD_EXECUTABLE = r"D:\quant\quant_platform\tooling\python\python.exe"
 _EXACT_SCM_CHILD_MODULE = "quant_hub.ops.local_exact_runtime_entry"
 _EXACT_SCM_PYCACHE_PARENT = (
@@ -9533,6 +9536,19 @@ def _transient_scm_start_plan_sha256(
     )
 
 
+def _legacy_transient_scm_start_plan_sha256(
+    journal: Mapping[str, object],
+    start: Mapping[str, object],
+) -> str:
+    """Rebuild the sole pre-root-bundle SCM plan for closed-history replay."""
+
+    material = dict(_transient_scm_start_plan_material(journal, start))
+    service = dict(material["service"])
+    service["binary_path"] = _LEGACY_EXACT_SCM_HOST_EXECUTABLE
+    material["service"] = service
+    return _identity.identity_sha256(material)
+
+
 def _transient_start_authorization_material(
     journal: Mapping[str, object],
     start: Mapping[str, object],
@@ -9615,7 +9631,11 @@ def _forbid_self_reported_qualification(value: object) -> None:
     walk(value)
 
 
-def validate_deployment_journal(value: object) -> Mapping[str, object]:
+def validate_deployment_journal(
+    value: object,
+    *,
+    _allow_legacy_scm_plan: bool = False,
+) -> Mapping[str, object]:
     """验证 closed ``qrh-deployment-attempt/v4`` revision。"""
 
     journal = _closed(
@@ -9904,7 +9924,18 @@ def validate_deployment_journal(value: object) -> Mapping[str, object]:
         scm_identity_sha256 = _sha256(
             start["scm_identity_sha256"], label="transient SCM identity"
         )
-        if scm_identity_sha256 != _transient_scm_start_plan_sha256(journal, start):
+        accepted_scm_identities = {
+            _transient_scm_start_plan_sha256(journal, start)
+        }
+        # The private flag is used only while loading an entire persisted history;
+        # validate_journal_history then requires that history to finish in the
+        # failure terminal.  Public/single-revision validation and all new appends
+        # remain bound exclusively to the current root-bundle executable.
+        if _allow_legacy_scm_plan:
+            accepted_scm_identities.add(
+                _legacy_transient_scm_start_plan_sha256(journal, start)
+            )
+        if scm_identity_sha256 not in accepted_scm_identities:
             raise DeploymentJournalError(
                 "transient_start authorization SCM start plan hash 不匹配"
             )
@@ -10167,10 +10198,20 @@ _IMMUTABLE_JOURNAL_FIELDS = {
 }
 
 
-def validate_journal_history(values: Sequence[object]) -> tuple[Mapping[str, object], ...]:
+def validate_journal_history(
+    values: Sequence[object],
+    *,
+    _allow_legacy_scm_plan: bool = False,
+) -> tuple[Mapping[str, object], ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence) or not values:
         raise DeploymentJournalError("journal history 必须非空")
-    history = tuple(validate_deployment_journal(value) for value in values)
+    history = tuple(
+        validate_deployment_journal(
+            value,
+            _allow_legacy_scm_plan=_allow_legacy_scm_plan,
+        )
+        for value in values
+    )
     first = history[0]
     terminal: object | None = None
     previous_updated: datetime | None = None
@@ -10265,6 +10306,24 @@ def validate_journal_history(values: Sequence[object]) -> tuple[Mapping[str, obj
             raise DeploymentJournalError("terminal receipt 不得在后续 revision 消失")
         if _journal_is_closed(journal) and index != len(history) - 1:
             raise DeploymentJournalError("attempt 终态后不得追加 revision")
+    if _allow_legacy_scm_plan:
+        scm_generations: set[str] = set()
+        for journal in history:
+            for start in journal["transient_start"]:
+                observed = str(start["scm_identity_sha256"])
+                if observed == _transient_scm_start_plan_sha256(journal, start):
+                    scm_generations.add("current")
+                elif observed == _legacy_transient_scm_start_plan_sha256(
+                    journal, start
+                ):
+                    scm_generations.add("legacy")
+        if "legacy" in scm_generations and (
+            history[-1]["phase"] != _FAILURE_PHASE
+            or scm_generations != {"legacy"}
+        ):
+            raise DeploymentJournalError(
+                "legacy SCM start plan 只允许完整、单代且 failure-closed 的历史"
+            )
     return history
 
 
@@ -10356,7 +10415,10 @@ class DeploymentJournalStore:
             record = _canonical_read(
                 path,
                 safe_root=self._safe_root,
-                validator=validate_deployment_journal,
+                validator=lambda value: validate_deployment_journal(
+                    value,
+                    _allow_legacy_scm_plan=True,
+                ),
                 label="deployment journal revision",
             )
             if record is None:
@@ -10370,7 +10432,10 @@ class DeploymentJournalStore:
         nonce_global: set[str] = set()
         for folded, items in grouped.items():
             items.sort(key=lambda item: item[0])
-            history = validate_journal_history([item[1] for item in items])
+            history = validate_journal_history(
+                [item[1] for item in items],
+                _allow_legacy_scm_plan=True,
+            )
             nonce = str(history[0]["nonce"]).casefold()
             if nonce in nonce_global:
                 raise DeploymentJournalError("不同 attempt 不得复用 nonce")

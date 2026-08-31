@@ -265,3 +265,12 @@ authority；本次文档审核不重新执行任何外部可见动作。
 若未来取得合法 transport 和 credential，应以新的冻结文档／代码哈希创建独立审核，不得回填
 本记录来制造事后审核。为防止历史结论继续被误用，允许在文件顶部或末尾追加带日期、理由和
 证据指针的 `REVOKED`／`CORRECTION` 声明；这类声明只能收窄或撤销旧结论，不能追溯授予 authority。
+
+## CORRECTION（2026-09-01，仅收窄历史“当前事实”）
+
+本文件第 208–218 行关于 adapter 数量的“当前”陈述已经失效。当前除
+`identity_graph_negative_fixtures` 外，还实现了 `revocation_surface` 的真实本地 producer/replay
+adapter；后者 authority scope 固定为
+`LOCAL_FUNCTIONAL_CLOSURE_NOT_EXTERNAL_TRUST_ROOT`。其余依赖外部系统或可信 MCP 的角色仍未取得
+权威 evidence，Stage 5 certificate 仍不可签发。此勘误不恢复本文件顶部撤销的 PASS/authority，
+当前研究员文档审核改由 `RESEARCHER_DATA_GUIDE_REVIEW_20260901.md` 的 exact hash 记录承接。

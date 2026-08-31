@@ -1,11 +1,19 @@
 # C→D 首次 writer handoff（本地 active/prior 合同）
 
+> 研究员总入口：[`RESEARCHER_DATA_GUIDE.md`](RESEARCHER_DATA_GUIDE.md)。
+> 生产现场状态入口：[`STAGE5_STAGE6_CLOSURE.md`](STAGE5_STAGE6_CLOSURE.md)。
+
 ## 当前状态
 
 本 runbook 描述目标合同，不表示生产切换已经获批。新的 integrated deployment controller、
 真实 `R0→R1` pair、SQLite/CAS、Windows service、writer fence、crash replay、浏览器/API 与
 write-set 门禁全部通过前，只允许隔离、只读核验；不得停止现网 C writer、切换 active、开放
 D 流量或清理旧材料。
+
+最近一次已记录现场事件见 `STAGE5_STAGE6_CLOSURE.md` 的“当前实现与现场签发边界”：
+2026-08-31 已授权 handoff 在 D ingress 前的 service start/bootstrap comments schema pre-expand
+处失败，official rollback 恢复旧 C listener，未产生 D active/prior、Stage 5 certificate 或
+visibility receipt。后续重试必须消费该 failure/rollback 证据；不得仅凭本合同重新开始或跳过失败收尾。
 
 ## 固定边界
 

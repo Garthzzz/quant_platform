@@ -1,5 +1,7 @@
 # Stage 4/5 公开评测门禁运行手册
 
+> 研究员总入口：[`RESEARCHER_DATA_GUIDE.md`](RESEARCHER_DATA_GUIDE.md)。本文件只展开检索评测资格门禁。
+
 ## 权威入口
 
 检索评测的权威入口是 `quant_hub.knowledge.evaluation.evaluate`。它会先对完整

@@ -4329,6 +4329,181 @@ class ExactTransientStartAuthorizationSeamTests(PersistenceFixture):
             ):
                 validate_deployment_journal(forged)
 
+    def _legacy_pythonservice_failure_histories(
+        self,
+        *,
+        attempt: str,
+        nonce: str,
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        first = self._first(
+            operation="activation",
+            attempt=attempt,
+            nonce=nonce,
+        )
+        history = history_to(first, "candidate_start_authorized")
+        receipt = failure_receipt(
+            self.r0,
+            self.r1,
+            original_prior=self.r_minus_1,
+            attempt=attempt,
+            failed_phase="candidate_start_authorized",
+        )
+        history.append(
+            advance_one(
+                history[-1],
+                receipt=receipt,
+                failure=True,
+            )
+        )
+        legacy_history: list[dict[str, object]] = []
+        for raw in history:
+            journal = deepcopy(raw)
+            journal["previous_journal_sha256"] = (
+                None
+                if not legacy_history
+                else legacy_history[-1]["journal_sha256"]
+            )
+            for start in journal["transient_start"]:
+                start["scm_identity_sha256"] = (
+                    persistence_module._legacy_transient_scm_start_plan_sha256(
+                        journal, start
+                    )
+                )
+                field = (
+                    persistence_module._transient_start_authorization_evidence_field(
+                        start["role"]
+                    )
+                )
+                journal["evidence_hashes"][field] = (
+                    persistence_module._transient_start_authorization_sha256(
+                        journal, start
+                    )
+                )
+            seal(journal, "journal_sha256")
+            legacy_history.append(journal)
+        return history, legacy_history
+
+    def test_store_replays_only_failure_closed_legacy_pythonservice_history(self) -> None:
+        _current_history, legacy_history = (
+            self._legacy_pythonservice_failure_histories(
+                attempt="transient-legacy-pythonservice",
+                nonce="nonce-transient-legacy-pythonservice",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            DeploymentJournalError,
+            "SCM start plan hash",
+        ):
+            validate_journal_history(legacy_history)
+        with self.assertRaisesRegex(
+            DeploymentJournalError,
+            "failure-closed",
+        ):
+            validate_journal_history(
+                legacy_history[:-1],
+                _allow_legacy_scm_plan=True,
+            )
+
+        for journal in legacy_history:
+            target = self.persistence.layout.journals / (
+                f"{journal['attempt']}.r{int(journal['revision']):020d}.json"
+            )
+            target.write_bytes(identity.canonical_bytes(journal))
+        self.assertEqual(
+            tuple(legacy_history),
+            self.persistence.journals.replay(
+                "transient-legacy-pythonservice"
+            ),
+        )
+
+    def test_failure_closed_mixed_scm_generations_are_rejected(self) -> None:
+        current_history, _legacy_history = (
+            self._legacy_pythonservice_failure_histories(
+                attempt="transient-mixed-pythonservice",
+                nonce="nonce-transient-mixed-pythonservice",
+            )
+        )
+        mixed_history: list[dict[str, object]] = []
+        for raw in current_history:
+            journal = deepcopy(raw)
+            journal["previous_journal_sha256"] = (
+                None
+                if not mixed_history
+                else mixed_history[-1]["journal_sha256"]
+            )
+            for start in journal["transient_start"]:
+                if start["role"] == "prior":
+                    start["scm_identity_sha256"] = (
+                        persistence_module._legacy_transient_scm_start_plan_sha256(
+                            journal, start
+                        )
+                    )
+                else:
+                    start["scm_identity_sha256"] = (
+                        persistence_module._transient_scm_start_plan_sha256(
+                            journal, start
+                        )
+                    )
+                field = (
+                    persistence_module._transient_start_authorization_evidence_field(
+                        start["role"]
+                    )
+                )
+                journal["evidence_hashes"][field] = (
+                    persistence_module._transient_start_authorization_sha256(
+                        journal, start
+                    )
+                )
+            seal(journal, "journal_sha256")
+            mixed_history.append(journal)
+
+        with self.assertRaisesRegex(DeploymentJournalError, "failure-closed"):
+            validate_journal_history(
+                mixed_history,
+                _allow_legacy_scm_plan=True,
+            )
+        for journal in mixed_history:
+            target = self.persistence.layout.journals / (
+                f"{journal['attempt']}.r{int(journal['revision']):020d}.json"
+            )
+            target.write_bytes(identity.canonical_bytes(journal))
+        with self.assertRaisesRegex(DeploymentJournalError, "failure-closed"):
+            self.persistence.journals.replay("transient-mixed-pythonservice")
+
+    def test_legacy_failure_history_rejects_same_and_next_revision_append(self) -> None:
+        current_history, legacy_history = (
+            self._legacy_pythonservice_failure_histories(
+                attempt="transient-legacy-no-append",
+                nonce="nonce-transient-legacy-no-append",
+            )
+        )
+        for journal in legacy_history:
+            target = self.persistence.layout.journals / (
+                f"{journal['attempt']}.r{int(journal['revision']):020d}.json"
+            )
+            target.write_bytes(identity.canonical_bytes(journal))
+
+        same_revision = current_history[-1]
+        validate_deployment_journal(same_revision)
+        next_revision = history_to(
+            current_history[0], "binding_cas_committed"
+        )[-1]
+        next_revision["previous_journal_sha256"] = legacy_history[-1][
+            "journal_sha256"
+        ]
+        seal(next_revision, "journal_sha256")
+        validate_deployment_journal(next_revision)
+
+        with self.persistence.global_lock() as lock:
+            with self.assertRaisesRegex(DeploymentJournalError, "第三值"):
+                self.persistence.journals.append(same_revision, lock=lock)
+            with self.assertRaisesRegex(
+                DeploymentJournalError,
+                "SCM start plan hash",
+            ):
+                self.persistence.journals.append(next_revision, lock=lock)
+
     def test_multiple_role_records_are_rejected_by_journal_and_facade(self) -> None:
         first = self._first(
             operation="activation",
