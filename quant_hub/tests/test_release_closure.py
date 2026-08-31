@@ -306,42 +306,61 @@ class ReleaseClosureTests(unittest.TestCase):
             closure.produce_gate_evidence_from_observation(self.root, relative)
 
     def test_managed_wrapper_is_explicitly_non_qualifying_without_real_adapter(self) -> None:
-        relative, _ = self._managed_observation()
-        with self.assertRaisesRegex(
-            closure.ReleaseClosureError,
-            "non-qualifying.*browser-sqlite-comment-replay-receipt",
+        for role, required in (
+            (
+                "full_replay_and_comment_lifecycle",
+                "browser-sqlite-comment-replay-receipt",
+            ),
+            (
+                "identity_graph_negative_fixtures",
+                "identity-graph-fixture-report",
+            ),
         ):
-            closure.produce_gate_evidence_from_observation(self.root, relative)
+            with self.subTest(role=role):
+                relative, _ = self._managed_observation(role)
+                with self.assertRaisesRegex(
+                    closure.ReleaseClosureError,
+                    f"non-qualifying.*{required}",
+                ):
+                    closure.produce_gate_evidence_from_observation(self.root, relative)
 
     def test_cli_fails_closed_without_writing_gate_or_certificate(self) -> None:
-        relative, _ = self._managed_observation()
-        output = self.root / "gates/should-not-exist.json"
-        output.parent.mkdir()
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        # The product CLI accepts only D:\quant\quant_platform.  Keep that
-        # boundary covered separately, and isolate it here so this test reaches
-        # the managed-adapter fail-closed branch on hosted checkout paths too.
-        with (
-            patch.object(closure, "_cli_evidence_root", return_value=self.root),
-            redirect_stdout(stdout),
-            redirect_stderr(stderr),
-        ):
-            code = closure.main(
-                [
-                    "derive-gate",
-                    "--evidence-root",
-                    str(self.root),
-                    "--observation",
-                    relative,
-                    "--output",
-                    "gates/should-not-exist.json",
-                ]
+        (self.root / "gates").mkdir()
+        for index, role in enumerate(
+            (
+                "full_replay_and_comment_lifecycle",
+                "identity_graph_negative_fixtures",
             )
-        self.assertEqual(2, code)
-        self.assertEqual("", stdout.getvalue())
-        self.assertIn("non-qualifying", stderr.getvalue())
-        self.assertFalse(output.exists())
+        ):
+            with self.subTest(role=role):
+                relative, _ = self._managed_observation(role)
+                output_relative = f"gates/should-not-exist-{index}.json"
+                output = self.root / output_relative
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                # The product CLI accepts only D:\quant\quant_platform.  Keep that
+                # boundary covered separately, and isolate it here so this test reaches
+                # the managed-adapter fail-closed branch on hosted checkout paths too.
+                with (
+                    patch.object(closure, "_cli_evidence_root", return_value=self.root),
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                ):
+                    code = closure.main(
+                        [
+                            "derive-gate",
+                            "--evidence-root",
+                            str(self.root),
+                            "--observation",
+                            relative,
+                            "--output",
+                            output_relative,
+                        ]
+                    )
+                self.assertEqual(2, code)
+                self.assertEqual("", stdout.getvalue())
+                self.assertIn("non-qualifying", stderr.getvalue())
+                self.assertFalse(output.exists())
 
     def test_cli_rejects_evidence_root_outside_exact_d_project(self) -> None:
         with tempfile.TemporaryDirectory() as outside:
@@ -411,7 +430,7 @@ class ReleaseClosureTests(unittest.TestCase):
             ["properties"]["result_artifact"]["properties"]["schema_version"]["const"]
             for item in observation_schema["allOf"]
         }
-        self.assertEqual(closure._MANAGED_RESULT_SCHEMAS, observation_roles)  # noqa: SLF001
+        self.assertEqual(closure._PRIMARY_RESULT_SCHEMAS, observation_roles)  # noqa: SLF001
 
         evidence_schema = json.loads(
             (config_root / "release_closure_gate_evidence.schema.json").read_text(

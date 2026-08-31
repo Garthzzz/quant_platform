@@ -94,6 +94,14 @@ _BUSINESS_TABLES = {
         "research_workspace_sync_run",
     ),
 }
+_V1_COMMENT_BUSINESS_TABLES = (
+    "actor",
+    "command_receipt",
+    "comment",
+    "comment_event",
+    "legacy_import_run",
+    "outbox_event",
+)
 _LEGACY_COMMENT_BUSINESS_TABLES = tuple(
     table for table in _BUSINESS_TABLES["comments"] if table != "comment_target"
 )
@@ -868,6 +876,14 @@ def _legacy_comment_business_sha256(connection: sqlite3.Connection) -> str:
     )
 
 
+def _v1_comment_business_sha256(connection: sqlite3.Connection) -> str:
+    """Identity of the six v1 fact tables, which predate progress storage."""
+
+    return identity_sha256(
+        [_table_digest(connection, table) for table in _V1_COMMENT_BUSINESS_TABLES]
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _ConnectionInspection:
     raw_user_version: int
@@ -1275,7 +1291,7 @@ class _RuntimeCore:
         authorization: LockedBootstrapCommentSchemaExpandAuthorization,
         compatibility_manifest: SqliteCompatibilityManifest,
     ) -> Mapping[str, object]:
-        """Expand exact legacy comments v2 only during first-pair bootstrap.
+        """Expand exact legacy comments v1/v2 during first-pair bootstrap.
 
         The normal seal path remains strictly read-only and therefore keeps
         ordinary activation/rollback fail-closed on a legacy or partial
@@ -1377,11 +1393,17 @@ class _RuntimeCore:
                         "SELECT version FROM comment_store_schema ORDER BY version"
                     )
                 ]
-                if store_markers != [1, 2]:
+                if store_markers == [1]:
+                    source_business_sha256 = _v1_comment_business_sha256
+                    source_schema = "v1"
+                elif store_markers == [1, 2]:
+                    source_business_sha256 = _legacy_comment_business_sha256
+                    source_schema = "v2"
+                else:
                     raise LocalDeploymentRuntimeError(
-                        "bootstrap comments source 不是 exact legacy/core v2"
+                        "bootstrap comments source is not exact legacy/core v1 or v2"
                     )
-                core_before = _legacy_comment_business_sha256(connection)
+                core_before = source_business_sha256(connection)
                 from quant_hub.collaboration.comment_store import (
                     expand_legacy_comment_target_schema,
                 )
@@ -1390,17 +1412,17 @@ class _RuntimeCore:
                     backfilled = expand_legacy_comment_target_schema(connection)
                 except (RuntimeError, sqlite3.DatabaseError) as error:
                     raise LocalDeploymentRuntimeError(
-                        "bootstrap comments v2→v2+[3] 原子扩展失败"
+                        "bootstrap comments v1/v2→v2+[3] 原子扩展失败"
                     ) from error
                 inspection = _inspect_connection(
                     connection,
                     database=database_name,
                     expected_migration_ledger=expected_ledger,
                 )
-                core_after = _legacy_comment_business_sha256(connection)
+                core_after = source_business_sha256(connection)
                 if core_after != core_before:
                     raise LocalDeploymentRuntimeError(
-                        "bootstrap comments expand 改变了 v2 current/event facts"
+                        f"bootstrap comments expand changed {source_schema} facts"
                     )
                 try:
                     authorization._assert_live()

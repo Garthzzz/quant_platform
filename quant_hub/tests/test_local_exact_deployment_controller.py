@@ -90,6 +90,10 @@ class ExactDeploymentControllerTests(unittest.TestCase):
             with closing(sqlite3.connect(comments, isolation_level=None)) as connection:
                 connection.execute("DROP TABLE comment_target")
                 connection.execute("DROP TABLE comment_target_schema")
+                connection.execute("DROP TABLE progress_topic_event")
+                connection.execute("DROP TABLE progress_command_receipt")
+                connection.execute("DROP TABLE progress_topic")
+                connection.execute("DELETE FROM comment_store_schema WHERE version=2")
             migration_root = (
                 Path(__file__).resolve().parents[1]
                 / "migrations"
@@ -165,11 +169,28 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 )
                 with closing(sqlite3.connect(comments)) as connection:
                     self.assertEqual(
+                        [(1,), (2,)],
+                        connection.execute(
+                            "SELECT version FROM comment_store_schema ORDER BY version"
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
                         [(3,)],
                         connection.execute(
                             "SELECT version FROM comment_target_schema"
                         ).fetchall(),
                     )
+                    for table in (
+                        "progress_command_receipt",
+                        "progress_topic",
+                        "progress_topic_event",
+                    ):
+                        self.assertEqual(
+                            0,
+                            connection.execute(
+                                f'SELECT count(*) FROM "{table}"'
+                            ).fetchone()[0],
+                        )
             finally:
                 if workspace is not None and workspace._state != "closed":
                     workspace.close()

@@ -31,6 +31,18 @@ from .local_release_identity import (
     validate_local_prior_binding,
     validate_release_manifest,
 )
+from .identity_graph_fixture import (
+    CORPUS_SCHEMA as IDENTITY_GRAPH_CORPUS_SCHEMA,
+    GATE_ROLE as IDENTITY_GRAPH_GATE_ROLE,
+    PRODUCER_NAME as IDENTITY_GRAPH_PRODUCER_NAME,
+    PRODUCER_VERSION as IDENTITY_GRAPH_PRODUCER_VERSION,
+    REPORT_AUTHORITY_SCOPE as IDENTITY_GRAPH_REPORT_AUTHORITY_SCOPE,
+    REPORT_SCHEMA as IDENTITY_GRAPH_REPORT_SCHEMA,
+    IdentityGraphFixtureError,
+    artifact_input_aggregate_sha256,
+    fixed_corpus_document,
+    replay_fixed_corpus,
+)
 GATE_EVIDENCE_SCHEMA = "qrh-closure-gate-evidence/v2-managed-inputs"
 GATE_OBSERVATION_SCHEMA = "qrh-closure-gate-observation/v2-managed-inputs"
 STAGE5_CERTIFICATE_SCHEMA = "qrh-stage5-release-certificate/v1"
@@ -78,6 +90,10 @@ STAGE6_GATE_ROLES = (
 _MANAGED_RESULT_SCHEMAS = {
     role: f"qrh-closure-{role.replace('_', '-')}-result/v1"
     for role in (*STAGE5_GATE_ROLES, *STAGE6_GATE_ROLES)
+}
+_PRIMARY_RESULT_SCHEMAS = {
+    **_MANAGED_RESULT_SCHEMAS,
+    IDENTITY_GRAPH_GATE_ROLE: IDENTITY_GRAPH_REPORT_SCHEMA,
 }
 _STAGE5_MACHINE_AUTHORITY = "QRH_STAGE5_MANAGED_MACHINE_OBSERVER"
 _INDEPENDENT_AUTHORITY = "QRH_STAGE5_INDEPENDENT_VERIFIER_DISPATCH"
@@ -1817,6 +1833,130 @@ def _subject_from_artifacts(
     return _validate_subject(subject)
 
 
+def _load_identity_graph_fixture_report(
+    root: Path,
+    *,
+    result_ref: Mapping[str, object],
+    input_refs: Sequence[Mapping[str, object]],
+    support_artifacts: Mapping[str, Mapping[str, object]],
+) -> tuple[Mapping[str, object], Mapping[str, object], Mapping[str, object], str]:
+    """现场重放固定 corpus；report 中的 expected/observed 字符串不作权威输入。"""
+
+    if len(support_artifacts) != 1:
+        raise ReleaseClosureError(
+            "identity graph report support closure 必须恰含固定 corpus"
+        )
+    corpus_ref = next(iter(support_artifacts.values()))
+    if (
+        corpus_ref["artifact_kind"] != "canonical_json"
+        or corpus_ref["schema_version"] != IDENTITY_GRAPH_CORPUS_SCHEMA
+    ):
+        raise ReleaseClosureError("identity graph corpus artifact schema 不受支持")
+    corpus, corpus_raw = _canonical_json_file(
+        root, str(corpus_ref["relative_path"])
+    )
+    expected_corpus = fixed_corpus_document()
+    if corpus_raw != canonical_bytes(expected_corpus):
+        raise ReleaseClosureError("identity graph corpus bytes/hash 漂移")
+    try:
+        replayed = replay_fixed_corpus(corpus)
+    except IdentityGraphFixtureError as error:
+        raise ReleaseClosureError("identity graph fixture 现场重放失败") from error
+
+    report, _ = _canonical_json_file(root, str(result_ref["relative_path"]))
+    report = _closed(
+        report,
+        {
+            "schema_version",
+            "report_id",
+            "gate_role",
+            "authority_scope",
+            "producer",
+            "produced_at",
+            "input_artifact_aggregate_sha256",
+            "corpus",
+            "fixtures",
+            "result",
+            "report_sha256",
+        },
+        label="identity graph fixture report",
+    )
+    if (
+        report["schema_version"] != IDENTITY_GRAPH_REPORT_SCHEMA
+        or report["gate_role"] != IDENTITY_GRAPH_GATE_ROLE
+        or report["authority_scope"] != IDENTITY_GRAPH_REPORT_AUTHORITY_SCOPE
+    ):
+        raise ReleaseClosureError("identity graph report identity/scope 漂移")
+    _identifier(report["report_id"], label="identity graph report_id")
+    produced_at = _timestamp(
+        report["produced_at"], label="identity graph report.produced_at"
+    )
+    producer_value = _closed(
+        report["producer"], {"name", "version"}, label="identity graph producer"
+    )
+    if producer_value != {
+        "name": IDENTITY_GRAPH_PRODUCER_NAME,
+        "version": IDENTITY_GRAPH_PRODUCER_VERSION,
+    }:
+        raise ReleaseClosureError("identity graph producer identity 漂移")
+    expected_input_aggregate = artifact_input_aggregate_sha256(input_refs)
+    if report["input_artifact_aggregate_sha256"] != expected_input_aggregate:
+        raise ReleaseClosureError("identity graph subject/support closure 漂移")
+    corpus_value = _closed(
+        report["corpus"],
+        {"schema_version", "sha256", "size_bytes"},
+        label="identity graph report corpus",
+    )
+    if corpus_value != {
+        "schema_version": IDENTITY_GRAPH_CORPUS_SCHEMA,
+        "sha256": hashlib.sha256(corpus_raw).hexdigest(),
+        "size_bytes": len(corpus_raw),
+    }:
+        raise ReleaseClosureError("identity graph report corpus identity 漂移")
+    if (
+        corpus_ref["sha256"] != corpus_value["sha256"]
+        or corpus_ref["size_bytes"] != corpus_value["size_bytes"]
+    ):
+        raise ReleaseClosureError("identity graph support ref 与 corpus 不一致")
+
+    fixtures_value = report["fixtures"]
+    if not isinstance(fixtures_value, list) or canonical_bytes(
+        fixtures_value
+    ) != canonical_bytes(list(replayed)):
+        raise ReleaseClosureError(
+            "identity graph report outcome 不是现场 linter 重放结果"
+        )
+    positive = [item for item in replayed if item["expected_result"] == "accept"]
+    negative = [item for item in replayed if item["expected_result"] == "reject"]
+    expected_result = {
+        "positive_fixtures_total": len(positive),
+        "positive_fixtures_accepted": len(positive),
+        "negative_fixtures_total": len(negative),
+        "negative_fixtures_rejected": len(negative),
+    }
+    result = _closed(
+        report["result"], set(expected_result), label="identity graph report result"
+    )
+    if result != expected_result:
+        raise ReleaseClosureError("identity graph report aggregate 不是现场重放结果")
+    _self_hash(report, "report_sha256", label="identity graph fixture report")
+    return (
+        report,
+        {
+            "positive_fixtures_total": len(positive),
+            "positive_fixtures_passed": len(positive),
+            "negative_fixtures_total": len(negative),
+            "negative_fixtures_rejected": len(negative),
+        },
+        {
+            "name": IDENTITY_GRAPH_PRODUCER_NAME,
+            "version": IDENTITY_GRAPH_PRODUCER_VERSION,
+            "independent": False,
+        },
+        _utc_text(produced_at),
+    )
+
+
 def _load_managed_result(
     root: Path,
     role: str,
@@ -1825,6 +1965,17 @@ def _load_managed_result(
     support_artifacts: Mapping[str, Mapping[str, object]],
     subject: Mapping[str, object],
 ) -> tuple[Mapping[str, object], Mapping[str, object], Mapping[str, object], str]:
+    if (
+        role == IDENTITY_GRAPH_GATE_ROLE
+        and result_ref["artifact_kind"] == "canonical_json"
+        and result_ref["schema_version"] == IDENTITY_GRAPH_REPORT_SCHEMA
+    ):
+        return _load_identity_graph_fixture_report(
+            root,
+            result_ref=result_ref,
+            input_refs=input_refs,
+            support_artifacts=support_artifacts,
+        )
     expected_schema = _MANAGED_RESULT_SCHEMAS[role]
     if (
         result_ref["artifact_kind"] != "canonical_json"

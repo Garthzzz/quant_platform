@@ -38,6 +38,7 @@ qrh-mcp-acceptance = "quant_hub.knowledge_mcp.acceptance_cli:main"
 qrh-knowledge-compile = "quant_hub.knowledge.semantic_cli:main"
 qrh-semantic-authority = "quant_hub.ops.semantic_authority:main"
 qrh-release-closure = "quant_hub.ops.release_closure:main"
+qrh-stage5-identity-graph-fixtures = "quant_hub.ops.identity_graph_fixture:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

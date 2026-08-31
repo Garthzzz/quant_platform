@@ -493,15 +493,15 @@ scan
 → paper-lab run（登记并建立 task）
 → paper_lab_execute.py --task <manifest>（四阶段执行）
 → awaiting_review
-→ 独立 reviewer 签发并提交 review certificate
+→ 按当前 reviewer key registry 验证签名的 review certificate
 → releasable
 → paper-lab publish --run-id <run_id>
 ```
 
-中断后建立下一次任务使用 `paper-lab run --resume`。当前没有供普通研究员自签
-独立审核 PASS 的 CLI；producer 不能自己调用 `review_run` 冒充独立 reviewer。
-只有受信审核流程以 exact run artifact 和 requirements manifest 签发证书，且
-`PaperLabService.review_run(...)` 验证通过后，才允许执行：
+中断后建立下一次任务使用 `paper-lab run --resume`。当前没有供普通研究员签发
+review certificate 的 CLI。`PaperLabService.review_run(...)` 会验证证书是否绑定 exact
+run artifact、requirements manifest，以及是否能由进程环境
+`QRH_PAPER_LAB_REVIEWER_RSA_KEYS` 配置的 RSA 公钥验证；验证通过后才允许执行：
 
 ```powershell
 .\quant_hub\.venv\Scripts\python.exe -B -m quant_hub.cli `
@@ -511,6 +511,11 @@ scan
   --archive-root D:\quant\quant_platform\reference\archive `
   --var-root $PaperLabVar
 ```
+
+这里必须严格区分“代码已验证签名”和“审核者具有独立、受保护的外部身份”。当前
+源码不会鉴别 `review_run` 的调用者，也不能单独证明 producer 与 reviewer 已隔离，
+或 reviewer key registry 未被运行者替换。独立审核成立还需要进程环境、密钥托管、
+权限分离和签发审计等外部证据；没有这些证据时，不得把上述签名验证称为独立信任根。
 
 常用只读查询：
 
@@ -541,6 +546,11 @@ Paper Lab 的结构化数据和生成资产分别位于：
 ```text
 http://localhost:8765/
 ```
+
+exact-D production 在业务路由之前安装访问门禁。未登录访问 `/api/*` 返回
+`401 authentication_required`，访问页面则重定向到 `/login`。浏览器用户先打开
+`/login` 并使用授权运维提供的访问密码；脚本必须先向 `/login` 提交表单并在后续
+请求中复用同一个 cookie session。开发模式只有在明确未安装该门禁时才可省略这一步。
 
 主要页面：
 
@@ -624,6 +634,46 @@ POST   /api/v1/paper-lab/blueprints
 POST   /knowledge/research/{document_id}/comments
 ```
 
+写接口的最小请求合同如下。`actor` 均使用下文三种固定结构；“可选”表示字段可省略，
+不是建议传任意额外字段。主要 Pydantic 路由会拒绝未声明字段；Paper Lab 与通用研究
+调用方也应只发送表中字段。
+
+| 接口 | JSON 主体 | 并发前置 | 成功状态 |
+|---|---|---|---|
+| `POST /api/v1/research-tree/sync` | `{}` | 不发 `If-Match` | `200` |
+| `POST /api/v1/research-projects` | 必填 `actor,title`；可选 `description,research_question,research_content,lifecycle_status,status_note` | 不发 `If-Match` | `201` |
+| `PATCH /api/v1/research-nodes/{node_id}` | `actor` 加至少一个可编辑字段：`title,description,research_question,research_content,lifecycle_status,status_note` | 先 `GET /api/v1/research-nodes/{node_id}`，原样回传响应 `ETag` | `200` |
+| `POST /api/v1/research-nodes/{node_id}/comments` | `actor,content` | 不发 `If-Match` | `201` |
+| `PATCH /api/v1/research-node-comments/{comment_id}` | `actor,content` | 从 `GET /api/v1/research-nodes/{node_id}/comments` 对应项取得 `etag` | `200` |
+| `DELETE /api/v1/research-node-comments/{comment_id}` | `actor` | 同上 | `200` |
+| `POST /api/v1/dashboard-topics` | `actor,title,state`；可选 `note,parent_topic_id,manual_order`；`state` 仅 `planned/paused` | 不发 `If-Match` | `201` |
+| `PATCH /api/v1/dashboard-topics/{topic_id}` | `actor` 加至少一个 `title,state,note,parent_topic_id,manual_order` | 先 `GET /api/v1/dashboard-topics/{topic_id}`，原样回传 `ETag` | `200` |
+| `DELETE /api/v1/dashboard-topics/{topic_id}` | `actor` | 同上 | `200` |
+| `POST /api/v1/topics` | `actor,topic_key,title`；可选 `manual_order` | 不发 `If-Match` | `201` |
+| `POST /api/v1/topics/{topic_id}/research-links` | `actor,research_id,link_kind,provenance_urn`；可选 `dashboard_primary,display_rank`；`link_kind` 仅 `primary/supporting` | 不发 `If-Match` | `200` |
+| `POST /api/v1/topics/{topic_id}/state-events` | `actor,state`；可选 `note`；`state` 仅 `planned/paused` | 不发 `If-Match` | `201` |
+| `POST /api/v1/research/{research_id}/work-state-events` | `actor,state`；可选 `note`；`state` 仅 `planned/in_progress/paused` | 不发 `If-Match` | `201` |
+| `POST /api/v1/research/{research_id}/completion-decisions` | `decision,reason`，并且只给 `actor` 或 `review_urn` 之一；完成时给 `research_release_id`，撤销时给 `target_decision_id` | 不发 `If-Match` | `201` |
+| `POST /api/v1/research/{research_id}/comments` | `actor,content`；可选严格锚点对象 `target` | 不发 `If-Match` | `201` |
+| `PATCH /api/v1/comments/{comment_id}` | `actor,content` | 从 `GET /api/v1/research/{research_id}/comments` 对应项取得 `etag` | `200` |
+| `DELETE /api/v1/comments/{comment_id}` | `actor` | 同上 | `200` |
+| `POST /api/v1/research-updates/{update_id}/annotations` | `actor`；可选 `note` | 从 `GET /api/v1/research-updates` 对应项取得 `etag` | `201` |
+| `PATCH /api/v1/paper-lab/papers/{paper_id}` | `field,value,expected_version,actor_display_name,reason` | 从 `GET /api/v1/paper-lab/papers/{paper_id}` 取整数版本；不发 `If-Match` | `200` |
+| `POST /api/v1/paper-lab/blueprints/validate` | `components` 数组 | 不发 `If-Match`；只验证不保存 | `200` |
+| `POST /api/v1/paper-lab/blueprints` | `name,objective,components`；可选 `blueprint_id` | 不发 `If-Match` | `201` |
+| `POST /knowledge/research/{document_id}/comments` | 顶层 `actor_kind,content,version_id`；`other` 另给 `display_name`；块/区间锚点另给 `target_kind,anchor_span_id` | 不发 `If-Match` | `201` |
+
+公共失败状态也属于调用合同：未通过生产访问门禁时 `/api/*` 为 `401`，页面型
+`/knowledge/*` 会先 `302` 到登录页；非法前置条件为 `400`；
+Origin/CSRF 不合法为 `403`；对象不存在为 `404`；幂等键复用到不同载荷、版本或
+并发事实漂移通常为 `409`；JSON/字段校验失败为 `422`；缺少必需的
+`Idempotency-Key` 或 `If-Match` 为 `428`。研究工作区不可用时可能返回 `503`。
+调用方必须读取 JSON 中的 `error`/`message`，不能只按 2xx/非 2xx 猜测结果。
+Archive 块／区间评论的完整 `target` 字段由
+`quant_hub/src/quant_hub/web/contracts.py` 的 `CommentTargetCreate` 定义；它绑定来源版本、
+source hash、byte range、exact text、结构上下文和 locator。研究员通常应让页面生成该对象，
+不要手拼未核验锚点。
+
 评论和进度写入应通过 UI 或 API，不要改 SQLite。JSON 写请求必须：
 
 - 使用 `Content-Type: application/json`；
@@ -657,21 +707,37 @@ session、精确同源 `Origin`、`X-CSRF-Token` 和 `Idempotency-Key`；JSON �
 API 没有扫描、候选构建、证书签发或 release 激活接口。这些操作不能用普通 HTTP 请求绕过。
 
 下面是可直接复制的 PowerShell 读取与写入示例。先把 `$Base`、`$ResearchId`
-和正文改成真实值；`$Base` 必须与服务启动时的 trusted origin 精确一致。
+和正文改成真实值；`$Base` 必须与服务启动时的 trusted origin 精确一致。示例会
+交互读取访问密码，只在本进程内用于登录，不把密码写进脚本、命令历史或磁盘。
 
 ```powershell
 $Base = 'http://localhost:8765'
 $Query = [uri]::EscapeDataString('时序交叉验证')
 
-# 只读检索：不需要 CSRF 或 Idempotency-Key。
-$Search = Invoke-RestMethod -Method Get -Uri "$Base/api/v1/search?q=$Query&limit=5"
-$Search.data
-
-# 建立一次 session，之后的写请求始终复用同一 cookie jar。
+# production 先建立 access-gate session；密码必须由授权运维提供。
 $WebSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+$SecurePassword = Read-Host 'Quant Research Hub 访问密码' -AsSecureString
+$PasswordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+try {
+  $PlainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($PasswordPointer)
+  Invoke-WebRequest -Method Post -Uri "$Base/login" `
+    -WebSession $WebSession -Body @{ password = $PlainPassword } | Out-Null
+}
+finally {
+  $PlainPassword = $null
+  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($PasswordPointer)
+  $SecurePassword.Dispose()
+}
+
+# 取得业务 session/CSRF；所有后续读写始终复用同一 cookie jar。
 $Session = Invoke-RestMethod -Method Get -Uri "$Base/api/v1/session" -WebSession $WebSession
 $Csrf = $Session.data.csrf_token
 $ResearchId = 'res_REPLACE_WITH_32_HEX'
+
+# 只读检索不需要 CSRF 或 Idempotency-Key，但仍需要上面的 production 登录 cookie。
+$Search = Invoke-RestMethod -Method Get `
+  -Uri "$Base/api/v1/search?q=$Query&limit=5" -WebSession $WebSession
+$Search.data
 
 $CommentHeaders = @{
   Origin = $Base
@@ -795,8 +861,8 @@ artifact，并原子更新本机 mirror/pointer。退出状态包括 `fresh`、`
 
 1. `^src:{citation_id}` 是展示层定位符，不是 PDF、来源原文或“模型已经证明”的
    标记；`citation_id` 必须来自受审阅 Evidence，不能手写。
-2. 本机 mirror 只保存签名/散列闭合的 MCP 检索 artifact 和身份指针，不复制
-   release SQLite、Evidence PDF 或完整 source object。
+2. 本机 mirror 只保存由 release manifest 标识并按散列核验的 MCP 检索 artifact 和
+   身份指针，不复制 release SQLite、Evidence PDF 或完整 source object。
 3. `search_quant_knowledge` 的 snippet 只用于选择候选，不能直接充当最终证据；
    最终结论只引用 `get_quant_knowledge` 返回的 `source_citations`。
 4. canonical locator 至少绑定 object、document version、source hash、span、精确
@@ -835,8 +901,8 @@ inventory 或 Authenticode 结果。授权编排脚本必须直接调用下列�
 - `knowledge_mcp/evaluation.py::build_acceptance_preregistration()`：由真实 prompt bytes、
   case 合同和 authority identity 生成 canonical preregistration；
 - `knowledge_mcp/acceptance_contracts.py::collect_openai_authenticode()`、
-  `pin_runtime_closure()` 和 `validate_real_codex_launch_config_bytes()`：采集/固定运行时
-  bytes，并验证 launch config；
+  `pin_runtime_closure()` 和 `validate_real_codex_launch_config_bytes()`：采集/固定合同明确
+  声明的进程输入 bytes，并验证 launch config；
 - 同文件的 `build_real_codex_command()` 和 `build_real_request_material()`：从已验证
   config 生成双臂命令与 dispatch 身份；
 - `knowledge_mcp/acceptance_runner.py::record_real_acceptance_inputs()`：重读上述 bytes 并以
@@ -909,13 +975,23 @@ SHA-256 和 runtime file 行都要从实际 bytes 机械生成，不能照抄占
 }
 ```
 
-`runtime_closures[].files` 必须列出 root 下全部文件，按 `/` 风格 UTF-8 相对路径严格递增，
-不能只列示例中的一行。`codex_executable` 必须由 `shell=False` 直接启动，Windows 只接受
-OpenAI Authenticode `Valid` 的 `.exe`，不接受 `.ps1/.cmd/.bat` 或把 `sys.executable` 改名
-冒充 Codex。MCP command 也必须是 native `qrh-knowledge-mcp.exe`，并同时冻结其实际
-`python.exe`、client config、package 与 `.dist-info`；`PYTHONPATH` 必须指向冻结 package root
-的父目录，`PYTHONSAFEPATH/PYTHONNOUSERSITE` 必须为 `1`，`env_vars` 必须为空，避免从 cwd、
-user site 或继承环境加载另一份同名运行时。
+`runtime_closures[].files` 必须列出每个**已声明 root** 下的全部文件，按 `/` 风格 UTF-8
+相对路径严格递增，不能只列示例中的一行。这里的 `runtime_closures` 是合同字段名，
+不等于“整个 Windows/Python 运行时已经闭合”。当前实现只 pin 并复核：原生
+`codex.exe`、原生 `qrh-knowledge-mcp.exe` launcher、launcher 记录的 `python.exe`、client
+config，以及 launch config 明确声明的 package roots（当前为 `quant_hub` package 和
+`.dist-info`）。它**不** inventory 或证明 `PYTHONPATH` 的父目录、Python home、标准库、
+DLL、`.pth`、`sitecustomize`、OS loader、PowerShell 或其他未声明的加载输入。
+
+`codex_executable` 必须由 `shell=False` 直接启动，Windows 只接受 OpenAI Authenticode
+`Valid` 的 `.exe`，不接受 `.ps1/.cmd/.bat` 或把 `sys.executable` 改名冒充 Codex。这里的
+Authenticode 只核验该 `codex.exe` 的发布者签名与文件身份；它不是 campaign receipt 的
+countersignature，也不表示 OpenAI 或其他独立方签发、认可了本次验收结果。MCP command
+也必须是 native `qrh-knowledge-mcp.exe`，并固定上述合同范围内的 Python、client config
+与声明 package roots；`PYTHONPATH` 必须指向冻结 package root 的父目录，
+`PYTHONSAFEPATH/PYTHONNOUSERSITE` 必须为 `1`，`env_vars` 必须为空。这些约束减少从 cwd、
+user site 或继承环境加载另一份同名包的风险，但不会把未 inventory 的父目录或 Python/OS
+加载链转化为已证明事实。
 
 `execution_scope=production_exact_d` 时，`evidence_parent` 必须机械解析到
 `D:\quant\quant_platform\audit` 内；`local` 也只能写到显式父目录的直接子目录。任一路径含
@@ -942,16 +1018,40 @@ qrh-mcp-acceptance verify `
 `preregister` 先在 sibling staging directory 以不可覆盖方式写入并 fsync 全部输入，闭合
 inventory 后才 write-through 提交；`run` 对每个 case 依次运行 assisted 和 no-MCP 两臂，
 使用 `shell=False` 调用真实 `codex exec --json --ignore-user-config --ignore-rules`。两臂完整
-配置只能在目标 `enabled=true/false` 上不同，`required=true` 保持不变；同一 signed Codex 的
-app-server 会现场读取包含 packaged/system/enterprise/project/legacy-managed 的配置层，只排除
+配置只能在目标 `enabled=true/false` 上不同，`required=true` 保持不变；同一份已固定的
+`codex.exe` app-server 会现场读取包含 packaged/system/enterprise/project/legacy-managed 的配置层，只排除
 `--ignore-user-config` 对应的 user layer；active 非 user 层引入 MCP/app/plugin 时直接失败。
-Windows runner 全程固定 Codex/MCP/Python/config/
-package bytes，查询真实 Codex、MCP launcher 和 Python process image，并以硬上限并行流式读取
-stdout/stderr。`verify` 从 closed inventory、原始 JSONL、intent/completion、prompt、config
-和 ledger 全量重放，不相信自报 PASS。当前即使真实两臂功能测试通过，也只会得到
+Windows runner 固定并复核上一段列出的 Codex/native launcher/Python/client config/声明
+package roots，以硬上限并行流式读取 stdout/stderr；对 descendant process image 的观察仅用于
+诊断。当前证据不证明唯一父子进程链，也不把 descendant image、PID 或启动时间提升为
+authority。`verify` 从受记录 inventory、原始 JSONL、intent/completion、prompt、config
+和 ledger 重放，不相信自报 PASS。当前即使真实两臂功能测试通过，也只会得到
 `REAL_CODEX_EVIDENCE_REPLAY_NON_AUTHORITATIVE`：它证明封闭回放自洽，但不是 Stage 5 资格证据。
 公开 fake 或 real/fake 混用只能得到 `PUBLIC_SYNTHETIC_NON_QUALIFYING_GATE`。平台尚缺独立可信
-attestation/countersignature，研究员不得把上述任一磁盘 receipt 当成生产放行授权。
+attestation/receipt 签发方，研究员不得把上述任一磁盘 receipt 当成生产放行授权。
+
+#### 未来 authoritative receipt 的最低合同（尚未实现）
+
+未来若要让真实 MCP 对照验收进入 Stage 5，不能只给现有 JSON 增加一个 `signature` 字段。
+最低合同必须同时满足：
+
+1. **外部信任根。** 回执由普通仓库写权限、运行验收的用户和被测进程均不能导出、替换或
+   伪造的独立信任根签发；信任根身份、密钥轮换和撤销状态可由 verifier 独立取得。
+2. **256-bit nonce challenge。** verifier 为每次验收产生至少 256 bit 的密码学随机 nonce，
+   challenge 绑定 run、冻结输入身份、期望签发域和有效期；签发方不得接受调用方自选的旧 nonce。
+3. **域分离的 canonical signature。** 签名输入使用版本化、确定性的 canonical bytes，并以
+   固定 domain separator 区分 MCP acceptance、Stage 5 certificate 与 visibility receipt；签名
+   必须覆盖 nonce、subject、artifact/manifest hashes、判定、签发方身份和有效期。
+4. **原子 `VerifyAndConsume`。** verifier 必须在同一个受信事务中验证签名、信任链、nonce、
+   subject、有效期和撤销状态，并以 compare-and-swap（CAS）把 nonce 从“未使用”原子转换为
+   “已消费”。失败、重复消费或 identity drift 一律 fail closed。
+5. **防重放与 TOCTOU。** 已消费 nonce 永不再次放行；验证后到状态提交之间不得重新读取可被
+   普通用户替换的 receipt/artifact。若必须跨步骤使用，后续步骤须绑定前一步的 canonical
+   receipt hash 和 CAS 版本，而不是按路径重新信任文件。
+
+在这个合同由独立受信服务或等价的受保护签发设施真实落地并通过负向测试前，现有
+`campaign-receipt.json`、Authenticode 结果、self-hash、PID/process image 和本机 manifest/散列
+都只能作为功能回放或诊断材料，不能单独构成 authoritative receipt。
 
 ## 5. 所有数据库与数据文件在哪里
 

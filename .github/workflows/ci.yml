@@ -337,6 +337,7 @@ jobs:
             "quant_hub/ops/local_exact_deployment_controller.py",
             "quant_hub/ops/local_deployment_persistence.py",
             "quant_hub/ops/local_deployment_runtime.py",
+            "quant_hub/ops/identity_graph_fixture.py",
             "quant_hub/ops/local_release_identity.py",
             "quant_hub/ops/release_closure.py",
             "quant_hub/ops/tooling_update_host.py",
@@ -398,6 +399,9 @@ jobs:
           if (($entryPoints -join "`n") -notmatch "qrh-release-closure = quant_hub\.ops\.release_closure:main") {
             throw "wheel is missing the qrh-release-closure entrypoint"
           }
+          if (($entryPoints -join "`n") -notmatch "qrh-stage5-identity-graph-fixtures = quant_hub\.ops\.identity_graph_fixture:main") {
+            throw "wheel is missing the qrh-stage5-identity-graph-fixtures entrypoint"
+          }
           $removedEntryPoints = @(
             "qrh-cold-bundle",
             "qrh-cold-restore",
@@ -433,6 +437,7 @@ jobs:
           }
           foreach ($module in @(
             "quant_hub.knowledge_mcp.acceptance_cli",
+            "quant_hub.ops.identity_graph_fixture",
             "quant_hub.ops.release_closure",
             "quant_hub.ops.writer_handoff",
             "quant_hub.ops.tooling_update_host",
@@ -446,6 +451,7 @@ jobs:
           foreach ($entrypoint in @(
             "qrh-mcp-acceptance.exe",
             "qrh-release-closure.exe",
+            "qrh-stage5-identity-graph-fixtures.exe",
             "qrh-writer-handoff.exe",
             "qrh-tooling-update.exe",
             "qrh-vm-bootstrap.exe"

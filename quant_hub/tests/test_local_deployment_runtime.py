@@ -206,6 +206,34 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
                     "2000-01-01T00:00:00.000000Z",
                 ),
             )
+            connection.execute(
+                """
+                INSERT INTO progress_topic(
+                    topic_id,topic_key,title,state,note,manual_order,
+                    created_by_actor_id,last_modified_by_actor_id,created_at,
+                    updated_at,revision,retired_at,legacy_source_node_id
+                ) VALUES(?,?,?,'planned',NULL,100,?,?,?,?,1,NULL,NULL)
+                """,
+                (
+                    "legacy_topic",
+                    "legacy-topic",
+                    "Legacy Topic",
+                    "legacy_actor",
+                    "legacy_actor",
+                    "2000-01-01T00:00:00.000000Z",
+                    "2000-01-01T00:00:00.000000Z",
+                ),
+            )
+        return path
+
+    def downgrade_comments_to_exact_legacy_v1(self) -> Path:
+        path = self.downgrade_comments_to_exact_legacy_v2()
+        with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("DROP TABLE progress_topic_event")
+            connection.execute("DROP TABLE progress_command_receipt")
+            connection.execute("DROP TABLE progress_topic")
+            connection.execute("DELETE FROM comment_store_schema WHERE version=2")
         return path
 
     def seal(self, database: str, *, attempt: str = "attempt-b3") -> StateDatabaseSeal:
@@ -360,6 +388,12 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
                     ).fetchall(),
                 )
                 self.assertEqual(
+                    [("legacy_topic", "legacy-topic", "planned")],
+                    connection.execute(
+                        "SELECT topic_id,topic_key,state FROM progress_topic"
+                    ).fetchall(),
+                )
+                self.assertEqual(
                     [("legacy_comment", "research", "legacy_research")],
                     connection.execute(
                         """
@@ -420,6 +454,173 @@ class LocalDeploymentRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(1, canary.as_dict()["challenge"]["applied_rowcount"])
             self.assertEqual(0, canary.as_dict()["challenge"]["stale_rowcount"])
+
+    def test_bootstrap_expands_exact_legacy_v1_through_empty_v2_atomically(self) -> None:
+        path = self.downgrade_comments_to_exact_legacy_v1()
+        fact_tables = (
+            "actor",
+            "command_receipt",
+            "comment",
+            "comment_event",
+            "legacy_import_run",
+            "outbox_event",
+        )
+        with closing(sqlite3.connect(path)) as connection:
+            facts_before = {
+                table: connection.execute(f'SELECT * FROM "{table}"').fetchall()
+                for table in fact_tables
+            }
+
+        from quant_hub.collaboration import comment_store as comment_store_module
+
+        real_backfill = comment_store_module._backfill_legacy_comment_targets
+        observed_v2_boundary = False
+
+        def assert_v2_boundary(connection: sqlite3.Connection) -> int:
+            nonlocal observed_v2_boundary
+            self.assertEqual(
+                [1, 2],
+                [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM comment_store_schema ORDER BY version"
+                    )
+                ],
+            )
+            for table in (
+                "progress_command_receipt",
+                "progress_topic",
+                "progress_topic_event",
+            ):
+                self.assertEqual(
+                    0,
+                    connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0],
+                )
+            observed_v2_boundary = True
+            return real_backfill(connection)
+
+        with self.locked_bootstrap_expand(
+            attempt="bootstrap-legacy-v1",
+            nonce="bootstrap-legacy-v1-nonce",
+        ) as (authorization, compatibility, _workspace, _state_identity):
+            with patch(
+                "quant_hub.collaboration.comment_store._backfill_legacy_comment_targets",
+                side_effect=assert_v2_boundary,
+            ):
+                expanded = self.runtime.expand_bootstrap_comment_schema(
+                    authorization=authorization,
+                    compatibility_manifest=compatibility,
+                )
+            self.assertEqual(1, expanded["backfilled_comment_targets"])
+            replay = self.runtime.expand_bootstrap_comment_schema(
+                authorization=authorization,
+                compatibility_manifest=compatibility,
+            )
+            self.assertEqual(0, replay["backfilled_comment_targets"])
+
+        self.assertTrue(observed_v2_boundary)
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(
+                [(1,), (2,)],
+                connection.execute(
+                    "SELECT version FROM comment_store_schema ORDER BY version"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [(3,)],
+                connection.execute(
+                    "SELECT version FROM comment_target_schema ORDER BY version"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                facts_before,
+                {
+                    table: connection.execute(f'SELECT * FROM "{table}"').fetchall()
+                    for table in fact_tables
+                },
+            )
+
+    def test_bootstrap_legacy_v1_rejects_partial_progress_without_db_write(self) -> None:
+        path = self.downgrade_comments_to_exact_legacy_v1()
+        with closing(sqlite3.connect(path, isolation_level=None)) as connection:
+            connection.execute("CREATE TABLE progress_topic(value TEXT) STRICT")
+        before = self.database_snapshot(path)
+
+        with self.locked_bootstrap_expand(
+            attempt="bootstrap-v1-partial-progress",
+            nonce="bootstrap-v1-partial-progress-nonce",
+        ) as (authorization, compatibility, _workspace, _state_identity):
+            with self.assertRaisesRegex(LocalDeploymentRuntimeError, "原子扩展失败"):
+                self.runtime.expand_bootstrap_comment_schema(
+                    authorization=authorization,
+                    compatibility_manifest=compatibility,
+                )
+
+        self.assertEqual(before, self.database_snapshot(path))
+
+    def test_bootstrap_legacy_v1_exception_rolls_back_v2_and_v3(self) -> None:
+        path = self.downgrade_comments_to_exact_legacy_v1()
+        with closing(sqlite3.connect(path)) as connection:
+            before_schema = connection.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+            ).fetchall()
+            before_facts = connection.execute(
+                "SELECT * FROM comment ORDER BY comment_id"
+            ).fetchall()
+
+        def fail_at_v2_boundary(connection: sqlite3.Connection) -> int:
+            self.assertEqual(
+                [1, 2],
+                [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM comment_store_schema ORDER BY version"
+                    )
+                ],
+            )
+            self.assertEqual(
+                0,
+                sum(
+                    connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+                    for table in (
+                        "progress_command_receipt",
+                        "progress_topic",
+                        "progress_topic_event",
+                    )
+                ),
+            )
+            raise RuntimeError("injected v1 expansion failure")
+
+        with self.locked_bootstrap_expand(
+            attempt="bootstrap-v1-expand-failure",
+            nonce="bootstrap-v1-expand-failure-nonce",
+        ) as (authorization, compatibility, _workspace, _state_identity):
+            with patch(
+                "quant_hub.collaboration.comment_store._backfill_legacy_comment_targets",
+                side_effect=fail_at_v2_boundary,
+            ), self.assertRaisesRegex(LocalDeploymentRuntimeError, "原子扩展失败"):
+                self.runtime.expand_bootstrap_comment_schema(
+                    authorization=authorization,
+                    compatibility_manifest=compatibility,
+                )
+
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(
+                before_schema,
+                connection.execute(
+                    "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+                ).fetchall(),
+            )
+            self.assertEqual(
+                before_facts,
+                connection.execute("SELECT * FROM comment ORDER BY comment_id").fetchall(),
+            )
+            self.assertEqual(
+                [(1,)],
+                connection.execute(
+                    "SELECT version FROM comment_store_schema ORDER BY version"
+                ).fetchall(),
+            )
 
     def test_bootstrap_comment_expand_failure_rolls_back_partial_schema_and_facts(self) -> None:
         path = self.downgrade_comments_to_exact_legacy_v2()

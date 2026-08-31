@@ -216,6 +216,66 @@ BEFORE DELETE ON progress_command_receipt BEGIN
 END;
 """
 
+_PROGRESS_TABLE_NAMES = (
+    "progress_command_receipt",
+    "progress_topic",
+    "progress_topic_event",
+)
+
+
+def _progress_schema_rows(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[str, str, str, str | None], ...]:
+    placeholders = ",".join("?" for _item in _PROGRESS_TABLE_NAMES)
+    return tuple(
+        (str(row[0]), str(row[1]), str(row[2]), None if row[3] is None else str(row[3]))
+        for row in connection.execute(
+            f"""
+            SELECT type,name,tbl_name,sql
+            FROM sqlite_master
+            WHERE lower(tbl_name) IN ({placeholders})
+               OR lower(name) GLOB 'progress_*'
+            ORDER BY type,name,tbl_name
+            """,
+            _PROGRESS_TABLE_NAMES,
+        )
+    )
+
+
+def _approved_progress_schema_rows() -> tuple[
+    tuple[str, str, str, str | None], ...
+]:
+    reference = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        reference.executescript(_SCHEMA)
+        reference.executescript(_PROGRESS_SCHEMA)
+        return _progress_schema_rows(reference)
+    finally:
+        reference.close()
+
+
+def _require_approved_progress_schema(connection: sqlite3.Connection) -> None:
+    if _progress_schema_rows(connection) != _approved_progress_schema_rows():
+        raise RuntimeError("progress schema is not the approved exact DDL")
+
+
+def _execute_schema_in_current_transaction(
+    connection: sqlite3.Connection,
+    schema: str,
+) -> None:
+    """Execute a multi-statement schema without sqlite3.executescript commits."""
+
+    pending = ""
+    for line in schema.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                connection.execute(statement)
+            pending = ""
+    if pending.strip():
+        raise RuntimeError("schema contains an incomplete SQL statement")
+
 # The core version deliberately remains v2.  V39's initializer accepts unknown
 # additive tables but rejects an extra row in comment_store_schema, so recording
 # target v3 in that legacy table would make a retained prior release unable to
@@ -846,7 +906,7 @@ def _backfill_legacy_comment_targets(connection: sqlite3.Connection) -> int:
 
 
 def expand_legacy_comment_target_schema(connection: sqlite3.Connection) -> int:
-    """Atomically expand an exact legacy v2 comment store to v2+[3].
+    """Atomically expand an exact legacy v1/v2 comment store to v2+[3].
 
     This deliberately accepts an already-open connection rather than a path.
     Deployment owns the fixed-D path, writer fence, file lifecycle, final
@@ -858,49 +918,84 @@ def expand_legacy_comment_target_schema(connection: sqlite3.Connection) -> int:
 
     if connection.in_transaction:
         raise RuntimeError("评论锚点 schema 扩展要求独立事务边界")
-    store_versions = [
-        int(row[0])
-        for row in connection.execute(
-            "SELECT version FROM comment_store_schema ORDER BY version"
-        )
-    ]
-    if store_versions != [1, 2]:
-        raise RuntimeError(f"不支持的持久评论库 schema：{store_versions}")
-
-    present_objects = _comment_target_schema_rows(connection)
-    if present_objects:
-        _require_approved_comment_target_schema(connection)
-        extension_versions = [
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        store_versions = [
             int(row[0])
             for row in connection.execute(
-                "SELECT version FROM comment_target_schema ORDER BY version"
+                "SELECT version FROM comment_store_schema ORDER BY version"
             )
         ]
-        if extension_versions != [COMMENT_TARGET_SCHEMA_VERSION]:
-            raise RuntimeError(
-                f"不支持的评论锚点扩展 schema：{extension_versions}"
-            )
-        missing_targets = int(
-            connection.execute(
-                """
-                SELECT count(*)
-                FROM comment AS comment_row
-                WHERE NOT EXISTS(
-                    SELECT 1 FROM comment_target AS target
-                    WHERE target.comment_id=comment_row.comment_id
-                )
-                """
-            ).fetchone()[0]
-        )
-        if missing_targets:
-            raise RuntimeError("当前评论锚点 schema 存在未回填 legacy comment")
-        return 0
+        progress_objects = _progress_schema_rows(connection)
+        target_objects = _comment_target_schema_rows(connection)
 
-    try:
-        # executescript normally commits a pending transaction first.  The
-        # explicit BEGIN here is therefore the sole boundary and intentionally
-        # has no COMMIT in the script; marker/backfill join the same transaction.
-        connection.executescript("BEGIN IMMEDIATE;\n" + _COMMENT_TARGET_SCHEMA)
+        if store_versions == [1]:
+            if progress_objects:
+                raise RuntimeError(
+                    "legacy v1 comment store contains partial progress schema"
+                )
+            if target_objects:
+                raise RuntimeError(
+                    "legacy v1 comment store contains premature target schema"
+                )
+            _execute_schema_in_current_transaction(connection, _PROGRESS_SCHEMA)
+            _require_approved_progress_schema(connection)
+            if any(
+                int(connection.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+                for table in _PROGRESS_TABLE_NAMES
+            ):
+                raise RuntimeError("new v2 progress tables are not empty")
+            connection.execute(
+                "INSERT INTO comment_store_schema(version,applied_at) VALUES(?,?)",
+                (COMMENT_STORE_SCHEMA_VERSION, utc_now()),
+            )
+            upgraded_versions = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_store_schema ORDER BY version"
+                )
+            ]
+            if upgraded_versions != [1, COMMENT_STORE_SCHEMA_VERSION]:
+                raise RuntimeError(
+                    f"v1 to v2 comment marker expansion did not close: {upgraded_versions}"
+                )
+        elif store_versions == [1, COMMENT_STORE_SCHEMA_VERSION]:
+            _require_approved_progress_schema(connection)
+        else:
+            raise RuntimeError(f"unsupported durable comment schema: {store_versions}")
+
+        if target_objects:
+            _require_approved_comment_target_schema(connection)
+            extension_versions = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_target_schema ORDER BY version"
+                )
+            ]
+            if extension_versions != [COMMENT_TARGET_SCHEMA_VERSION]:
+                raise RuntimeError(
+                    f"unsupported comment target schema: {extension_versions}"
+                )
+            missing_targets = int(
+                connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM comment AS comment_row
+                    WHERE NOT EXISTS(
+                        SELECT 1 FROM comment_target AS target
+                        WHERE target.comment_id=comment_row.comment_id
+                    )
+                    """
+                ).fetchone()[0]
+            )
+            if missing_targets:
+                raise RuntimeError(
+                    "current comment target schema has unbackfilled legacy comments"
+                )
+            connection.rollback()
+            return 0
+
+        _execute_schema_in_current_transaction(connection, _COMMENT_TARGET_SCHEMA)
         connection.execute(
             "INSERT INTO comment_target_schema(version,applied_at) VALUES(?,?)",
             (COMMENT_TARGET_SCHEMA_VERSION, utc_now()),
