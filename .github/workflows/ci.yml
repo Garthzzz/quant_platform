@@ -217,6 +217,9 @@ jobs:
           Write-Output "Public-safe unit tests passed"
       - name: Build and exercise installable operational wheel
         shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONUTF8: "1"
         run: |
           $wheelRoot = Join-Path $env:RUNNER_TEMP "qrh-wheel"
           New-Item -ItemType Directory -Path $wheelRoot -Force | Out-Null
