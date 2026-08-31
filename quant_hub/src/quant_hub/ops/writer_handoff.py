@@ -2853,7 +2853,7 @@ def _finish_failed_handoff_cleanup(
         bool(rollback["succeeded"]),
         bool(rollback["blocked"]),
         str(failure["error_code"]),
-        True,
+        False,
     )
 
 
@@ -4466,10 +4466,20 @@ def main(argv: list[str] | None = None) -> int:
             )
             result = {
                 "schema_version": "qrh-writer-handoff-finalize-result/v1",
-                "status": "succeeded",
-                "evidence_type": "writer_handoff_receipt",
+                "status": (
+                    "succeeded"
+                    if applied.succeeded
+                    else "failed_cleanup_completed"
+                ),
+                "evidence_type": (
+                    "writer_handoff_receipt"
+                    if applied.succeeded
+                    else "writer_handoff_failure"
+                ),
                 "evidence_id": applied.receipt_path.stem,
-                "writer_authority_committed": True,
+                "writer_authority_committed": (
+                    applied.writer_authority_committed
+                ),
             }
             code = 0
         elif args.command == "status":

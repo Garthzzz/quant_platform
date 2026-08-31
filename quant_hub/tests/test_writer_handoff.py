@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from datetime import UTC, datetime, timedelta
 import hashlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -913,9 +915,61 @@ class WriterHandoffTests(unittest.TestCase):
             allow_test_root=True,
         )
         self.assertFalse(resolved.succeeded)
+        self.assertFalse(resolved.writer_authority_committed)
         self.assertFalse(journal_path.exists())
         self.assertFalse(
             (self.fixture.root / "tmp" / "writer-handoff" / attempt_id).exists()
+        )
+
+    def test_finalize_cli_reports_failed_cleanup_without_writer_authority(self) -> None:
+        from quant_hub.ops import writer_handoff as module
+
+        finalized = module.HandoffApplyResult(
+            False,
+            self.fixture.root / "writer-handoff-failure-attempt-cli.json",
+            None,
+            None,
+            True,
+            True,
+            False,
+            "d_service_start_failed",
+            False,
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            module, "_root", return_value=self.fixture.root
+        ), mock.patch.object(
+            module, "finalize_writer_handoff", return_value=finalized
+        ), redirect_stdout(output):
+            code = module.main(
+                [
+                    "finalize",
+                    "--vm-root",
+                    str(self.fixture.root),
+                    "--release-manifest-sha256",
+                    "a" * 64,
+                    "--successor-release-id",
+                    "release-r1",
+                    "--successor-release-manifest-sha256",
+                    "b" * 64,
+                    "--successor-snapshot-id",
+                    "snapshot-r1",
+                    "--attempt-id",
+                    "attempt-cli",
+                    "--nonce",
+                    NONCE,
+                ]
+            )
+        self.assertEqual(0, code)
+        self.assertEqual(
+            {
+                "schema_version": "qrh-writer-handoff-finalize-result/v1",
+                "status": "failed_cleanup_completed",
+                "evidence_type": "writer_handoff_failure",
+                "evidence_id": "writer-handoff-failure-attempt-cli",
+                "writer_authority_committed": False,
+            },
+            json.loads(output.getvalue()),
         )
 
     def test_failure_terminal_is_durable_before_cleanup_crash(self) -> None:
