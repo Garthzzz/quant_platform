@@ -14745,6 +14745,24 @@ class LocalDeploymentPersistence:
         legacy_parent = self.layout.temporary / "failure-release-cleanup"
         legacy_name = f"failure-{quarantine_digest[:48]}.partial"
         legacy_quarantine = legacy_parent / legacy_name
+
+        def remove_empty_quarantine_parents() -> None:
+            for parent_path in (quarantine_parent, legacy_parent):
+                if self._safe_root.preflight(
+                    parent_path,
+                    expected_kind="directory",
+                    allow_absent=True,
+                ) is None:
+                    continue
+                with os.scandir(parent_path) as entries:
+                    if any(entries):
+                        continue
+                with _BoundDirectory(
+                    self._safe_root, self.layout.temporary
+                ) as temporary_guard:
+                    temporary_guard.rmdir(parent_path.name)
+                    temporary_guard.flush()
+
         final_present = self._safe_root.preflight(
             final, expected_kind="directory", allow_absent=True
         )
@@ -14824,6 +14842,7 @@ class LocalDeploymentPersistence:
                 quarantine, expected_kind="directory", allow_absent=False
             )
         if quarantine_present is None:
+            remove_empty_quarantine_parents()
             return False
 
         manifest_path = quarantine / "release_manifest.json"
@@ -14905,23 +14924,7 @@ class LocalDeploymentPersistence:
         with _BoundDirectory(self._safe_root, quarantine_parent) as parent:
             parent.rmdir(quarantine_name)
             parent.flush()
-        with os.scandir(quarantine_parent) as entries:
-            if not any(entries):
-                with _BoundDirectory(
-                    self._safe_root, self.layout.temporary
-                ) as temporary_guard:
-                    temporary_guard.rmdir(quarantine_parent.name)
-                    temporary_guard.flush()
-        if self._safe_root.preflight(
-            legacy_parent, expected_kind="directory", allow_absent=True
-        ) is not None:
-            with os.scandir(legacy_parent) as entries:
-                if not any(entries):
-                    with _BoundDirectory(
-                        self._safe_root, self.layout.temporary
-                    ) as temporary_guard:
-                        temporary_guard.rmdir(legacy_parent.name)
-                        temporary_guard.flush()
+        remove_empty_quarantine_parents()
         return True
 
     def execute_retention_cleanup(

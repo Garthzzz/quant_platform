@@ -938,6 +938,16 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 )
                 self.assertFalse(legacy_quarantine.exists())
                 self.assertFalse((persistence.layout.temporary / "f").exists())
+                self.assertFalse(legacy_quarantine.parent.exists())
+                (persistence.layout.temporary / "f").mkdir()
+                legacy_quarantine.parent.mkdir()
+                self.assertFalse(
+                    persistence.cleanup_failed_candidate(
+                        lock=lock, attempt_id="activate-r1"
+                    )
+                )
+                self.assertFalse((persistence.layout.temporary / "f").exists())
+                self.assertFalse(legacy_quarantine.parent.exists())
             finally:
                 if lock.held:
                     lock.release()
