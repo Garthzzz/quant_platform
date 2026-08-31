@@ -240,6 +240,15 @@ Archive 论文系统与 Paper Lab 数据库相互独立。它的正式数据库�
 
 第一份是正式论文资源清单，第二份保留仍待确认、待获取或有歧义的候选。不要删除“无法确认”“无法获取”“权利不允许本地保存”的记录；原因本身就是审计数据。
 
+`import_reviewed_evidence_materials.py` 不是“给任意新论文直接入库”的通用抓取器。它默认读取工作区内两类已经过人工或代理审阅、并按工具契约整理好的材料包：
+
+```text
+D:\quant\quant_platform\project_state\workers\crossref_identity_review\
+D:\quant\quant_platform\project_state\workers\arxiv_expansion_materials\
+```
+
+前者保存 Crossref 身份核验材料，后者保存 arXiv 扩展材料。新发现的论文应先经过 Archive 线索提取、元数据核验和材料包审阅，再调用此脚本生成导入计划；不要把下载目录或任意 PDF 目录直接塞给它。
+
 受控导入的正确做法是先生成静态计划，确认后才对隔离候选应用：
 
 ```powershell
@@ -702,6 +711,7 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\control\deployment_runtime.json` | 服务监听、release 相对路径、外置 state 和 writer authority 的封闭启动契约 |
 | `<VM_ROOT>\control\service_install_candidate.json` | 服务安装候选证据 |
 | `<VM_ROOT>\control\exact_runtime_tooling.json` | 固定工具链身份 |
+| `<VM_ROOT>\control\tooling_update_pending.json` | 工具链更新的短生命周期 journal；仅由 tooling updater 创建和维护，成功收尾后清理，禁止手工编辑或删除 |
 | `<VM_ROOT>\control\writer_handoff_pending.json` | handoff 进行中的受控 journal；只由 handoff 工具维护 |
 | `<VM_ROOT>\control\writer-handoff-intents\*.json` | writer handoff 意图 |
 | `<VM_ROOT>\state\comments.sqlite3` | 当前生产评论与 Dashboard 外置状态 |

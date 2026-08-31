@@ -36,6 +36,13 @@ WORKSPACE_MIGRATIONS = (
     "migrations/research_workspace/0003_project_creation_command.down.sql",
     "migrations/research_workspace/0003_project_creation_command.up.sql",
 )
+WORKSPACE_RUNTIME_MIGRATIONS = tuple(
+    f"runtime_contract/{path}" for path in WORKSPACE_MIGRATIONS
+)
+WORKSPACE_MIGRATION_LAYOUTS = (
+    WORKSPACE_MIGRATIONS,
+    WORKSPACE_RUNTIME_MIGRATIONS,
+)
 
 COMMENTS_LOGICAL_SCHEMA = {
     "logical_version": 2,
@@ -196,22 +203,32 @@ def _migration_files_from_manifest(
     inventory = {
         str(item["path"]): item for item in manifest["inventory"]["files"]
     }
+    approved_prefixes = (
+        "migrations/research_workspace/",
+        "runtime_contract/migrations/research_workspace/",
+    )
     observed = {
         path
         for path in inventory
-        if path.startswith("migrations/research_workspace/")
+        if path.startswith(approved_prefixes)
     }
-    if observed != set(WORKSPACE_MIGRATIONS):
+    matches = [
+        layout
+        for layout in WORKSPACE_MIGRATION_LAYOUTS
+        if observed == set(layout)
+    ]
+    if len(matches) != 1:
         raise ExactReleaseCompatibilityError(
             "research_workspace manifest migration set is not exact"
         )
+    selected = matches[0]
     return [
         {
             "path": path,
             "bytes": int(inventory[path]["bytes"]),
             "sha256": str(inventory[path]["sha256"]),
         }
-        for path in WORKSPACE_MIGRATIONS
+        for path in selected
     ]
 
 
@@ -257,7 +274,9 @@ def _validate_migration_files(
             label="workspace migration record",
         )
         path = record["path"]
-        if type(path) is not str or path not in WORKSPACE_MIGRATIONS:
+        if type(path) is not str or not any(
+            path in layout for layout in WORKSPACE_MIGRATION_LAYOUTS
+        ):
             raise ExactReleaseCompatibilityError(
                 "workspace migration path is outside the fixed enum"
             )
@@ -266,9 +285,9 @@ def _validate_migration_files(
         _sha256(record["sha256"], label="migration sha256")
         paths.append(path)
         records.append(record)
-    if paths != list(WORKSPACE_MIGRATIONS):
+    if not any(paths == list(layout) for layout in WORKSPACE_MIGRATION_LAYOUTS):
         raise ExactReleaseCompatibilityError(
-            "workspace migration files must be the exact lexical six"
+            "workspace migration files must use one exact lexical six-file layout"
         )
     return records
 
@@ -766,6 +785,7 @@ __all__ = [
     "ROLLBACK_POLICY",
     "WORKSPACE_LOGICAL_SCHEMA",
     "WORKSPACE_MIGRATIONS",
+    "WORKSPACE_RUNTIME_MIGRATIONS",
     "build_exact_release_compatibility_evidence",
     "plan_exact_release_compatibility",
     "validate_exact_release_compatibility_evidence",

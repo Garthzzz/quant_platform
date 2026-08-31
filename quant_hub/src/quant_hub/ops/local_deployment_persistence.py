@@ -171,6 +171,13 @@ _EXACT_RELEASE_MIGRATIONS = (
     "migrations/research_workspace/0003_project_creation_command.down.sql",
     "migrations/research_workspace/0003_project_creation_command.up.sql",
 )
+_EXACT_RELEASE_RUNTIME_MIGRATIONS = tuple(
+    f"runtime_contract/{path}" for path in _EXACT_RELEASE_MIGRATIONS
+)
+_EXACT_RELEASE_MIGRATION_LAYOUTS = (
+    _EXACT_RELEASE_MIGRATIONS,
+    _EXACT_RELEASE_RUNTIME_MIGRATIONS,
+)
 
 # kernel lock 尚未取得前，Windows directory-handle enter 也可能部分成功后失败。
 # 这个进程内 reservation 只封闭该极短 pre-kernel 窗口；跨进程权威仍完全由下面
@@ -3782,6 +3789,7 @@ class _ExactReleaseRoleState:
     manifest: Mapping[str, object] | None = None
     manifest_raw: bytes | None = None
     members: tuple[_ExactReleasePinnedMember, ...] = ()
+    migration_paths: tuple[str, ...] = ()
     namespace_monitor: object | None = None
 
 
@@ -4447,12 +4455,17 @@ class LockedExactReleaseClosures:
                 ),
                 "migrations": [
                     {
-                        "relative_path": member.relative_path,
+                        "relative_path": logical_path,
                         "bytes": member.expected_size,
                         "sha256": member.expected_sha256,
                     }
+                    for logical_path, physical_path in zip(
+                        _EXACT_RELEASE_MIGRATIONS,
+                        role.migration_paths,
+                        strict=True,
+                    )
                     for member in role.members
-                    if member.relative_path in _EXACT_RELEASE_MIGRATIONS
+                    if member.relative_path == physical_path
                 ],
             }
         value = {
@@ -4492,8 +4505,11 @@ class LockedExactReleaseClosures:
         if type(migration) is not str or migration not in _EXACT_RELEASE_MIGRATIONS:
             raise UnsafeLocalPath("migration 只允许固定 research_workspace 枚举")
         current = self._role(role)
+        physical_migration = current.migration_paths[
+            _EXACT_RELEASE_MIGRATIONS.index(migration)
+        ]
         for member in current.members:
-            if member.relative_path == migration:
+            if member.relative_path == physical_migration:
                 if member.raw is None:
                     raise UnsafeLocalPath("migration bytes 尚未闭合")
                 return bytes(member.raw)
@@ -4620,17 +4636,26 @@ class LockedExactReleaseClosures:
         return role.directory.joinpath(*member.relative_path.split("/"))
 
     @staticmethod
-    def _assert_migration_subtree(release: Mapping[str, object]) -> None:
-        prefix = "migrations/research_workspace/"
+    def _migration_layout(release: Mapping[str, object]) -> tuple[str, ...]:
+        prefixes = (
+            "migrations/research_workspace/",
+            "runtime_contract/migrations/research_workspace/",
+        )
         observed = {
             str(item["path"])
             for item in release["inventory"]["files"]
-            if str(item["path"]).startswith(prefix)
+            if str(item["path"]).startswith(prefixes)
         }
-        if observed != set(_EXACT_RELEASE_MIGRATIONS):
+        matches = [
+            layout
+            for layout in _EXACT_RELEASE_MIGRATION_LAYOUTS
+            if observed == set(layout)
+        ]
+        if len(matches) != 1:
             raise RetentionPlanningError(
                 "research_workspace migration subtree 必须恰为固定六文件"
             )
+        return matches[0]
 
     def _open_windows_member(
         self,
@@ -4749,7 +4774,7 @@ class LockedExactReleaseClosures:
 
     def _scan_role(
         self, role: _ExactReleaseRoleState
-    ) -> tuple[ReleaseInventoryEntry, Mapping[str, object]]:
+    ) -> tuple[ReleaseInventoryEntry, Mapping[str, object], tuple[str, ...]]:
         entry, release = self._persistence._scan_release(role.directory)
         reference = role.reference
         if (
@@ -4759,8 +4784,8 @@ class LockedExactReleaseClosures:
             raise RetentionPlanningError(
                 "journal release ref 未解析到 exact manifest ID/hash"
             )
-        self._assert_migration_subtree(release)
-        return entry, release
+        migration_paths = self._migration_layout(release)
+        return entry, release, migration_paths
 
     def _acquire_role(self, role: _ExactReleaseRoleState) -> None:
         lock = self._lock
@@ -4772,7 +4797,7 @@ class LockedExactReleaseClosures:
         )
         # 必须先启动递归 monitor，再做第一次 manifest/inventory 枚举。
         role.namespace_monitor = self._new_namespace_monitor(role.directory)
-        entry, release = self._scan_role(role)
+        entry, release, migration_paths = self._scan_role(role)
         manifest_raw = _identity.canonical_bytes(release)
         members: list[_ExactReleasePinnedMember] = [
             _ExactReleasePinnedMember(
@@ -4796,6 +4821,7 @@ class LockedExactReleaseClosures:
         role.manifest = release
         role.manifest_raw = manifest_raw
         role.members = tuple(members)
+        role.migration_paths = migration_paths
         for member in role.members:
             path = self._path_for(role, member)
             initial = self._persistence._safe_root.preflight(
@@ -4818,11 +4844,17 @@ class LockedExactReleaseClosures:
             raw = self._read_member(role, member)
             if (
                 member.relative_path == "release_manifest.json"
-                or member.relative_path in _EXACT_RELEASE_MIGRATIONS
+                or member.relative_path in role.migration_paths
             ):
                 member.raw = raw
-        confirmed_entry, confirmed_release = self._scan_role(role)
-        if confirmed_entry != entry or confirmed_release != release:
+        confirmed_entry, confirmed_release, confirmed_migration_paths = (
+            self._scan_role(role)
+        )
+        if (
+            confirmed_entry != entry
+            or confirmed_release != release
+            or confirmed_migration_paths != migration_paths
+        ):
             raise RetentionPlanningError(
                 "exact release closure 在 open-instance acquisition 期间漂移"
             )
@@ -4859,8 +4891,12 @@ class LockedExactReleaseClosures:
         for role in self._roles:
             if role.entry is None or role.manifest is None:
                 raise RetentionPlanningError("exact release role 未完成 acquisition")
-            entry, release = self._scan_role(role)
-            if entry != role.entry or release != role.manifest:
+            entry, release, migration_paths = self._scan_role(role)
+            if (
+                entry != role.entry
+                or release != role.manifest
+                or migration_paths != role.migration_paths
+            ):
                 raise RetentionPlanningError("exact release full closure 出场漂移")
             for member in role.members:
                 # 上一次可判定 close fault 可能已经单调闭合了部分成员；full
@@ -4878,7 +4914,7 @@ class LockedExactReleaseClosures:
                 raw = self._read_member(role, member)
                 if (
                     member.relative_path == "release_manifest.json"
-                    or member.relative_path in _EXACT_RELEASE_MIGRATIONS
+                    or member.relative_path in role.migration_paths
                 ) and (member.raw is None or raw != member.raw):
                     raise RetentionPlanningError(
                         "exact release pinned member 出场 bytes 漂移"

@@ -19,6 +19,7 @@ from quant_hub.ops.local_exact_release_compatibility import (
     ExactReleaseCompatibilityError,
     LockedExactReleaseCompatibilityEvidenceSet,
     WORKSPACE_MIGRATIONS,
+    WORKSPACE_RUNTIME_MIGRATIONS,
     build_exact_release_compatibility_evidence,
     plan_exact_release_compatibility,
     validate_exact_release_compatibility_evidence,
@@ -28,7 +29,9 @@ from tests.test_local_deployment_persistence import (
     EXACT_MIGRATIONS,
     PersistenceFixture,
     advance_one,
+    digest,
     journal,
+    migration_bytes,
     release,
     seal,
     state_identity,
@@ -208,6 +211,84 @@ class ExactReleaseCompatibilityTests(PersistenceFixture):
                     )
                     closures.close()
                     workspace.close()
+
+    def test_sealed_runtime_migration_layout_is_accepted_without_mixing(self) -> None:
+        candidate = self.exact_release("release-r1", "a")
+        for record in candidate["inventory"]["files"]:
+            if record["path"] in WORKSPACE_MIGRATIONS:
+                index = WORKSPACE_MIGRATIONS.index(record["path"])
+                record["path"] = WORKSPACE_RUNTIME_MIGRATIONS[index]
+                raw = migration_bytes("release-r1", record["path"])
+                record["bytes"] = len(raw)
+                record["sha256"] = digest(raw)
+        candidate["inventory"]["files"].sort(key=lambda item: item["path"])
+        candidate["resources"]["inventory_sha256"] = identity.identity_sha256(
+            candidate["inventory"]
+        )
+
+        planned = self.plan(
+            operation="bootstrap_first_pair",
+            attempt="runtime-layout",
+            nonce="runtime-layout-nonce",
+            candidate=candidate,
+            prior=None,
+        )
+        self.assertRegex(planned.aggregate_sha256, r"^[0-9a-f]{64}$")
+        first = journal(
+            None,
+            candidate,
+            operation="bootstrap_first_pair",
+            attempt="runtime-layout",
+            nonce="runtime-layout-nonce",
+        )
+        self.bind_plan(first, planned.aggregate_sha256)
+        self.materialize(candidate)
+        self.append_history([first])
+        with self.persistence.global_lock() as lock:
+            workspace = self.persistence.bind_attempt_workspace(
+                lock, "runtime-layout", "runtime-layout-nonce"
+            )
+            closures = self.persistence.lock_exact_release_closures(lock, workspace)
+            self.assertEqual(
+                list(WORKSPACE_MIGRATIONS),
+                [
+                    item["relative_path"]
+                    for item in closures.metadata()["roles"]["candidate"][
+                        "migrations"
+                    ]
+                ],
+            )
+            self.assertEqual(
+                migration_bytes("release-r1", WORKSPACE_RUNTIME_MIGRATIONS[0]),
+                closures.read_migration("candidate", WORKSPACE_MIGRATIONS[0]),
+            )
+            evidence = build_exact_release_compatibility_evidence(closures)
+            self.assertEqual(planned.aggregate_sha256, evidence.aggregate_sha256)
+            closures.close()
+            workspace.close()
+
+        mixed = deepcopy(candidate)
+        mixed["inventory"]["files"].append(
+            {
+                "path": WORKSPACE_MIGRATIONS[0],
+                "bytes": 1,
+                "sha256": "1" * 64,
+            }
+        )
+        mixed["inventory"]["files"].sort(key=lambda item: item["path"])
+        mixed["resources"]["inventory_sha256"] = identity.identity_sha256(
+            mixed["inventory"]
+        )
+        with self.assertRaisesRegex(
+            ExactReleaseCompatibilityError, "migration set is not exact"
+        ):
+            self.plan(
+                operation="bootstrap_first_pair",
+                attempt="mixed-layout",
+                nonce="mixed-layout-nonce",
+                candidate=mixed,
+                prior=None,
+            )
 
     def test_plan_aggregate_is_exactly_the_journal_and_database_seal_value(self) -> None:
         first, _candidate, _prior, planned = self.install_scenario(
