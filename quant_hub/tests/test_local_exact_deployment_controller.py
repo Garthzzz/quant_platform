@@ -473,9 +473,19 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 object.__setattr__(
                     controller, "_service", BootstrapFailureService()
                 )
-                persistence.commit_bootstrap_failure_authorization(
-                    lock=lock, workspace=workspace
+                failure_authorization = (
+                    persistence.commit_bootstrap_failure_authorization(
+                        lock=lock, workspace=workspace
+                    )
                 )
+                advanced_state = {}
+                for filename in (
+                    "comments.sqlite3",
+                    "research_workspace.sqlite3",
+                ):
+                    path = persistence.layout.state / filename
+                    advanced_state[filename] = path.read_bytes() + b"-legacy-advanced"
+                    path.write_bytes(advanced_state[filename])
                 workspace.close()
                 workspace = None
                 lock.release()
@@ -531,6 +541,30 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 self.assertIsNone(persistence.read_active_release())
                 self.assertIsNone(persistence.read_local_prior_binding())
 
+                class AdvanceDuringBoundary(BootstrapFailureService):
+                    @staticmethod
+                    def observe_bootstrap_boundary():
+                        path = persistence.layout.state / "comments.sqlite3"
+                        advanced_state["comments.sqlite3"] += b"-during-fence"
+                        path.write_bytes(advanced_state["comments.sqlite3"])
+                        return BootstrapFailureService.observe_bootstrap_boundary()
+
+                with patch.object(
+                    ProductionExactDeploymentController,
+                    "_qualify_and_stop",
+                    side_effect=AssertionError("bootstrap forward path re-entered"),
+                ) as qualify:
+                    with self.assertRaisesRegex(
+                        ExactDeploymentControllerError,
+                        "drifted around boundary observation",
+                    ):
+                        fresh(AdvanceDuringBoundary()).bootstrap_first_pair(
+                            release_id="release-v39-r0",
+                            expected_manifest_sha256=candidate_hash,
+                            attempt_id="bootstrap-v39-r0",
+                        )
+                    qualify.assert_not_called()
+
                 with patch.object(
                     ProductionExactDeploymentController,
                     "_qualify_and_stop",
@@ -572,6 +606,11 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 self.assertFalse(
                     (persistence.layout.releases / "release-v39-r0").exists()
                 )
+                for filename, expected in advanced_state.items():
+                    self.assertEqual(
+                        expected,
+                        (persistence.layout.state / filename).read_bytes(),
+                    )
                 failure = [
                     record.value
                     for record in persistence.read_local_receipts()
@@ -580,6 +619,25 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                 ]
                 self.assertEqual(1, len(failure))
                 self.assertEqual("bootstrap_first_pair", failure[0]["operation"])
+                state_observation = failure[0]["restoration_evidence"][
+                    "current_d_state_identity_observation"
+                ]
+                self.assertEqual(
+                    "current_d_state_preserved_after_legacy_writer_fence",
+                    state_observation["status"],
+                )
+                self.assertEqual(
+                    failure_authorization["authorization_sha256"],
+                    state_observation["failure_authorization_sha256"],
+                )
+                self.assertEqual(
+                    failure_authorization["production_state_order_sha256"],
+                    state_observation["authorized_state_order_sha256"],
+                )
+                self.assertNotEqual(
+                    state_observation["authorized_state_order_sha256"],
+                    state_observation["preserved_state_order_sha256"],
+                )
                 with patch.object(
                     ProductionExactDeploymentController,
                     "_qualify_and_stop",

@@ -1274,11 +1274,9 @@ class ProductionExactDeploymentController:
                 "failure terminal cannot replace an existing terminal"
             )
         if latest["operation"] == "bootstrap_first_pair":
-            return self._commit_bootstrap_failure_terminal(
-                lock=lock,
-                workspace=workspace,
-                restoration=restoration,
-                boundary=steady,
+            raise DeploymentJournalError(
+                "bootstrap failure terminal requires the bootstrap-specific "
+                "closed-writer boundary path"
             )
         original_active = latest["original_pair"]["active"]  # type: ignore[index]
         if set(steady) != {
@@ -1455,6 +1453,7 @@ class ProductionExactDeploymentController:
         workspace: LockedAttemptWorkspace,
         restoration: Mapping[str, object],
         boundary: Mapping[str, object],
+        failure_authorization: Mapping[str, object],
     ) -> Mapping[str, object]:
         latest = self._persistence.journals.replay(workspace.attempt_id)[-1]
         if (
@@ -1494,6 +1493,29 @@ class ProductionExactDeploymentController:
             )
         state = self._original_state_identity(latest)
         original_pair = {"kind": "bootstrap_no_d_pair", "pair": None}
+        state_advanced_before_fence = (
+            restoration["state_order_sha256"]
+            != failure_authorization["production_state_order_sha256"]
+        )
+        state_observation_details: dict[str, object] = {
+            "observed_state_identity": state,
+        }
+        state_status = "d_state_not_externally_written"
+        if state_advanced_before_fence:
+            state_status = "current_d_state_preserved_after_legacy_writer_fence"
+            state_observation_details.update(
+                {
+                    "failure_authorization_sha256": failure_authorization[
+                        "authorization_sha256"
+                    ],
+                    "authorized_state_order_sha256": failure_authorization[
+                        "production_state_order_sha256"
+                    ],
+                    "preserved_state_order_sha256": restoration[
+                        "state_order_sha256"
+                    ],
+                }
+            )
         evidence = {
             "original_active_pointer_observation": self._failure_observation(
                 status="absent",
@@ -1516,9 +1538,9 @@ class ProductionExactDeploymentController:
                 observed_release=None,
             ),
             "current_d_state_identity_observation": self._failure_observation(
-                status="d_state_not_externally_written",
+                status=state_status,
                 evidence_sha256=str(restoration["state_order_sha256"]),
-                observed_state_identity=state,
+                **state_observation_details,
             ),
         }
         receipt_body: dict[str, object] = {
@@ -1783,18 +1805,29 @@ class ProductionExactDeploymentController:
         }:
             raise cause
         if latest["operation"] == "bootstrap_first_pair":
-            selection = workspace
-            if selection is None or selection._state == "closed":  # noqa: SLF001
-                selection = self._persistence.bind_attempt_workspace(
-                    lock, attempt_id, str(history[0]["nonce"])
-                )
-            try:
-                self._persistence.commit_bootstrap_failure_authorization(
+            failure_authorization = (
+                self._persistence.read_bootstrap_failure_authorization(
                     lock=lock,
-                    workspace=selection,
+                    attempt_id=attempt_id,
+                    nonce=str(history[0]["nonce"]),
                 )
-            finally:
-                selection.close()
+            )
+            failure_replay = failure_authorization is not None
+            if failure_authorization is None:
+                selection = workspace
+                if selection is None or selection._state == "closed":  # noqa: SLF001
+                    selection = self._persistence.bind_attempt_workspace(
+                        lock, attempt_id, str(history[0]["nonce"])
+                    )
+                try:
+                    failure_authorization = (
+                        self._persistence.commit_bootstrap_failure_authorization(
+                            lock=lock,
+                            workspace=selection,
+                        )
+                    )
+                finally:
+                    selection.close()
             stop = getattr(self._service, "stop_exact_transient", None)
             if not callable(stop):
                 raise ExactDeploymentControllerError(
@@ -1808,18 +1841,17 @@ class ProductionExactDeploymentController:
                 first = self._persistence.restore_original_control_for_failure(
                     lock=lock, workspace=recovery
                 )
-                failure_authorization = (
-                    self._persistence.read_bootstrap_failure_authorization(
-                        lock=lock,
-                        attempt_id=attempt_id,
-                        nonce=str(history[0]["nonce"]),
-                    )
-                )
                 if failure_authorization is None:
                     raise ExactDeploymentControllerError(
                         "bootstrap failure selection disappeared before reverse proof"
                     )
-                if (
+                # A durable failure marker can outlive the original failed
+                # handoff while the legacy writer legitimately advances the
+                # shared current D state.  Replay must never rewrite that
+                # one-shot marker or roll state back.  The two observations
+                # around the closed-writer boundary below prove that the
+                # current state is preserved and quiescent during recovery.
+                if not failure_replay and (
                     first["state_order_sha256"]
                     != failure_authorization["production_state_order_sha256"]
                 ):
@@ -1853,6 +1885,7 @@ class ProductionExactDeploymentController:
                     workspace=recovery,
                     restoration=second,
                     boundary=boundary,
+                    failure_authorization=failure_authorization,
                 )
             finally:
                 recovery.close()

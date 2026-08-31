@@ -1158,19 +1158,62 @@ def validate_failure_receipt(value: object) -> Mapping[str, object]:
             label="failure writer observed release",
         )
 
+    raw_state = evidence["current_d_state_identity_observation"]
+    advanced_bootstrap_state = (
+        original_active is None
+        and isinstance(raw_state, Mapping)
+        and raw_state.get("status")
+        == "current_d_state_preserved_after_legacy_writer_fence"
+    )
+    state_detail_fields = {"observed_state_identity"}
+    if advanced_bootstrap_state:
+        state_detail_fields.update(
+            {
+                "failure_authorization_sha256",
+                "authorized_state_order_sha256",
+                "preserved_state_order_sha256",
+            }
+        )
     state = _failure_restoration_observation(
-        evidence["current_d_state_identity_observation"],
-        detail_fields={"observed_state_identity"},
+        raw_state,
+        detail_fields=state_detail_fields,
         label="failure current D state identity observation",
     )
     expected_state_status = (
-        "d_state_not_externally_written"
-        if original_active is None
-        else "current_d_state_identity_unchanged"
+        "current_d_state_preserved_after_legacy_writer_fence"
+        if advanced_bootstrap_state
+        else (
+            "d_state_not_externally_written"
+            if original_active is None
+            else "current_d_state_identity_unchanged"
+        )
     )
     observed_state_identity = validate_state_identity(
         state["observed_state_identity"]
     )
+    if advanced_bootstrap_state:
+        _sha256(
+            state["failure_authorization_sha256"],
+            label="failure bootstrap authorization",
+        )
+        _sha256(
+            state["authorized_state_order_sha256"],
+            label="failure bootstrap authorized state order",
+        )
+        _sha256(
+            state["preserved_state_order_sha256"],
+            label="failure bootstrap preserved state order",
+        )
+        if (
+            state["authorized_state_order_sha256"]
+            == state["preserved_state_order_sha256"]
+            or state["evidence_sha256"]
+            != state["preserved_state_order_sha256"]
+        ):
+            raise LocalReleaseIdentityError(
+                "failure bootstrap advanced state observation does not bind "
+                "the authorized and preserved state orders"
+            )
     if (
         state["status"] != expected_state_status
         or observed_state_identity != original_state_identity

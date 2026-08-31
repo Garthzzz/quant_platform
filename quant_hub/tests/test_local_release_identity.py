@@ -870,6 +870,39 @@ class LocalReleaseIdentityContractTests(unittest.TestCase):
     def test_failure_receipt_binds_operation_and_exact_candidate_role(self) -> None:
         bootstrap_failure = failure_receipt(None, self.r0)
         validate_failure_receipt(bootstrap_failure)
+        advanced_bootstrap_failure = failure_receipt(None, self.r0)
+        advanced_state = advanced_bootstrap_failure["restoration_evidence"][
+            "current_d_state_identity_observation"
+        ]
+        advanced_state.update(
+            {
+                "status": "current_d_state_preserved_after_legacy_writer_fence",
+                "failure_authorization_sha256": _hash("a"),
+                "authorized_state_order_sha256": _hash("b"),
+                "preserved_state_order_sha256": _hash("c"),
+                "evidence_sha256": _hash("c"),
+            }
+        )
+        _seal(advanced_state, "observation_sha256")
+        advanced_bootstrap_failure["result"][
+            "restoration_evidence_sha256"
+        ] = identity_sha256(advanced_bootstrap_failure["restoration_evidence"])
+        _seal(advanced_bootstrap_failure, "receipt_sha256")
+        validate_failure_receipt(advanced_bootstrap_failure)
+
+        unbound_advanced_state = deepcopy(advanced_bootstrap_failure)
+        unbound_observation = unbound_advanced_state["restoration_evidence"][
+            "current_d_state_identity_observation"
+        ]
+        unbound_observation["preserved_state_order_sha256"] = _hash("b")
+        unbound_observation["evidence_sha256"] = _hash("b")
+        _seal(unbound_observation, "observation_sha256")
+        unbound_advanced_state["result"][
+            "restoration_evidence_sha256"
+        ] = identity_sha256(unbound_advanced_state["restoration_evidence"])
+        _seal(unbound_advanced_state, "receipt_sha256")
+        with self.assertRaisesRegex(LocalReleaseIdentityError, "advanced state"):
+            validate_failure_receipt(unbound_advanced_state)
         pre_pair_failure = failure_receipt(self.r0, self.r1)
         validate_failure_receipt(pre_pair_failure)
         ordinary_failure = failure_receipt(self.r1, self.r2, self.r0)
