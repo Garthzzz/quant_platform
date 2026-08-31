@@ -604,7 +604,9 @@ def _powershell_package_inventory_verification_script() -> str:
     )
 
 
-def verified_d_tooling_python_script(module_binding: str) -> str:
+def verified_d_tooling_python_script(
+    module_binding: str, *, allow_legacy: bool = False
+) -> str:
     """PowerShell prelude binding exact D Python and one fixed CLI module.
 
     This prelude uses only Windows/PowerShell primitives.  It verifies the
@@ -618,7 +620,7 @@ def verified_d_tooling_python_script(module_binding: str) -> str:
         raise PublishAdapterError("unreviewed operational module binding") from error
     python_path = r"D:\quant\quant_platform\tooling\python\python.exe"
     candidate_path = r"D:\quant\quant_platform\control\service_install_candidate.json"
-    expected_fields = (
+    common_fields = (
         "schema_version", "service_name", "python_class", "start_type",
         "service_executable", "service_executable_sha256", "service_python",
         "service_python_sha256", "service_host_module",
@@ -629,7 +631,16 @@ def verified_d_tooling_python_script(module_binding: str) -> str:
         "deployment_runtime_sha256", "quant_hub_package_root",
         "quant_hub_package_inventory_sha256",
     )
-    rendered_fields = ",".join(_ps_literal(field) for field in expected_fields)
+    v2_only_fields = (
+        "service_python_runtime", "service_python_runtime_sha256",
+        "service_pywin32_runtime", "service_pywin32_runtime_sha256",
+    )
+    rendered_common_fields = ",".join(
+        _ps_literal(field) for field in common_fields
+    )
+    rendered_v2_fields = ",".join(
+        _ps_literal(field) for field in v2_only_fields
+    )
     module_hash_field = f"{module_binding}_sha256"
     package_verification = _powershell_package_inventory_verification_script()
     return (
@@ -652,12 +663,20 @@ def verified_d_tooling_python_script(module_binding: str) -> str:
         f"$candidatePath={_ps_literal(candidate_path)};"
         "$candidateFull=Assert-OperationalFile $candidatePath '';"
         "$candidate=Get-Content -LiteralPath $candidateFull -Raw -Encoding UTF8|ConvertFrom-Json;"
-        f"$expectedFields=@({rendered_fields})|Sort-Object;"
+        f"$allowLegacy=${str(allow_legacy).lower()};"
+        "$legacyCandidate=$candidate.schema_version-eq"
+        "'qrh-windows-service-install-candidate/v1';"
+        "if($legacyCandidate-and-not $allowLegacy){throw 'legacy_operational_binding_forbidden'};"
+        "if(-not $legacyCandidate-and $candidate.schema_version-ne"
+        "'qrh-windows-service-install-candidate/v2')"
+        "{throw 'operational_binding_identity_differs'};"
+        f"$expectedFields=@({rendered_common_fields});"
+        f"if(-not $legacyCandidate){{$expectedFields+=@({rendered_v2_fields})}};"
+        "$expectedFields=$expectedFields|Sort-Object;"
         "$actualFields=@($candidate.PSObject.Properties.Name)|Sort-Object;"
         "if(($expectedFields-join '|')-ne($actualFields-join '|'))"
         "{throw 'operational_binding_schema_differs'};"
-        "if($candidate.schema_version-ne'qrh-windows-service-install-candidate/v1'"
-        "-or $candidate.service_name-ne'QuantResearchHub'"
+        "if($candidate.service_name-ne'QuantResearchHub'"
         "-or $candidate.python_class-ne"
         "'quant_hub.ops.windows_service.QuantResearchHubWindowsService'"
         "-or $candidate.start_type-ne'automatic'){throw 'operational_binding_identity_differs'};"
@@ -675,11 +694,27 @@ def verified_d_tooling_python_script(module_binding: str) -> str:
         +
         f"$pythonExpected={_ps_literal(python_path)};"
         f"$moduleExpected={_ps_literal(module_path)};"
+        "$serviceExpected=if($legacyCandidate){Join-Path $rootFull "
+        "'tooling\\python\\Lib\\site-packages\\win32\\pythonservice.exe'}"
+        "else{Join-Path $rootFull 'tooling\\python\\pythonservice.exe'};"
+        "$pythonRuntimeExpected=Join-Path $rootFull 'tooling\\python\\python313.dll';"
+        "$pywin32RuntimeExpected=Join-Path $rootFull 'tooling\\python\\pywintypes313.dll';"
         "$pythonFull=Assert-OperationalFile $pythonExpected $candidate.service_python_sha256;"
+        "$serviceFull=Assert-OperationalFile $serviceExpected $candidate.service_executable_sha256;"
+        "if(-not $legacyCandidate){"
+        "$pythonRuntimeFull=Assert-OperationalFile $pythonRuntimeExpected "
+        "$candidate.service_python_runtime_sha256;"
+        "$pywin32RuntimeFull=Assert-OperationalFile $pywin32RuntimeExpected "
+        "$candidate.service_pywin32_runtime_sha256};"
         f"$moduleFull=Assert-OperationalFile $moduleExpected $candidate.{module_hash_field};"
         "if(-not $pythonFull.Equals($candidate.service_python,[StringComparison]::OrdinalIgnoreCase)"
+        "-or-not $serviceFull.Equals($candidate.service_executable,[StringComparison]::OrdinalIgnoreCase)"
         f"-or-not $moduleFull.Equals($candidate.{module_binding},[StringComparison]::OrdinalIgnoreCase))"
         "{throw 'operational_binding_path_differs'};"
+        "if(-not $legacyCandidate-and("
+        "-not $pythonRuntimeFull.Equals($candidate.service_python_runtime,[StringComparison]::OrdinalIgnoreCase)"
+        "-or-not $pywin32RuntimeFull.Equals($candidate.service_pywin32_runtime,[StringComparison]::OrdinalIgnoreCase)))"
+        "{throw 'operational_loader_binding_path_differs'};"
         "$python=$pythonFull;"
         "$env:PYTHONPATH=Join-Path $rootFull 'tooling\\python\\Lib\\site-packages';"
     )
@@ -754,7 +789,9 @@ def sealed_candidate_tooling_update_script(
     )
     rendered_arguments = ",".join(_ps_literal(item) for item in arguments)
     return (
-        verified_d_tooling_python_script("deployment_cli_module")
+        verified_d_tooling_python_script(
+            "deployment_cli_module", allow_legacy=True
+        )
         + f"$manifestExpected={_ps_literal(str(manifest))};"
         + f"$manifestFull=Assert-OperationalFile $manifestExpected {_ps_literal(manifest_hash)};"
         + "$releaseManifest=Get-Content -LiteralPath $manifestFull -Raw -Encoding UTF8|ConvertFrom-Json;"
@@ -1058,7 +1095,10 @@ class OpenSSHDeploymentInvoker:
         script = (
             ssh_target_guard_script(self.config.target_address)
             + OpenSSHVMBackend._ensure_directory_script(temporary)
-            + verified_d_tooling_python_script("deployment_cli_module")
+            + verified_d_tooling_python_script(
+                "deployment_cli_module",
+                allow_legacy=deployment_mode == "candidate_only",
+            )
             + f"$tmp={_ps_literal(str(temporary))};"
             "$env:PYTHONDONTWRITEBYTECODE='1';$env:TEMP=$tmp;$env:TMP=$tmp;"
             f"$cli=@({rendered_arguments});$output=& $python @cli;"
@@ -1143,7 +1183,19 @@ class OpenSSHToolingUpdater:
             raise PublishAdapterError("remote tooling updater result is invalid JSON") from None
         if (
             not isinstance(value, dict)
-            or value.get("schema_version") != "qrh-tooling-update-result/v1"
+            or set(value)
+            != {
+                "schema_version",
+                "status",
+                "attempt_id",
+                "release_id",
+                "release_manifest_sha256",
+                "quant_hub_package_inventory_sha256",
+                "exact_runtime_tooling_sha256",
+                "root_bundle_provenance",
+                "restart_recovery",
+            }
+            or value.get("schema_version") != "qrh-tooling-update-result/v2"
             or value.get("status") != "updated"
             or value.get("release_id") != release_id
             or value.get("release_manifest_sha256")
@@ -1159,6 +1211,15 @@ class OpenSSHToolingUpdater:
             value.get("exact_runtime_tooling_sha256"),
             "updated exact runtime tooling",
         )
+        if value.get("root_bundle_provenance") not in {
+            "derived_from_live_v1",
+            "persisted_v2_exact_claim",
+        } or value.get("restart_recovery") not in {
+            "not_required",
+            "rolled_back_exact_old",
+            "completed_exact_new",
+        }:
+            raise PublishAdapterError("remote tooling updater recovery identity differs")
         return value
 
 

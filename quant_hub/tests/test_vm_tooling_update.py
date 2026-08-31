@@ -4,7 +4,7 @@ import ast
 import hashlib
 import importlib.util
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -70,6 +70,14 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.python.write_bytes(b"python")
         self.service_host.parent.mkdir(parents=True)
         self.service_host.write_bytes(b"pythonservice")
+        self.python_runtime = self.root / "tooling" / "python" / "python313.dll"
+        self.python_runtime.write_bytes(b"python313-runtime")
+        self.legacy_pywin32_runtime = (
+            self.root / "tooling" / "python" / "Lib" / "site-packages"
+            / "pywin32_system32" / "pywintypes313.dll"
+        )
+        self.legacy_pywin32_runtime.parent.mkdir(parents=True)
+        self.legacy_pywin32_runtime.write_bytes(b"pywintypes313-runtime")
         package_paths = {
             relative for _logical, relative in module._KEY_FILES
         } | {"ops/service_entry.py", "ops/vm_deploy_cli.py", "web/access_gate.py"}
@@ -142,7 +150,7 @@ class VMToolingUpdateTests(unittest.TestCase):
         old_records = module._regular_files(self.package)
         old_inventory_hash = module._package_inventory_sha256(old_records)
         install = {
-            "schema_version": module.INSTALL_SCHEMA,
+            "schema_version": module.LEGACY_INSTALL_SCHEMA,
             "service_name": module.SERVICE_NAME,
             "python_class": "quant_hub.ops.windows_service.QuantResearchHubWindowsService",
             "service_executable": str(self.service_host),
@@ -168,7 +176,7 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.tooling_path = control / "exact_runtime_tooling.json"
         self.tooling_path.write_bytes(
             module._canonical(
-                module._build_tooling_claim(
+                module._build_legacy_tooling_claim(
                     self.root,
                     old_records,
                     package_inventory_sha256=old_inventory_hash,
@@ -183,6 +191,34 @@ class VMToolingUpdateTests(unittest.TestCase):
                 if item.is_file()
             )
         }
+        self.old_install = self.install_path.read_bytes()
+        self.old_tooling = self.tooling_path.read_bytes()
+        self.service_image_path = str(self.service_host)
+
+    def service_rebind(self, expected: str, replacement: str) -> None:
+        self.assertEqual(PureWindowsPath(expected), PureWindowsPath(self.service_image_path))
+        self.service_image_path = replacement
+
+    def migrate_fixture_to_v2(self) -> None:
+        root_host = self.root / "tooling" / "python" / "pythonservice.exe"
+        root_pywin32 = self.root / "tooling" / "python" / "pywintypes313.dll"
+        root_host.write_bytes(self.service_host.read_bytes())
+        root_pywin32.write_bytes(self.legacy_pywin32_runtime.read_bytes())
+        install = json.loads(self.install_path.read_text(encoding="utf-8"))
+        install["schema_version"] = module.INSTALL_SCHEMA
+        for field, path in (
+            ("service_executable", root_host),
+            ("service_python_runtime", self.python_runtime),
+            ("service_pywin32_runtime", root_pywin32),
+        ):
+            install[field] = str(path)
+            install[f"{field}_sha256"] = _hash(path)
+        self.install_path.write_bytes(module._canonical(install))
+        old_records = module._regular_files(self.package)
+        self.tooling_path.write_bytes(
+            module._canonical(module._build_tooling_claim(self.root, old_records))
+        )
+        self.service_image_path = str(root_host)
         self.old_install = self.install_path.read_bytes()
         self.old_tooling = self.tooling_path.read_bytes()
 
@@ -216,6 +252,8 @@ class VMToolingUpdateTests(unittest.TestCase):
             "attempt_id": "tooling-r1",
             "allow_test_root": True,
             "service_stopped_probe": lambda: True,
+            "service_image_path_probe": lambda: self.service_image_path,
+            "service_binding_updater": self.service_rebind,
         }
         arguments.update(changes)
         return module.update_vm_tooling(**arguments)
@@ -235,9 +273,27 @@ class VMToolingUpdateTests(unittest.TestCase):
         self.assertNotIn("quant_hub", imports)
         before = module._snapshot(self.root)
         result = self.update()
+        self.assertEqual("qrh-tooling-update-result/v2", result["schema_version"])
         expected = self.expected_installed()
         self.assertEqual(expected, module._regular_files(self.package))
         install = json.loads(self.install_path.read_text(encoding="utf-8"))
+        self.assertEqual(module.INSTALL_SCHEMA, install["schema_version"])
+        self.assertEqual(
+            str(self.root / "tooling" / "python" / "pythonservice.exe"),
+            install["service_executable"],
+        )
+        self.assertEqual(
+            str(self.root / "tooling" / "python" / "pythonservice.exe"),
+            self.service_image_path,
+        )
+        self.assertEqual(
+            self.service_host.read_bytes(),
+            (self.root / "tooling" / "python" / "pythonservice.exe").read_bytes(),
+        )
+        self.assertEqual(
+            self.legacy_pywin32_runtime.read_bytes(),
+            (self.root / "tooling" / "python" / "pywintypes313.dll").read_bytes(),
+        )
         self.assertEqual(
             module._package_inventory_sha256(expected),
             install["quant_hub_package_inventory_sha256"],
@@ -259,6 +315,8 @@ class VMToolingUpdateTests(unittest.TestCase):
         ).verify_persisted()
         self.assertEqual(tooling, verified.as_dict())
         self.assertEqual(tooling["tooling_sha256"], result["exact_runtime_tooling_sha256"])
+        self.assertEqual("derived_from_live_v1", result["root_bundle_provenance"])
+        self.assertEqual("not_required", result["restart_recovery"])
         self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
         audit_path = module._finalize_audit(
             self.root, before, outcome="succeeded"
@@ -274,6 +332,57 @@ class VMToolingUpdateTests(unittest.TestCase):
             )
         )
 
+    def test_v2_to_v2_update_preserves_bundle_without_scm_rebind(self) -> None:
+        self.migrate_fixture_to_v2()
+        bundle = {
+            name: (self.root / "tooling" / "python" / name).read_bytes()
+            for name in ("pythonservice.exe", "python313.dll", "pywintypes313.dll")
+        }
+
+        def forbidden_rebind(_expected: str, _replacement: str) -> None:
+            self.fail("v2-to-v2 update must not rebind SCM")
+
+        self.update(service_binding_updater=forbidden_rebind)
+        self.assertEqual(
+            bundle,
+            {
+                name: (self.root / "tooling" / "python" / name).read_bytes()
+                for name in bundle
+            },
+        )
+        self.assertEqual(
+            module.INSTALL_SCHEMA,
+            json.loads(self.install_path.read_text(encoding="utf-8"))["schema_version"],
+        )
+
+    def test_v2_failure_rollback_preserves_existing_bundle_and_binding(self) -> None:
+        self.migrate_fixture_to_v2()
+        bundle = {
+            name: (self.root / "tooling" / "python" / name).read_bytes()
+            for name in ("pythonservice.exe", "python313.dll", "pywintypes313.dll")
+        }
+        def forbidden_rebind(_expected: str, _replacement: str) -> None:
+            self.fail("v2 rollback must not rebind unchanged SCM ImagePath")
+
+        with self.assertRaisesRegex(module.ToolingUpdateError, "claims swap"):
+            self.update(
+                fail_after_claims_swap=True,
+                service_binding_updater=forbidden_rebind,
+            )
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+        self.assertEqual(
+            bundle,
+            {
+                name: (self.root / "tooling" / "python" / name).read_bytes()
+                for name in bundle
+            },
+        )
+        self.assertEqual(
+            str(self.root / "tooling" / "python" / "pythonservice.exe"),
+            self.service_image_path,
+        )
+
     def test_running_service_rejects_before_any_write(self) -> None:
         with self.assertRaisesRegex(module.ToolingUpdateError, "STOPPED"):
             self.update(service_stopped_probe=lambda: False)
@@ -287,6 +396,13 @@ class VMToolingUpdateTests(unittest.TestCase):
                 if item.is_file()
             },
         )
+
+    def test_transaction_lock_is_exclusive_for_full_update_owner(self) -> None:
+        lock_path = self.root / "control" / "tooling_update.lock"
+        with module._ToolingUpdateLock(lock_path):
+            with self.assertRaisesRegex(module.ToolingUpdateError, "exclusive lock"):
+                with module._ToolingUpdateLock(lock_path):
+                    self.fail("contender unexpectedly acquired tooling update lock")
 
     def test_missing_workspace_migration_record_fails_closed(self) -> None:
         manifest = json.loads(self.manifest_raw.decode("utf-8"))
@@ -390,6 +506,224 @@ class VMToolingUpdateTests(unittest.TestCase):
         )
         self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
         self.assertFalse(any(self.package.parent.glob("quant_hub.update-*")))
+        self.assertEqual(str(self.service_host), self.service_image_path)
+        self.assertFalse((self.root / "tooling" / "python" / "pythonservice.exe").exists())
+        self.assertFalse((self.root / "tooling" / "python" / "pywintypes313.dll").exists())
+
+    def test_failure_after_bundle_publish_restores_v1_files_claims_and_scm(self) -> None:
+        with self.assertRaisesRegex(module.ToolingUpdateError, "bundle publish"):
+            self.update(fail_after_host_bundle_publish=True)
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+        self.assertEqual(str(self.service_host), self.service_image_path)
+        self.assertFalse((self.root / "tooling" / "python" / "pythonservice.exe").exists())
+        self.assertFalse((self.root / "tooling" / "python" / "pywintypes313.dll").exists())
+
+    def test_second_root_bundle_publish_failure_rolls_back_exact_v1(self) -> None:
+        with self.assertRaisesRegex(module.ToolingUpdateError, "second root bundle"):
+            self.update(fail_before_second_root_bundle_publish=True)
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+        self.assertEqual(str(self.service_host), self.service_image_path)
+        self.assertFalse((self.root / "tooling" / "python" / "pythonservice.exe").exists())
+        self.assertFalse((self.root / "tooling" / "python" / "pywintypes313.dll").exists())
+        self.assertFalse((self.root / "control" / "tooling_update_pending.json").exists())
+
+    def test_reverse_rebind_failure_preserves_recoverable_journal_and_priors(self) -> None:
+        old_image = str(self.service_host)
+        new_image = str(self.root / "tooling" / "python" / "pythonservice.exe")
+
+        def fail_reverse(expected: str, replacement: str) -> None:
+            if PureWindowsPath(expected) == PureWindowsPath(old_image):
+                self.service_rebind(expected, replacement)
+                return
+            raise module.ToolingUpdateError("injected reverse rebind failure")
+
+        with self.assertRaisesRegex(module.ToolingUpdateError, "journal remains"):
+            self.update(
+                service_binding_updater=fail_reverse,
+                fail_after_service_rebind=True,
+            )
+        journal_path = self.root / "control" / "tooling_update_pending.json"
+        self.assertTrue(journal_path.is_file())
+        self.assertEqual(new_image, self.service_image_path)
+        self.assertTrue(
+            (self.root / "control" / ".service_install_candidate.tooling-r1.prior").is_file()
+        )
+        self.assertTrue(any(self.package.parent.glob("quant_hub.update-*.prior")))
+        recovered = module._recover_pending_transaction(
+            self.root,
+            service_stopped_probe=lambda: True,
+            service_image_path_probe=lambda: self.service_image_path,
+            service_binding_updater=self.service_rebind,
+        )
+        self.assertEqual("rolled_back_exact_old", recovered)
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(old_image, self.service_image_path)
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+
+    def test_recovery_never_rebinds_scm_to_drifted_legacy_source_bundle(self) -> None:
+        old_image = str(self.service_host)
+        new_image = str(self.root / "tooling" / "python" / "pythonservice.exe")
+
+        def fail_reverse(expected: str, replacement: str) -> None:
+            if PureWindowsPath(expected) == PureWindowsPath(old_image):
+                self.service_rebind(expected, replacement)
+                return
+            raise module.ToolingUpdateError("injected reverse rebind failure")
+
+        with self.assertRaisesRegex(module.ToolingUpdateError, "journal remains"):
+            self.update(
+                service_binding_updater=fail_reverse,
+                fail_after_service_rebind=True,
+            )
+        self.legacy_pywin32_runtime.write_bytes(b"drifted-after-journal")
+        with self.assertRaisesRegex(module.ToolingUpdateError, "source bundle differs"):
+            module._recover_pending_transaction(
+                self.root,
+                service_stopped_probe=lambda: True,
+                service_image_path_probe=lambda: self.service_image_path,
+                service_binding_updater=self.service_rebind,
+            )
+        self.assertEqual(new_image, self.service_image_path)
+        self.assertTrue(
+            (self.root / "control" / "tooling_update_pending.json").is_file()
+        )
+
+    def test_process_restart_recovers_closed_journal_then_retries_update(self) -> None:
+        with self.assertRaises(module._SimulatedProcessCrash):
+            self.update(simulate_process_crash_after_claims_swap=True)
+        journal_path = self.root / "control" / "tooling_update_pending.json"
+        journal = module._read_journal(self.root, journal_path)
+        self.assertEqual(module._JOURNAL_FIELDS, set(journal))
+        self.assertEqual("claims_swapped", journal["phase"])
+        self.assertEqual("derived_from_live_v1", journal["root_bundle_provenance"])
+        self.assertEqual(str(self.service_host), journal["old_image_path"])
+        self.assertEqual(
+            str(self.root / "tooling" / "python" / "pythonservice.exe"),
+            journal["new_image_path"],
+        )
+        self.assertEqual(
+            hashlib.sha256(self.old_install).hexdigest(),
+            journal["old_install_sha256"],
+        )
+        self.assertEqual(
+            hashlib.sha256(self.old_tooling).hexdigest(),
+            journal["old_tooling_sha256"],
+        )
+        self.assertEqual(
+            ["pythonservice.exe", "python313.dll", "pywintypes313.dll"],
+            [item["name"] for item in journal["root_bundle_members"]],
+        )
+        result = self.update()
+        self.assertEqual("rolled_back_exact_old", result["restart_recovery"])
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(
+            str(self.root / "tooling" / "python" / "pythonservice.exe"),
+            self.service_image_path,
+        )
+
+    def test_restart_after_verified_phase_completes_exact_new_only(self) -> None:
+        original = module._recover_pending_transaction
+
+        def crash_before_verified_cleanup(root, **arguments):
+            journal_path = root / "control" / "tooling_update_pending.json"
+            if journal_path.exists():
+                journal = module._read_journal(root, journal_path)
+                if journal["phase"] == "verified":
+                    raise module._SimulatedProcessCrash()
+            return original(root, **arguments)
+
+        with (
+            patch.object(
+                module,
+                "_recover_pending_transaction",
+                side_effect=crash_before_verified_cleanup,
+            ),
+            self.assertRaises(module._SimulatedProcessCrash),
+        ):
+            self.update()
+        journal_path = self.root / "control" / "tooling_update_pending.json"
+        self.assertEqual(
+            "verified", module._read_journal(self.root, journal_path)["phase"]
+        )
+        recovered = self.update()
+        self.assertEqual("completed_exact_new", recovered["restart_recovery"])
+        self.assertEqual("derived_from_live_v1", recovered["root_bundle_provenance"])
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(
+            module.INSTALL_SCHEMA,
+            json.loads(self.install_path.read_text(encoding="utf-8"))["schema_version"],
+        )
+
+    def test_restart_rejects_non_closed_or_resigned_pending_journal(self) -> None:
+        with self.assertRaises(module._SimulatedProcessCrash):
+            self.update(simulate_process_crash_after_claims_swap=True)
+        journal_path = self.root / "control" / "tooling_update_pending.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        journal["unreviewed"] = True
+        journal_path.write_bytes(module._canonical(journal))
+        with self.assertRaisesRegex(module.ToolingUpdateError, "schema differs"):
+            module._recover_pending_transaction(
+                self.root,
+                service_stopped_probe=lambda: True,
+                service_image_path_probe=lambda: self.service_image_path,
+                service_binding_updater=self.service_rebind,
+            )
+        self.assertTrue(journal_path.is_file())
+
+    def test_service_becoming_running_preserves_journal_for_stopped_recovery(self) -> None:
+        states = iter((True, False, False))
+
+        def stopped() -> bool:
+            return next(states, False)
+
+        with self.assertRaisesRegex(module.ToolingUpdateError, "journal remains"):
+            self.update(service_stopped_probe=stopped)
+        journal_path = self.root / "control" / "tooling_update_pending.json"
+        self.assertTrue(journal_path.is_file())
+        self.assertEqual(self.old_package, {
+            item.relative_to(self.package).as_posix(): item.read_bytes()
+            for item in self.package.rglob("*") if item.is_file()
+        })
+        recovered = module._recover_pending_transaction(
+            self.root,
+            service_stopped_probe=lambda: True,
+            service_image_path_probe=lambda: self.service_image_path,
+            service_binding_updater=self.service_rebind,
+        )
+        self.assertEqual("rolled_back_exact_old", recovered)
+        self.assertFalse(journal_path.exists())
+
+    def test_service_stopped_is_rechecked_at_every_mutation_boundary(self) -> None:
+        calls = 0
+
+        def stopped() -> bool:
+            nonlocal calls
+            calls += 1
+            return True
+
+        self.update(service_stopped_probe=stopped)
+        self.assertGreaterEqual(calls, 5)
+
+    def test_failure_after_scm_rebind_restores_v1_files_claims_and_binding(self) -> None:
+        calls = 0
+
+        def rebind_then_fail(expected: str, replacement: str) -> None:
+            nonlocal calls
+            self.service_rebind(expected, replacement)
+            calls += 1
+            if calls == 1:
+                raise module.ToolingUpdateError("injected rebind readback failure")
+
+        with self.assertRaisesRegex(module.ToolingUpdateError, "rebind readback"):
+            self.update(service_binding_updater=rebind_then_fail)
+        self.assertEqual(self.old_install, self.install_path.read_bytes())
+        self.assertEqual(self.old_tooling, self.tooling_path.read_bytes())
+        self.assertEqual(str(self.service_host), self.service_image_path)
+        self.assertFalse((self.root / "tooling" / "python" / "pythonservice.exe").exists())
+        self.assertFalse((self.root / "tooling" / "python" / "pywintypes313.dll").exists())
 
     def test_failure_between_package_renames_restores_live_package(self) -> None:
         with self.assertRaisesRegex(module.ToolingUpdateError, "moved to prior"):

@@ -42,7 +42,7 @@ LIVE_STEADY_WINDOWS_WRITER_LEASE_SCOPE = (
 _PRODUCTION_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
 _SERVICE_NAME = "QuantResearchHub"
 _SCM_HOST_EXECUTABLE = (
-    r"D:\quant\quant_platform\tooling\python\Lib\site-packages\win32\pythonservice.exe"
+    r"D:\quant\quant_platform\tooling\python\pythonservice.exe"
 )
 _CHILD_EXECUTABLE = r"D:\quant\quant_platform\tooling\python\python.exe"
 _CHILD_MODULE = "quant_hub.ops.local_exact_runtime_entry"

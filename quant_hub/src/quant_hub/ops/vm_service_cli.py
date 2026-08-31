@@ -128,10 +128,8 @@ def _runner(arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
 def stage_python_service_executable(
     root: Path, *, source: Path | None = None
 ) -> Path:
-    expected = (
-        root / "tooling" / "python" / "Lib" / "site-packages" / "win32"
-        / "pythonservice.exe"
-    )
+    tooling = root / "tooling" / "python"
+    expected = tooling / "pythonservice.exe"
     verify_vm_write_target(expected, allow_root=False, must_exist=True)
     ensure_no_reparse_components(expected)
     resolved = expected.resolve(strict=True)
@@ -139,6 +137,12 @@ def stage_python_service_executable(
         raise VMServiceCLIError("service executable must belong to D-root service Python")
     if not resolved.is_file():
         raise VMServiceCLIError("D-root pythonservice.exe is unavailable")
+    for name in ("python313.dll", "pywintypes313.dll"):
+        runtime = tooling / name
+        verify_vm_write_target(runtime, allow_root=False, must_exist=True)
+        ensure_no_reparse_components(runtime)
+        if not runtime.resolve(strict=True).is_file():
+            raise VMServiceCLIError(f"D-root service runtime {name} is unavailable")
     return resolved
 
 

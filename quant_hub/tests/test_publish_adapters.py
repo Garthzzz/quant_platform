@@ -28,6 +28,7 @@ from quant_hub.ops.publish_adapters import (
     _powershell_package_inventory_verification_script,
     _powershell_utf8_output_script,
     sealed_candidate_tooling_update_script,
+    verified_d_tooling_python_script,
 )
 from quant_hub.ops.vm_boundary import validate_production_vm_write_path
 from quant_hub.ops.release_identity import manifest_sha256
@@ -92,6 +93,7 @@ class ProductionConfigTests(unittest.TestCase):
         self.assertIn("Assert-OperationalFile $updaterExpected", script)
         self.assertIn("-I", script)
         self.assertIn("--release-manifest-sha256", script)
+        self.assertIn("$allowLegacy=$true", script)
         self.assertLess(
             script.index("Assert-OperationalFile $updaterExpected"),
             script.index("& $python @toolingArgs"),
@@ -111,6 +113,20 @@ class ProductionConfigTests(unittest.TestCase):
         )
         self.assertEqual(0, parsed.returncode, parsed.stderr)
 
+    def test_operational_prelude_allows_v1_only_at_migration_boundaries(self) -> None:
+        legacy = verified_d_tooling_python_script(
+            "deployment_cli_module", allow_legacy=True
+        )
+        steady = verified_d_tooling_python_script("deployment_cli_module")
+        self.assertIn("$allowLegacy=$true", legacy)
+        self.assertIn("$allowLegacy=$false", steady)
+        self.assertIn("legacy_operational_binding_forbidden", steady)
+        self.assertIn(
+            "tooling\\python\\Lib\\site-packages\\win32\\pythonservice.exe",
+            legacy,
+        )
+        self.assertIn("tooling\\python\\pythonservice.exe", steady)
+
     def test_host_tooling_invoker_uses_only_fixed_manifest_bound_script(self) -> None:
         config = ProductionPublishConfig.parse(config_value()).vm
         calls = []
@@ -121,13 +137,15 @@ class ProductionConfigTests(unittest.TestCase):
                 0,
                 json.dumps(
                     {
-                        "schema_version": "qrh-tooling-update-result/v1",
+                        "schema_version": "qrh-tooling-update-result/v2",
                         "status": "updated",
                         "attempt_id": "tooling-r1",
                         "release_id": "release-r1",
                         "release_manifest_sha256": "a" * 64,
                         "quant_hub_package_inventory_sha256": "b" * 64,
                         "exact_runtime_tooling_sha256": "c" * 64,
+                        "root_bundle_provenance": "derived_from_live_v1",
+                        "restart_recovery": "not_required",
                     }
                 ),
             )
@@ -567,6 +585,7 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
         self.assertIn(r"D:\quant\quant_platform\tooling\python\python.exe", script)
         self.assertIn("deployment_cli_module_sha256", script)
         self.assertIn("package_inventory_hash_mismatch", script)
+        self.assertIn("$allowLegacy=$false", script)
         self.assertIn("& $python @cli", script)
         self.assertNotIn("& python", script)
         self.assertIn("SSH_CONNECTION", script)
@@ -579,6 +598,38 @@ class VMDeploymentAdapterTests(AuthorityPatchedTestCase):
             input=script, text=True, capture_output=True, check=False,
         )
         self.assertEqual(0, parsed.returncode, parsed.stderr)
+
+    def test_ssh_candidate_only_allows_exact_v1_migration_prelude(self) -> None:
+        config = ProductionPublishConfig.parse(config_value()).vm
+        calls = []
+
+        def runner(arguments):
+            calls.append(list(arguments))
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "schema_version": "qrh-vm-deploy-result/v1",
+                        "release_id": "release-1",
+                        "release_manifest_sha256": "a" * 64,
+                        "publish_candidate_sha256": CANDIDATE_HASH,
+                        "status": "candidate_validated",
+                        "evidence_id": "candidate-1",
+                        "evidence_type": "candidate_validation_receipt",
+                    }
+                ),
+            )
+
+        OpenSSHDeploymentInvoker(config, command_runner=runner).invoke(
+            vm_root=config.root,
+            release_id="release-1",
+            release_manifest_sha256="a" * 64,
+            publish_candidate_sha256=CANDIDATE_HASH,
+            deployment_mode="candidate_only",
+            deployment_attempt_id=None,
+        )
+        script = base64.b64decode(calls[0][-1]).decode("utf-16le")
+        self.assertIn("$allowLegacy=$true", script)
 
 
 class OpenSSHVMBackendTests(AuthorityPatchedTestCase):

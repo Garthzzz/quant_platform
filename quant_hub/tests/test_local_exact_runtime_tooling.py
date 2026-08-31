@@ -42,8 +42,14 @@ def _payload() -> dict[str, object]:
         "python": _file("python", "tooling/python/python.exe", 1),
         "service_host": _file(
             "pythonservice",
-            "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+            "tooling/python/pythonservice.exe",
             2,
+        ),
+        "service_python_runtime": _file(
+            "python313", "tooling/python/python313.dll", 3
+        ),
+        "service_pywin32_runtime": _file(
+            "pywintypes313", "tooling/python/pywintypes313.dll", 4
         ),
         "package": {
             "relative_path": EXACT_RUNTIME_PACKAGE_RELATIVE_PATH,
@@ -64,7 +70,12 @@ def _resign(document: dict[str, object]) -> dict[str, object]:
     payload = copy.deepcopy(document)
     payload.pop("file_order_sha256", None)
     payload.pop("tooling_sha256", None)
-    for field in ("python", "service_host"):
+    for field in (
+        "python",
+        "service_host",
+        "service_python_runtime",
+        "service_pywin32_runtime",
+    ):
         payload[field].pop("file_sha256", None)
     payload["package"].pop("package_sha256", None)
     for value in payload["files"]:
@@ -91,7 +102,7 @@ class ExactRuntimeToolingManifestTests(unittest.TestCase):
 
     def test_top_level_schema_scope_root_and_extra_fields_are_closed(self) -> None:
         for field, value in (
-            ("schema_version", "qrh-exact-runtime-tooling/v2"),
+            ("schema_version", "qrh-exact-runtime-tooling/v1"),
             ("scope", "live_tooling_closure"),
             ("root", r"D:\quant\other"),
         ):
@@ -152,6 +163,8 @@ class ExactRuntimeToolingManifestTests(unittest.TestCase):
         for path in (
             ("python", "file_sha256"),
             ("service_host", "file_sha256"),
+            ("service_python_runtime", "file_sha256"),
+            ("service_pywin32_runtime", "file_sha256"),
             ("package", "package_sha256"),
             ("files", 0, "file_sha256"),
             ("file_order_sha256",),

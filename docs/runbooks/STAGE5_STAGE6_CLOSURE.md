@@ -74,6 +74,24 @@
 重读 canonical bytes、复算 hash、核对真实对象和现场身份。任一必需 producer 尚未实现或现场
 证据尚未取得时，certificate 必须 fail closed。
 
+### Fixed tooling 与三文件 loader 前置闭包
+
+Stage 5 现场证据必须包含 fixed-tooling 的 v2 合同，但这只是前置条件，不等于 Stage 5 或 writer
+handoff 已完成。SCM `ImagePath` 必须精确指向
+`D:\quant\quant_platform\tooling\python\pythonservice.exe`，并与同目录
+`python313.dll`、`pywintypes313.dll` 一起由 `service_install_candidate.json` 和
+`exact_runtime_tooling.json` 逐文件绑定路径、大小与 SHA-256；激活、handoff、稳态 identity 和
+writer lease 均只接受 v2。该闭包证明声明文件与现场三件套 bytes 一致，不扩张为外部来源签名，
+也不单独证明 Windows loader 实际加载过哪个模块。
+
+tooling 更新使用 `qrh-tooling-update-pending/v2` durable journal 和进程间锁。journal 在副作用前
+绑定旧新 package/claim/SCM/三件套身份，以 `authority=coordination_only` 标明它不是发布权威；
+每次调用先恢复 pending transaction。只有 `verified` 且现场 exact new 才向前收尾，其他可判定
+中断状态回退 exact old；现场既不等于 old 也不等于 new 时保留 journal 并 fail closed。成功结果
+必须是 `qrh-tooling-update-result/v2`，`restart_recovery` 只能为 `not_required`、
+`rolled_back_exact_old` 或 `completed_exact_new`。该 result 与 journal 都不能替代 SCM 启动、
+endpoint、唯一 writer、active/prior、ingress 或 handoff receipt。
+
 ## Typed observation 与实际 CLI
 
 `qrh-release-closure` 是唯一证书闭合入口。每个分类 gate 先由对应现场 observer 写入
@@ -86,12 +104,17 @@ binding、active/prior manifest）和底层 support artifact。closure 使用
 “这个 wrapper 自洽”，不能赋予 PASS authority。
 
 每个角色只有在下表所列真实 producer schema 和 replay adapter 已实现且重读底层 receipt/API
-response/指针/manifest/SQLite bundle/测试报告后才可 qualify。当前这些分类 adapter 尚未注册，
-因此 `derive-gate` 明确返回 `non-qualifying`，不会写 gate；`certify-stage5`、`close-visibility` 也不能
-签发。这是有意的 fail-closed 状态，不得用 dummy artifact、旧 observation 或 managed wrapper
-补齐正向测试。
+response/指针/manifest/SQLite bundle/测试报告后才可 qualify；adapter availability 必须由 runtime
+allow-list 逐角色判断，不能整体假定存在。当前 `revocation_surface` 已有真实本地 producer 与
+replay adapter，会重扫 source、fresh wheel、CLI、config、schema、Windows tasks、runbook 和 VM
+write-set；其报告固定声明
+`authority_scope=LOCAL_FUNCTIONAL_CLOSURE_NOT_EXTERNAL_TRUST_ROOT`，producer 也明确是
+`independent=false`。因此它只能闭合本地产品撤销面，不能作为外部信任根、MCP attestation、
+独立审核或整个 Stage 5 的 PASS authority。依赖外部系统或可信 MCP 签发的其余角色仍按各自
+未满足条件返回 `non-qualifying`；`certify-stage5`、`close-visibility` 仍不能因这一个本地角色
+通过而签发。不得用 dummy artifact、旧 observation 或 managed wrapper 补齐正向测试。
 
-| gate role | 唯一待实现的真实 producer schema | 必须重放的 verifier |
+| gate role | producer schema | 必须重放的 verifier |
 |---|---|---|
 | `full_replay_and_comment_lifecycle` | `qrh-stage5-browser-sqlite-comment-replay-receipt/v1` | 浏览器、SQLite、source inventory 与 comment relocation |
 | `failure_and_incremental_matrix` | `qrh-stage5-failure-incremental-machine-report/v1` | failure/incremental matrix machine report |
@@ -101,7 +124,7 @@ response/指针/manifest/SQLite bundle/测试报告后才可 qualify。当前这
 | `active_prior_active_drill` | `qrh-stage5-active-prior-active-vm-drill-receipt/v1` | activation/rollback receipts 与 VM read/write-set |
 | `retention_closure` | `qrh-stage5-retention-filesystem-audit-receipt/v1` | active/prior/incoming/object filesystem audit |
 | `runbook_drills_and_quality_report` | `qrh-stage5-runbook-drill-quality-receipt/v1` | runbook bytes、drill receipts 与 quality report |
-| `revocation_surface` | `qrh-stage5-revocation-machine-audit-receipt/v1` | source/wheel/config/schema/task/write-set audit |
+| `revocation_surface` | `qrh-stage5-revocation-machine-audit-receipt/v1`（真实本地 adapter；`LOCAL_FUNCTIONAL_CLOSURE_NOT_EXTERNAL_TRUST_ROOT`） | source/wheel/config/schema/task/write-set 现场重扫；非独立、非外部/MCP 权威 |
 | `identity_graph_negative_fixtures` | `qrh-stage5-identity-graph-fixture-report/v1` | identity graph positive/negative fixture replay |
 | `repository_private_observation` | `qrh-stage6-github-repository-api-capture/v1` | authenticated GitHub repository response |
 | `private_controls_revalidation` | `qrh-stage6-github-controls-api-capture/v1` | authenticated plan/Actions/protection/permission responses |
@@ -214,10 +237,12 @@ tracked JSON Schema 已约束 observation 的 role→result schema、gate 的 ro
   persistence、Windows runtime 均为 live provenance + slots 对象，不能通过实例 method shadow、
   test hook、环境或 alias 注入绕过固定生产调用图。
 - 新 `quant_hub.ops.release_closure` 已实现 CLI、create-only/canonical/path/hash/time/subject 闭包、
-  real MCP campaign replay 和明确的分类 adapter allow-list；真实分类 adapter 当前仍缺失，所以
-  Stage 5/6 生产签发被机械阻断。补齐 adapter 时必须从底层真实 artifact 重算事实，不能把现有
-  managed result parser 或测试 fixture 改成 PASS authority。当前不得预造 PASS，也不得勾选
-  OpenSpec 6.8 或 7.4。
+  real MCP campaign replay 和明确的分类 adapter allow-list。`revocation_surface` 的真实本地 producer/
+  replay adapter 已实现，但其 authority scope 固定为
+  `LOCAL_FUNCTIONAL_CLOSURE_NOT_EXTERNAL_TRUST_ROOT`；依赖外部系统或可信 MCP 签发的必需角色仍未
+  取得权威证据，所以 Stage 5/6 生产签发继续被机械阻断。补齐其余 adapter 时必须从底层真实
+  artifact 重算事实，不能把现有 managed result parser、本地 revocation PASS 或测试 fixture
+  改成外部/MCP PASS authority。当前不得预造 PASS，也不得勾选 OpenSpec 6.8 或 7.4。
 - 2026-08-31 的已授权 writer handoff 已真实执行：流程在 D service start/bootstrap comments
   schema pre-expand 处失败，D ingress 未开放；official rollback 随后成功恢复 exact C listener，
   并已完成该失败 attempt 的收尾。该事实不等于 Stage 5 放行，也不产生 D active/prior certificate；

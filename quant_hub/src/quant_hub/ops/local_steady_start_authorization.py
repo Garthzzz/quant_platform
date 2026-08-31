@@ -32,7 +32,7 @@ _PLAN_SCOPE = "exact_steady_scm_start_plan_input_only"
 _SCM_INPUT_SCOPE = "exact_steady_scm_process_observation_input_only"
 _SERVICE_NAME = "QuantResearchHub"
 _SCM_HOST_EXECUTABLE = (
-    r"D:\quant\quant_platform\tooling\python\Lib\site-packages\win32\pythonservice.exe"
+    r"D:\quant\quant_platform\tooling\python\pythonservice.exe"
 )
 _SCM_PYTHON_CLASS = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 _CHILD_EXECUTABLE = r"D:\quant\quant_platform\tooling\python\python.exe"

@@ -16,7 +16,7 @@ from typing import Mapping
 from .local_release_identity import canonical_bytes, identity_sha256
 
 
-EXACT_RUNTIME_TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v1"
+EXACT_RUNTIME_TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v2"
 EXACT_RUNTIME_TOOLING_SCOPE = (
     "exact_runtime_tooling_claim_not_independently_observed"
 )
@@ -33,7 +33,17 @@ _BINARY_PATHS = (
     (
         "service_host",
         "pythonservice",
-        "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+        "tooling/python/pythonservice.exe",
+    ),
+    (
+        "service_python_runtime",
+        "python313",
+        "tooling/python/python313.dll",
+    ),
+    (
+        "service_pywin32_runtime",
+        "pywintypes313",
+        "tooling/python/pywintypes313.dll",
     ),
 )
 _KEY_FILES = (
@@ -206,6 +216,8 @@ def validate_exact_runtime_tooling(value: object) -> dict[str, object]:
             "root",
             "python",
             "service_host",
+            "service_python_runtime",
+            "service_pywin32_runtime",
             "package",
             "files",
             "file_order_sha256",
@@ -270,7 +282,17 @@ def _seal_file(value: object, *, logical_name: str, path: str) -> dict[str, obje
 def build_exact_runtime_tooling(payload: Mapping[str, object]) -> dict[str, object]:
     document = _mapping(
         payload,
-        {"schema_version", "scope", "root", "python", "service_host", "package", "files"},
+        {
+            "schema_version",
+            "scope",
+            "root",
+            "python",
+            "service_host",
+            "service_python_runtime",
+            "service_pywin32_runtime",
+            "package",
+            "files",
+        },
         label="exact runtime tooling payload",
     )
     for field, logical_name, path in _BINARY_PATHS:

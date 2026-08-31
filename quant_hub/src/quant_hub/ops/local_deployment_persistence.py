@@ -160,7 +160,7 @@ _EXACT_SCM_PYTHON_CLASS = (
     "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 )
 _EXACT_SCM_HOST_EXECUTABLE = (
-    r"D:\quant\quant_platform\tooling\python\Lib\site-packages\win32\pythonservice.exe"
+    r"D:\quant\quant_platform\tooling\python\pythonservice.exe"
 )
 _EXACT_SCM_CHILD_EXECUTABLE = r"D:\quant\quant_platform\tooling\python\python.exe"
 _EXACT_SCM_CHILD_MODULE = "quant_hub.ops.local_exact_runtime_entry"

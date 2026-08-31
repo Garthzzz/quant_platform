@@ -324,6 +324,73 @@ class ReleaseClosureTests(unittest.TestCase):
                 ):
                     closure.produce_gate_evidence_from_observation(self.root, relative)
 
+    def test_revocation_machine_report_uses_live_replay_adapter(self) -> None:
+        role = closure.REVOCATION_GATE_ROLE
+        relative, observation = self._managed_observation(role)
+        scans = [
+            {"id": surface, "outcome": "pass", "findings": []}
+            for surface in (
+                "source",
+                "fresh-wheel",
+                "cli",
+                "config",
+                "schema",
+                "windows-tasks",
+                "runbook",
+                "vm-write-set",
+            )
+        ]
+        report = {
+            "schema_version": closure.REVOCATION_REPORT_SCHEMA,
+            "report_id": "revocation-surface-20260831000200000000",
+            "gate_role": role,
+            "authority_scope": closure.REVOCATION_AUTHORITY_SCOPE,
+            "producer": {
+                "name": closure.REVOCATION_PRODUCER_NAME,
+                "version": closure.REVOCATION_PRODUCER_VERSION,
+            },
+            "produced_at": _utc(2),
+            "exact_project_root": closure.EXACT_VM_PROJECT_ROOT,
+            "scans": scans,
+            "result": {
+                "surface_checks_total": 8,
+                "surface_checks_passed": 8,
+                "periodic_state_copy_tasks": 0,
+                "outside_d_project_storage": 0,
+                "legacy_protection_exports": 0,
+            },
+            "report_sha256": "f" * 64,
+        }
+        result_ref = self._ref(
+            "results/revocation-machine.json",
+            "result-revocation-machine",
+            report,
+            closure.REVOCATION_REPORT_SCHEMA,
+            observed_at=_utc(2),
+        )
+        observation["result_artifact"] = result_ref
+        observation.pop("observation_sha256")
+        observation["observation_sha256"] = hashlib.sha256(
+            canonical_bytes(observation)
+        ).hexdigest()
+        _write_canonical(self.root / relative, observation)
+
+        with (
+            patch.object(closure, "validate_revocation_report", return_value=report),
+            patch.object(
+                closure,
+                "replay_revocation_production_report",
+                return_value=report,
+            ) as replay,
+        ):
+            evidence = closure.produce_gate_evidence_from_observation(
+                self.root, relative
+            )
+
+        replay.assert_called_once_with(report)
+        self.assertEqual(role, evidence["gate_role"])
+        self.assertEqual("pass", evidence["assertions"]["revocation_surface_result"])
+
     def test_cli_fails_closed_without_writing_gate_or_certificate(self) -> None:
         (self.root / "gates").mkdir()
         for index, role in enumerate(

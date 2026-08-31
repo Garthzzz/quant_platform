@@ -1242,7 +1242,8 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\control\deployment_runtime.json` | 服务监听、release 相对路径、外置 state 和 writer authority 的封闭启动契约 |
 | `<VM_ROOT>\control\service_install_candidate.json` | 服务安装候选证据 |
 | `<VM_ROOT>\control\exact_runtime_tooling.json` | 固定工具链身份 |
-| `<VM_ROOT>\control\tooling_update_pending.json` | 工具链更新的短生命周期 journal；仅由 tooling updater 创建和维护，成功收尾后清理，禁止手工编辑或删除 |
+| `<VM_ROOT>\control\tooling_update_pending.json` | `qrh-tooling-update-pending/v2` 崩溃恢复 journal；绑定旧新 package/claim/SCM/三件套身份，仅由 updater 创建、重放和清理，禁止手工编辑或删除 |
+| `<VM_ROOT>\control\tooling_update.lock` | 固定工具链更新的进程间互斥文件；只用于串行化更新，不是 writer lock 或放行凭据 |
 | exact-D workspace 迁移（完整路径见下） | controller 的 6 个迁移；密封安装并纳入 inventory；禁止手改 |
 | `<VM_ROOT>\control\writer_handoff_pending.json` | handoff 进行中的受控 journal；只由 handoff 工具维护 |
 | `<VM_ROOT>\control\writer-handoff-intents\*.json` | writer handoff 意图 |
@@ -1409,6 +1410,64 @@ site-packages 路径，并把它们计入 `quant_hub` 整包 inventory。生产 
 若 release 同时包含 `runtime_contract\code\migrations\research_workspace\`，它只是
 密封源码树随附的镜像；更新器会要求它与上述正式来源逐文件一致，但不会把镜像
 当成第二套生产 authority。部分合法 assembler 输出不带该镜像，正式来源仍必须完整。
+
+### 6.8 Windows 服务宿主、原生依赖和固定工具链位置
+
+生产 Windows 服务不是从任意 Python 环境或系统 `PATH` 启动。当前 v2 合同把服务宿主及其
+两个直接原生依赖固定在同一目录，并逐文件记录 SHA-256：
+
+| 对象 | VM 固定位置 | 合同字段 |
+|---|---|---|
+| SCM 服务宿主 | `<VM_ROOT>\tooling\python\pythonservice.exe` | `service_executable` |
+| CPython 运行库 | `<VM_ROOT>\tooling\python\python313.dll` | `service_python_runtime` |
+| pywin32 运行库 | `<VM_ROOT>\tooling\python\pywintypes313.dll` | `service_pywin32_runtime` |
+| 业务 Python | `<VM_ROOT>\tooling\python\python.exe` | `service_python` |
+| 已安装业务包 | `<VM_ROOT>\tooling\python\Lib\site-packages\quant_hub\` | `quant_hub_package_root` |
+| 服务安装合同 | `<VM_ROOT>\control\service_install_candidate.json` | `qrh-windows-service-install-candidate/v2` |
+| 完整工具链合同 | `<VM_ROOT>\control\exact_runtime_tooling.json` | `qrh-exact-runtime-tooling/v2` |
+
+把三个原生文件放在一起是 Windows 加载器合同的一部分，不是可选的目录整理。SCM 以
+`LocalSystem` 启动时不能依赖交互用户的 `PATH`、`PYTHONHOME` 或 `PYTHONPATH`；缺少相邻 DLL
+会在 Python 服务代码、项目日志和 canary 启动之前直接以原生加载错误退出。因此核验服务时，
+不能只检查 `pythonservice.exe` 文件存在，还必须同时检查三件套路径、普通文件/无 reparse、
+字节大小、SHA-256，以及 SCM 实际 `ImagePath` 是否精确指向上述宿主。
+
+第一次从 v1 迁移时，旧宿主
+`<VM_ROOT>\tooling\python\Lib\site-packages\win32\pythonservice.exe` 作为旧 v1 live 来源读取；
+更新器把宿主和 `pywintypes313.dll` 发布到固定同级目录，复用并核验根目录已有的
+`python313.dll`，再同步更新 package、两份 JSON claim 和 SCM `ImagePath`。迁移前的
+candidate-only 与密封 updater 可以严格读取 v1/v2 两代合同，以避免升级入口自锁；激活、
+writer handoff、稳态身份和 writer lease 始终只接受 v2。v1→v2 的三件套 provenance 明确记录为
+`derived_from_live_v1`：它表示迁移时读取 live bytes、计算散列并把目标闭合进 v2 claim，不表示
+外部信任根、代码签名或独立方为这些 bytes 背书；v2→v2 则要求现有三件套与持久化 v2 claim
+精确一致，记录为 `persisted_v2_exact_claim`。
+
+该过程由 `quant_hub/tools/update_vm_tooling.py` 负责事务化执行：服务必须已停止；新包与宿主
+先暂存并核验；claim 写入和 SCM 改绑均需读回；发生异常时恢复原 package、原 claim、原
+SCM `ImagePath`，并移除仅由本次 v1→v2 迁移创建的宿主文件。项目文件仍只写入 exact D 根；
+SCM 配置是 Windows 服务控制器状态，不会在 VM 的 C 盘创建项目副本。普通版本更新在 v2→v2
+路径上复用已经哈希绑定的三件套，不复制状态库，也不新增恢复根。
+
+更新开始时，`tooling_update.lock` 保证同一时刻只有一个 updater；
+`tooling_update_pending.json` 使用 `qrh-tooling-update-pending/v2`，在副作用前绑定旧新 package
+inventory、两份 claim 散列、旧新 SCM `ImagePath`、三件套来源/目标/大小/SHA-256 和 phase。
+进程内异常会立即尝试精确回退；若发生进程崩溃或断电，下次执行同一授权命令会先重放 journal：
+
+- `verified` 且现场仍是 exact new：完成清理，`restart_recovery=completed_exact_new`；
+- 可判定的未完成状态：恢复 exact old，再执行请求，最终
+  `restart_recovery=rolled_back_exact_old`；
+- 没有 pending journal：正常更新，`restart_recovery=not_required`；
+- 任一 live 对象既不等于 journal 的 old 也不等于 new，或服务不是 `STOPPED`：保留 journal、
+  返回错误并阻止继续，不得手工删除文件“解锁”。
+
+成功 JSON 的 schema 是 `qrh-tooling-update-result/v2`，还必须返回相同的 attempt/release/manifest、
+package inventory SHA-256、`exact_runtime_tooling` identity、`root_bundle_provenance` 和上述
+`restart_recovery`。该结果只是 fixed-tooling 事务结果；没有 active/prior、writer lease、endpoint
+和 ingress 证据，因此不能证明 VM handoff 已完成。
+
+运维放行前还应在无 D 路径环境变量、工作目录为 `C:\Windows\System32` 的进程环境中直接
+探测固定 `pythonservice.exe`。预期结果可以是“未由 SCM 调用”的正常非零退出，但不能再是
+`0xC0000135`（`DLL_NOT_FOUND`）；随后才允许进入真实 SCM 启动与 writer handoff。
 
 ## 7. 仅限授权运维：发布、激活和回退
 

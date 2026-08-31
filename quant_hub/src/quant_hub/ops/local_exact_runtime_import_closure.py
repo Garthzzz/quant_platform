@@ -321,7 +321,12 @@ def _tooling_live_guards(
         _path(tooling_package, str(record["relative_path"]))
         for record in inventory
     ]
-    for field in ("python", "service_host"):
+    for field in (
+        "python",
+        "service_host",
+        "service_python_runtime",
+        "service_pywin32_runtime",
+    ):
         binary = document.get(field)
         if type(binary) is not dict or type(binary.get("relative_path")) is not str:
             raise ExactRuntimeImportClosureError(

@@ -37,7 +37,7 @@ from .release_identity import (
 from .vm_boundary import PRODUCTION_VM_ROOT, validate_production_vm_write_path
 
 
-INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v1"
+INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v2"
 SERVICE_CLASS = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 SERVICE_NAME = "QuantResearchHub"
 WRITER_HANDOFF_JOURNAL_SCHEMA = "qrh-writer-handoff-pending/v4"
@@ -103,7 +103,9 @@ def _expected_candidate_paths(root: Path) -> dict[str, Path]:
     package = tooling / "Lib" / "site-packages"
     service_host = package / "quant_hub" / "ops" / "windows_service.py"
     return {
-        "service_executable": package / "win32" / "pythonservice.exe",
+        "service_executable": tooling / "pythonservice.exe",
+        "service_python_runtime": tooling / "python313.dll",
+        "service_pywin32_runtime": tooling / "pywintypes313.dll",
         "service_python": tooling / "python.exe",
         "service_host_module": service_host,
         "service_entry_module": service_host.with_name("service_entry.py"),
@@ -1193,6 +1195,10 @@ class ServiceInstallCandidate:
     python_class: str
     service_executable: Path
     service_executable_sha256: str
+    service_python_runtime: Path
+    service_python_runtime_sha256: str
+    service_pywin32_runtime: Path
+    service_pywin32_runtime_sha256: str
     service_python: Path
     service_python_sha256: str
     service_host_module: Path
@@ -1215,6 +1221,10 @@ class ServiceInstallCandidate:
             "python_class": self.python_class,
             "service_executable": str(self.service_executable),
             "service_executable_sha256": self.service_executable_sha256,
+            "service_python_runtime": str(self.service_python_runtime),
+            "service_python_runtime_sha256": self.service_python_runtime_sha256,
+            "service_pywin32_runtime": str(self.service_pywin32_runtime),
+            "service_pywin32_runtime_sha256": self.service_pywin32_runtime_sha256,
             "service_python": str(self.service_python),
             "service_python_sha256": self.service_python_sha256,
             "service_host_module": str(self.service_host_module),
@@ -1239,6 +1249,8 @@ def build_install_candidate(root: Path, service_name: str) -> ServiceInstallCand
         for name, path in _expected_candidate_paths(root.resolve(strict=True)).items()
     }
     executable = expected["service_executable"]
+    service_python_runtime = expected["service_python_runtime"]
+    service_pywin32_runtime = expected["service_pywin32_runtime"]
     service_python = expected["service_python"]
     service_host_module = expected["service_host_module"]
     service_entry_module = expected["service_entry_module"]
@@ -1247,6 +1259,8 @@ def build_install_candidate(root: Path, service_name: str) -> ServiceInstallCand
     runtime = expected["deployment_runtime"]
     package_root = service_host_module.parents[1]
     ensure_no_reparse_components(executable)
+    ensure_no_reparse_components(service_python_runtime)
+    ensure_no_reparse_components(service_pywin32_runtime)
     ensure_no_reparse_components(service_python)
     ensure_no_reparse_components(service_host_module)
     ensure_no_reparse_components(service_entry_module)
@@ -1255,6 +1269,8 @@ def build_install_candidate(root: Path, service_name: str) -> ServiceInstallCand
     ensure_no_reparse_components(runtime)
     if (
         not executable.is_file()
+        or not service_python_runtime.is_file()
+        or not service_pywin32_runtime.is_file()
         or not service_python.is_file()
         or not service_host_module.is_file()
         or not service_entry_module.is_file()
@@ -1266,6 +1282,8 @@ def build_install_candidate(root: Path, service_name: str) -> ServiceInstallCand
     # Logical production paths are checked separately so local fixtures remain testable.
     if PureWindowsPath(str(root.resolve())) == PRODUCTION_VM_ROOT:
         validate_production_vm_write_path(str(executable), allow_root=False)
+        validate_production_vm_write_path(str(service_python_runtime), allow_root=False)
+        validate_production_vm_write_path(str(service_pywin32_runtime), allow_root=False)
         validate_production_vm_write_path(str(service_python), allow_root=False)
         validate_production_vm_write_path(str(service_host_module), allow_root=False)
         validate_production_vm_write_path(str(service_entry_module), allow_root=False)
@@ -1277,6 +1295,10 @@ def build_install_candidate(root: Path, service_name: str) -> ServiceInstallCand
         python_class=SERVICE_CLASS,
         service_executable=executable,
         service_executable_sha256=_hash_file(executable),
+        service_python_runtime=service_python_runtime,
+        service_python_runtime_sha256=_hash_file(service_python_runtime),
+        service_pywin32_runtime=service_pywin32_runtime,
+        service_pywin32_runtime_sha256=_hash_file(service_pywin32_runtime),
         service_python=service_python,
         service_python_sha256=_hash_file(service_python),
         service_host_module=service_host_module,
@@ -1396,6 +1418,10 @@ def apply_install_candidate(
     _validate_install_candidate_paths(root, candidate)
     if (
         _hash_file(candidate.service_executable) != candidate.service_executable_sha256
+        or _hash_file(candidate.service_python_runtime)
+        != candidate.service_python_runtime_sha256
+        or _hash_file(candidate.service_pywin32_runtime)
+        != candidate.service_pywin32_runtime_sha256
         or _hash_file(candidate.service_python) != candidate.service_python_sha256
         or _hash_file(candidate.service_host_module)
         != candidate.service_host_module_sha256

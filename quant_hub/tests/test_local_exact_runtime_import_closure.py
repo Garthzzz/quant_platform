@@ -181,13 +181,10 @@ class ExactRuntimeImportClosureTests(unittest.TestCase):
         python = tooling_root / "tooling" / "python" / "python.exe"
         python.parent.mkdir(parents=True, exist_ok=True)
         python.write_bytes(b"test-python")
-        host = (
-            tooling_root
-            / "tooling" / "python" / "Lib" / "site-packages"
-            / "win32" / "pythonservice.exe"
-        )
-        host.parent.mkdir(parents=True, exist_ok=True)
+        host = tooling_root / "tooling" / "python" / "pythonservice.exe"
         host.write_bytes(b"test-pythonservice")
+        (host.parent / "python313.dll").write_bytes(b"test-python-runtime")
+        (host.parent / "pywintypes313.dll").write_bytes(b"test-pywin32-runtime")
         manifest = TestOnlyExactRuntimeToolingAdapter.for_test_only(
             tooling_root
         ).build_claim()

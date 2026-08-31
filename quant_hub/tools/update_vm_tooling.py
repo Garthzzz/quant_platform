@@ -23,7 +23,8 @@ PRODUCTION_ROOT = PureWindowsPath(r"D:\quant\quant_platform")
 SERVICE_NAME = "QuantResearchHub"
 SERVICE_CLASS = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 MANIFEST_SCHEMA = "qrh-release-manifest/v2"
-INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v1"
+LEGACY_INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v1"
+INSTALL_SCHEMA = "qrh-windows-service-install-candidate/v2"
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,179}$")
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _INSTALL_FIELDS = {
@@ -32,6 +33,10 @@ _INSTALL_FIELDS = {
     "python_class",
     "service_executable",
     "service_executable_sha256",
+    "service_python_runtime",
+    "service_python_runtime_sha256",
+    "service_pywin32_runtime",
+    "service_pywin32_runtime_sha256",
     "service_python",
     "service_python_sha256",
     "service_host_module",
@@ -48,6 +53,12 @@ _INSTALL_FIELDS = {
     "quant_hub_package_inventory_sha256",
     "start_type",
 }
+_LEGACY_INSTALL_FIELDS = _INSTALL_FIELDS - {
+    "service_python_runtime",
+    "service_python_runtime_sha256",
+    "service_pywin32_runtime",
+    "service_pywin32_runtime_sha256",
+}
 _PACKAGE_BINDINGS = {
     "service_host_module": "ops/windows_service.py",
     "service_entry_module": "ops/service_entry.py",
@@ -55,7 +66,9 @@ _PACKAGE_BINDINGS = {
     "access_gate_module": "web/access_gate.py",
 }
 _INSTALL_PATH_BINDINGS = {
-    "service_executable": "tooling/python/Lib/site-packages/win32/pythonservice.exe",
+    "service_executable": "tooling/python/pythonservice.exe",
+    "service_python_runtime": "tooling/python/python313.dll",
+    "service_pywin32_runtime": "tooling/python/pywintypes313.dll",
     "service_python": "tooling/python/python.exe",
     "service_host_module": (
         "tooling/python/Lib/site-packages/quant_hub/ops/windows_service.py"
@@ -71,10 +84,46 @@ _INSTALL_PATH_BINDINGS = {
     ),
     "deployment_runtime": "control/deployment_runtime.json",
 }
-_TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v1"
+_LEGACY_INSTALL_PATH_BINDINGS = {
+    **{
+        field: relative
+        for field, relative in _INSTALL_PATH_BINDINGS.items()
+        if field not in {
+            "service_executable",
+            "service_python_runtime",
+            "service_pywin32_runtime",
+        }
+    },
+    "service_executable": (
+        "tooling/python/Lib/site-packages/win32/pythonservice.exe"
+    ),
+}
+_LEGACY_PYWIN32_RUNTIME = (
+    "tooling/python/Lib/site-packages/pywin32_system32/pywintypes313.dll"
+)
+_TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v2"
+_LEGACY_TOOLING_SCHEMA = "qrh-exact-runtime-tooling/v1"
 _TOOLING_SCOPE = "exact_runtime_tooling_claim_not_independently_observed"
 _PACKAGE_ALGORITHM = "qrh-installed-package-inventory/v1"
 _BINARY_FILES = (
+    ("python", "python", "tooling/python/python.exe"),
+    (
+        "service_host",
+        "pythonservice",
+        "tooling/python/pythonservice.exe",
+    ),
+    (
+        "service_python_runtime",
+        "python313",
+        "tooling/python/python313.dll",
+    ),
+    (
+        "service_pywin32_runtime",
+        "pywintypes313",
+        "tooling/python/pywintypes313.dll",
+    ),
+)
+_LEGACY_BINARY_FILES = (
     ("python", "python", "tooling/python/python.exe"),
     (
         "service_host",
@@ -237,19 +286,31 @@ def _build_tooling_claim(
     package_records: Mapping[str, tuple[int, str]],
     *,
     package_inventory_sha256: str | None = None,
+    schema: str = _TOOLING_SCHEMA,
+    binary_files: tuple[tuple[str, str, str], ...] = _BINARY_FILES,
+    binary_records: Mapping[str, tuple[int, str]] | None = None,
 ) -> Mapping[str, object]:
     value: dict[str, object] = {
-        "schema_version": _TOOLING_SCHEMA,
+        "schema_version": schema,
         "scope": _TOOLING_SCOPE,
         "root": str(PRODUCTION_ROOT),
     }
-    for field, logical_name, relative in _BINARY_FILES:
-        path = _guard_chain(root, root.joinpath(*relative.split("/")))
+    for field, logical_name, relative in binary_files:
+        if binary_records is None:
+            path = _guard_chain(root, root.joinpath(*relative.split("/")))
+            size, digest = path.stat().st_size, _hash_file(path)
+        else:
+            try:
+                size, digest = binary_records[field]
+            except KeyError as error:
+                raise ToolingUpdateError(
+                    f"tooling binary record is absent: {field}"
+                ) from error
         value[field] = _file_claim(
             logical_name=logical_name,
             relative_path=relative,
-            size=path.stat().st_size,
-            digest=_hash_file(path),
+            size=size,
+            digest=digest,
         )
     package: dict[str, object] = {
         "relative_path": "tooling/python/Lib/site-packages/quant_hub",
@@ -285,6 +346,21 @@ def _build_tooling_claim(
     )
     value["tooling_sha256"] = _identity_sha256(value)
     return value
+
+
+def _build_legacy_tooling_claim(
+    root: Path,
+    package_records: Mapping[str, tuple[int, str]],
+    *,
+    package_inventory_sha256: str | None = None,
+) -> Mapping[str, object]:
+    return _build_tooling_claim(
+        root,
+        package_records,
+        package_inventory_sha256=package_inventory_sha256,
+        schema=_LEGACY_TOOLING_SCHEMA,
+        binary_files=_LEGACY_BINARY_FILES,
+    )
 
 
 def _read_candidate_manifest(
@@ -448,18 +524,273 @@ def _write_atomic_new(
         raise
 
 
+_JOURNAL_SCHEMA = "qrh-tooling-update-pending/v2"
+_JOURNAL_PHASES = {
+    "intent",
+    "staged",
+    "package_swapped",
+    "host_bundle_published",
+    "claims_swapped",
+    "service_rebound",
+    "verified",
+}
+_JOURNAL_FIELDS = {
+    "schema_version",
+    "attempt_id",
+    "release_id",
+    "release_manifest_sha256",
+    "install_generation",
+    "old_package_inventory_sha256",
+    "new_package_inventory_sha256",
+    "old_image_path",
+    "new_image_path",
+    "old_install_sha256",
+    "new_install_sha256",
+    "old_tooling_state",
+    "old_tooling_sha256",
+    "new_tooling_sha256",
+    "root_bundle_provenance",
+    "root_bundle_members",
+    "phase",
+    "authority",
+    "journal_sha256",
+}
+_JOURNAL_MEMBER_FIELDS = {
+    "name",
+    "source_relative_path",
+    "destination_relative_path",
+    "bytes",
+    "sha256",
+    "created_by_transaction",
+}
+
+
+class _SimulatedProcessCrash(BaseException):
+    """Test-only crash cut which deliberately bypasses in-process recovery."""
+
+
+def _journal_hash(value: Mapping[str, object]) -> str:
+    return hashlib.sha256(
+        _canonical({key: item for key, item in value.items() if key != "journal_sha256"})
+    ).hexdigest()
+
+
+def _seal_journal(root: Path, value: Mapping[str, object]) -> dict[str, object]:
+    document = dict(value)
+    document.pop("journal_sha256", None)
+    document["journal_sha256"] = _journal_hash(document)
+    return _validate_journal(root, document)
+
+
+def _validate_journal(root: Path, value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != _JOURNAL_FIELDS:
+        raise ToolingUpdateError("tooling update journal schema differs")
+    document = dict(value)
+    if (
+        document.get("schema_version") != _JOURNAL_SCHEMA
+        or document.get("authority") != "coordination_only"
+        or document.get("install_generation") not in {"v1", "v2"}
+        or document.get("phase") not in _JOURNAL_PHASES
+        or document.get("old_tooling_state") not in {"absent", "present"}
+        or document.get("root_bundle_provenance")
+        not in {"derived_from_live_v1", "persisted_v2_exact_claim"}
+    ):
+        raise ToolingUpdateError("tooling update journal identity differs")
+    if document["root_bundle_provenance"] != (
+        "derived_from_live_v1"
+        if document["install_generation"] == "v1"
+        else "persisted_v2_exact_claim"
+    ):
+        raise ToolingUpdateError("tooling update journal provenance differs")
+    if type(document.get("attempt_id")) is not str or type(
+        document.get("release_id")
+    ) is not str:
+        raise ToolingUpdateError("tooling update journal identifier type differs")
+    _identifier(document["attempt_id"], "journal attempt ID")
+    _identifier(document["release_id"], "journal release ID")
+    for field in (
+        "release_manifest_sha256",
+        "old_package_inventory_sha256",
+        "new_package_inventory_sha256",
+        "old_install_sha256",
+        "new_install_sha256",
+        "new_tooling_sha256",
+        "journal_sha256",
+    ):
+        if type(document.get(field)) is not str:
+            raise ToolingUpdateError(f"journal {field} type differs")
+        _sha(document[field], f"journal {field}")
+    if document["old_tooling_state"] == "present":
+        if type(document.get("old_tooling_sha256")) is not str:
+            raise ToolingUpdateError("journal old tooling type differs")
+        _sha(document["old_tooling_sha256"], "journal old tooling")
+    elif document.get("old_tooling_sha256") != "absent":
+        raise ToolingUpdateError("absent old tooling journal identity differs")
+    if type(document.get("old_image_path")) is not str or type(
+        document.get("new_image_path")
+    ) is not str:
+        raise ToolingUpdateError("tooling update journal ImagePath type differs")
+    old_image = PureWindowsPath(document["old_image_path"])
+    new_image = PureWindowsPath(document["new_image_path"])
+    logical_root = PureWindowsPath(str(root))
+    expected_old = (
+        logical_root
+        / "tooling"
+        / "python"
+        / "Lib"
+        / "site-packages"
+        / "win32"
+        / "pythonservice.exe"
+        if document["install_generation"] == "v1"
+        else logical_root / "tooling" / "python" / "pythonservice.exe"
+    )
+    expected_new = logical_root / "tooling" / "python" / "pythonservice.exe"
+    if old_image != expected_old or new_image != expected_new:
+        raise ToolingUpdateError("tooling update journal ImagePath differs")
+    members = document.get("root_bundle_members")
+    if not isinstance(members, list) or len(members) != 3:
+        raise ToolingUpdateError("tooling update journal bundle differs")
+    expected_names = ("pythonservice.exe", "python313.dll", "pywintypes313.dll")
+    expected_sources = (
+        {
+            "pythonservice.exe": _LEGACY_INSTALL_PATH_BINDINGS["service_executable"],
+            "python313.dll": "tooling/python/python313.dll",
+            "pywintypes313.dll": _LEGACY_PYWIN32_RUNTIME,
+        }
+        if document["install_generation"] == "v1"
+        else {
+            name: f"tooling/python/{name}" for name in expected_names
+        }
+    )
+    for member, name in zip(members, expected_names, strict=True):
+        if not isinstance(member, dict) or set(member) != _JOURNAL_MEMBER_FIELDS:
+            raise ToolingUpdateError("tooling update journal member schema differs")
+        if (
+            member.get("name") != name
+            or member.get("source_relative_path") != expected_sources[name]
+            or member.get("destination_relative_path") != f"tooling/python/{name}"
+            or type(member.get("bytes")) is not int
+            or int(member["bytes"]) < 1
+            or type(member.get("created_by_transaction")) is not bool
+            or bool(member["created_by_transaction"])
+            != (document["install_generation"] == "v1" and name != "python313.dll")
+        ):
+            raise ToolingUpdateError("tooling update journal member identity differs")
+        if type(member.get("sha256")) is not str:
+            raise ToolingUpdateError("tooling update journal member hash type differs")
+        _sha(member["sha256"], f"journal bundle {name}")
+    if document["journal_sha256"] != _journal_hash(document):
+        raise ToolingUpdateError("tooling update journal self hash differs")
+    return document
+
+
+def _read_journal(root: Path, path: Path) -> dict[str, object]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ToolingUpdateError("tooling update journal is unreadable") from error
+    document = _validate_journal(root, value)
+    if raw != _canonical(document):
+        raise ToolingUpdateError("tooling update journal is not canonical")
+    return document
+
+
+def _write_journal_new(
+    root: Path, path: Path, value: Mapping[str, object]
+) -> dict[str, object]:
+    document = _seal_journal(root, value)
+    _write_atomic_new(path, document, suffix=str(document["attempt_id"]))
+    return document
+
+
+def _advance_journal(
+    root: Path, path: Path, value: Mapping[str, object], phase: str
+) -> dict[str, object]:
+    if phase not in _JOURNAL_PHASES:
+        raise ToolingUpdateError("tooling update journal phase is invalid")
+    document = _seal_journal(root, {**value, "phase": phase})
+    _write_atomic(path, document, suffix=str(document["attempt_id"]))
+    return document
+
+
+def _write_prior_new(path: Path, raw: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+class _ToolingUpdateLock:
+    def __init__(self, path: Path):
+        self._path = path
+        self._stream = None
+
+    def __enter__(self) -> "_ToolingUpdateLock":
+        stream = self._path.open("a+b")
+        try:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+                os.fsync(stream.fileno())
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException as error:
+            stream.close()
+            raise ToolingUpdateError("another tooling update owns the exclusive lock") from error
+        self._stream = stream
+        return self
+
+    def __exit__(self, error_type, error, traceback) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            return
+        try:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+
 def _validate_installed_bindings(
     root: Path,
     install: object,
     package: Path,
     package_records: Mapping[str, tuple[int, str]],
-) -> Mapping[str, object]:
+) -> tuple[Mapping[str, object], str]:
     """Close the legacy fixed-D install before a claim may be bootstrapped."""
 
+    if not isinstance(install, dict):
+        raise ToolingUpdateError("service install candidate identity differs")
+    schema = install.get("schema_version")
+    if schema == INSTALL_SCHEMA:
+        fields = _INSTALL_FIELDS
+        path_bindings = _INSTALL_PATH_BINDINGS
+        generation = "v2"
+    elif schema == LEGACY_INSTALL_SCHEMA:
+        fields = _LEGACY_INSTALL_FIELDS
+        path_bindings = _LEGACY_INSTALL_PATH_BINDINGS
+        generation = "v1"
+    else:
+        raise ToolingUpdateError("service install candidate identity differs")
     if (
-        not isinstance(install, dict)
-        or set(install) != _INSTALL_FIELDS
-        or install.get("schema_version") != INSTALL_SCHEMA
+        set(install) != fields
         or install.get("service_name") != SERVICE_NAME
         or install.get("python_class") != SERVICE_CLASS
         or install.get("start_type") != "automatic"
@@ -472,7 +803,7 @@ def _validate_installed_bindings(
         "quant_hub_package_inventory_sha256"
     ) != _package_inventory_sha256(package_records):
         raise ToolingUpdateError("installed tooling package binding differs")
-    for field, relative in _INSTALL_PATH_BINDINGS.items():
+    for field, relative in path_bindings.items():
         expected = _guard_chain(root, root.joinpath(*relative.split("/")))
         if not expected.is_file():
             raise ToolingUpdateError("installed tooling binding is not a regular file")
@@ -481,7 +812,17 @@ def _validate_installed_bindings(
             or install.get(f"{field}_sha256") != _hash_file(expected)
         ):
             raise ToolingUpdateError(f"installed tooling binding differs: {field}")
-    return install
+    if generation == "v1":
+        for relative in (
+            "tooling/python/python313.dll",
+            _LEGACY_PYWIN32_RUNTIME,
+        ):
+            dependency = _guard_chain(root, root.joinpath(*relative.split("/")))
+            if not dependency.is_file():
+                raise ToolingUpdateError(
+                    "legacy service loader dependency is unavailable"
+                )
+    return install, generation
 
 
 def _copy_package(
@@ -512,6 +853,110 @@ def _copy_package(
     except BaseException:
         _remove_tree(destination)
         raise
+
+
+def _host_bundle_sources(root: Path, generation: str) -> Mapping[str, Path]:
+    if generation == "v1":
+        relatives = {
+            "pythonservice.exe": _LEGACY_INSTALL_PATH_BINDINGS[
+                "service_executable"
+            ],
+            "python313.dll": "tooling/python/python313.dll",
+            "pywintypes313.dll": _LEGACY_PYWIN32_RUNTIME,
+        }
+    elif generation == "v2":
+        relatives = {
+            "pythonservice.exe": _INSTALL_PATH_BINDINGS["service_executable"],
+            "python313.dll": _INSTALL_PATH_BINDINGS["service_python_runtime"],
+            "pywintypes313.dll": _INSTALL_PATH_BINDINGS[
+                "service_pywin32_runtime"
+            ],
+        }
+    else:
+        raise ToolingUpdateError("service host bundle generation is invalid")
+    return {
+        name: _guard_chain(root, root.joinpath(*relative.split("/")))
+        for name, relative in relatives.items()
+    }
+
+
+def _copy_host_bundle(
+    sources: Mapping[str, Path],
+    destination: Path,
+    expected: Mapping[str, tuple[int, str]],
+) -> Mapping[str, tuple[int, str]]:
+    destination.mkdir()
+    records: dict[str, tuple[int, str]] = {}
+    try:
+        for name in ("pythonservice.exe", "python313.dll", "pywintypes313.dll"):
+            source = sources[name]
+            if not source.is_file():
+                raise ToolingUpdateError("service host bundle source is unavailable")
+            raw = source.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if expected.get(name) != (len(raw), digest):
+                raise ToolingUpdateError(
+                    "service host bundle source changed during staging"
+                )
+            target = destination / name
+            with target.open("xb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            records[name] = (len(raw), digest)
+        if records != dict(expected) or _regular_files(destination) != records:
+            raise ToolingUpdateError("staged service host bundle differs")
+        return records
+    except BaseException:
+        _remove_tree(destination)
+        raise
+
+
+def _service_image_path() -> str:
+    completed = subprocess.run(
+        ("sc.exe", "qc", SERVICE_NAME),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if completed.returncode:
+        raise ToolingUpdateError("cannot query Windows service ImagePath")
+    for line in completed.stdout.splitlines():
+        if "BINARY_PATH_NAME" in line and ":" in line:
+            return line.split(":", 1)[1].strip().strip('"')
+    raise ToolingUpdateError("Windows service ImagePath is absent")
+
+
+def _rebind_service_executable(expected_current: str, replacement: str) -> None:
+    if PureWindowsPath(_service_image_path()) != PureWindowsPath(expected_current):
+        raise ToolingUpdateError("Windows service ImagePath differs before rebind")
+    completed = subprocess.run(
+        ("sc.exe", "config", SERVICE_NAME, "binPath=", replacement),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if completed.returncode:
+        raise ToolingUpdateError("Windows service ImagePath rebind failed")
+    if PureWindowsPath(_service_image_path()) != PureWindowsPath(replacement):
+        rollback = subprocess.run(
+            ("sc.exe", "config", SERVICE_NAME, "binPath=", expected_current),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if (
+            rollback.returncode
+            or PureWindowsPath(_service_image_path())
+            != PureWindowsPath(expected_current)
+        ):
+            raise ToolingUpdateError(
+                "Windows service ImagePath rebind and rollback did not close"
+            )
+        raise ToolingUpdateError("Windows service ImagePath readback differs")
 
 
 def _remove_tree(root: Path) -> None:
@@ -647,6 +1092,278 @@ def _finalize_audit(
     return path
 
 
+def _inventory_sha256_or_absent(path: Path) -> str | None:
+    if not os.path.lexists(path):
+        return None
+    if _is_reparse(path) or not path.is_dir():
+        raise ToolingUpdateError("tooling recovery package is not an ordinary directory")
+    return _package_inventory_sha256(_regular_files(path))
+
+
+def _file_sha256_or_absent(path: Path) -> str | None:
+    if not os.path.lexists(path):
+        return None
+    if _is_reparse(path) or not path.is_file():
+        raise ToolingUpdateError("tooling recovery claim is not a regular file")
+    return _hash_file(path)
+
+
+def _remove_exact_package(path: Path, expected_sha256: str) -> None:
+    observed = _inventory_sha256_or_absent(path)
+    if observed is None:
+        return
+    if observed != expected_sha256:
+        raise ToolingUpdateError("tooling recovery package inventory differs")
+    _remove_tree(path)
+
+
+def _remove_exact_host_stage(
+    path: Path, members: Mapping[str, tuple[int, str]]
+) -> None:
+    if not os.path.lexists(path):
+        return
+    if _is_reparse(path) or not path.is_dir():
+        raise ToolingUpdateError("tooling recovery host stage is not ordinary")
+    observed = _regular_files(path)
+    if not set(observed).issubset(members) or any(
+        observed[name] != members[name] for name in observed
+    ):
+        raise ToolingUpdateError("tooling recovery host stage differs")
+    _remove_tree(path)
+
+
+def _journal_transaction_paths(
+    root: Path, attempt: str
+) -> Mapping[str, Path]:
+    package_parent = (
+        root / "tooling" / "python" / "Lib" / "site-packages"
+    )
+    control = root / "control"
+    return {
+        "package": package_parent / "quant_hub",
+        "stage": package_parent / f"quant_hub.update-{attempt}.partial",
+        "prior": package_parent / f"quant_hub.update-{attempt}.prior",
+        "host_stage": root
+        / "tooling"
+        / "python"
+        / f".scm-host.update-{attempt}.partial",
+        "install": control / "service_install_candidate.json",
+        "install_prior": control / f".service_install_candidate.{attempt}.prior",
+        "tooling": control / "exact_runtime_tooling.json",
+        "tooling_prior": control / f".exact_runtime_tooling.{attempt}.prior",
+        "journal": control / "tooling_update_pending.json",
+    }
+
+
+def _journal_bundle_records(
+    journal: Mapping[str, object]
+) -> dict[str, tuple[int, str]]:
+    return {
+        str(member["name"]): (int(member["bytes"]), str(member["sha256"]))
+        for member in journal["root_bundle_members"]  # type: ignore[index]
+    }
+
+
+def _verify_root_bundle(
+    root: Path, journal: Mapping[str, object], *, old_state: bool
+) -> None:
+    for member in journal["root_bundle_members"]:  # type: ignore[index]
+        target = root.joinpath(
+            *str(member["destination_relative_path"]).split("/")
+        )
+        observed = _file_sha256_or_absent(target)
+        created = bool(member["created_by_transaction"])
+        if old_state and created:
+            if observed is not None:
+                raise ToolingUpdateError("tooling recovery old bundle still has new member")
+        elif (
+            observed != member["sha256"]
+            or target.stat().st_size != member["bytes"]
+        ):
+            raise ToolingUpdateError("tooling recovery root bundle differs")
+
+
+def _verify_bundle_sources(
+    root: Path, journal: Mapping[str, object]
+) -> None:
+    for member in journal["root_bundle_members"]:  # type: ignore[index]
+        source = root.joinpath(*str(member["source_relative_path"]).split("/"))
+        observed = _file_sha256_or_absent(source)
+        if (
+            observed != member["sha256"]
+            or source.stat().st_size != member["bytes"]
+        ):
+            raise ToolingUpdateError(
+                "tooling recovery source bundle differs from journal"
+            )
+
+
+def _remove_created_root_bundle(
+    root: Path, journal: Mapping[str, object]
+) -> None:
+    for member in reversed(journal["root_bundle_members"]):  # type: ignore[index]
+        if not bool(member["created_by_transaction"]):
+            continue
+        target = root.joinpath(
+            *str(member["destination_relative_path"]).split("/")
+        )
+        observed = _file_sha256_or_absent(target)
+        if observed is None:
+            continue
+        if observed != member["sha256"] or target.stat().st_size != member["bytes"]:
+            raise ToolingUpdateError("tooling recovery created bundle member differs")
+        target.unlink()
+
+
+def _cleanup_transaction_artifacts(
+    root: Path,
+    journal: Mapping[str, object],
+    *,
+    final_package_sha256: str,
+) -> None:
+    paths = _journal_transaction_paths(root, str(journal["attempt_id"]))
+    old_package = str(journal["old_package_inventory_sha256"])
+    new_package = str(journal["new_package_inventory_sha256"])
+    for name, expected in (("stage", new_package), ("prior", old_package)):
+        _remove_exact_package(paths[name], expected)
+    _remove_exact_host_stage(paths["host_stage"], _journal_bundle_records(journal))
+    for name, expected in (
+        ("install_prior", str(journal["old_install_sha256"])),
+        ("tooling_prior", str(journal["old_tooling_sha256"])),
+    ):
+        path = paths[name]
+        observed = _file_sha256_or_absent(path)
+        if observed is None:
+            continue
+        if expected == "absent" or observed != expected:
+            raise ToolingUpdateError("tooling recovery prior claim differs")
+        path.unlink()
+    if _inventory_sha256_or_absent(paths["package"]) != final_package_sha256:
+        raise ToolingUpdateError("tooling recovery final package differs")
+
+
+def _recover_pending_transaction(
+    root: Path,
+    *,
+    service_stopped_probe: Callable[[], bool],
+    service_image_path_probe: Callable[[], str],
+    service_binding_updater: Callable[[str, str], None],
+) -> str | None:
+    journal_path = root / "control" / "tooling_update_pending.json"
+    if not os.path.lexists(journal_path):
+        return None
+    journal = _read_journal(root, journal_path)
+    if not service_stopped_probe():
+        raise ToolingUpdateError(
+            "D service must be STOPPED before tooling update recovery"
+        )
+    paths = _journal_transaction_paths(root, str(journal["attempt_id"]))
+    for path in paths.values():
+        _guard_chain(root, path, must_exist=os.path.lexists(path))
+    old_image = str(journal["old_image_path"])
+    new_image = str(journal["new_image_path"])
+    current_image = service_image_path_probe()
+
+    if journal["phase"] == "verified":
+        if (
+            PureWindowsPath(current_image) == PureWindowsPath(new_image)
+            and _inventory_sha256_or_absent(paths["package"])
+            == journal["new_package_inventory_sha256"]
+            and _file_sha256_or_absent(paths["install"])
+            == journal["new_install_sha256"]
+            and _file_sha256_or_absent(paths["tooling"])
+            == journal["new_tooling_sha256"]
+        ):
+            _verify_root_bundle(root, journal, old_state=False)
+            if not service_stopped_probe():
+                raise ToolingUpdateError(
+                    "D service became RUNNING before verified recovery cleanup"
+                )
+            _cleanup_transaction_artifacts(
+                root,
+                journal,
+                final_package_sha256=str(journal["new_package_inventory_sha256"]),
+            )
+            journal_path.unlink()
+            return "completed_exact_new"
+
+    if (
+        PureWindowsPath(old_image) != PureWindowsPath(new_image)
+        and PureWindowsPath(current_image) == PureWindowsPath(new_image)
+    ):
+        _verify_bundle_sources(root, journal)
+        if not service_stopped_probe():
+            raise ToolingUpdateError("D service became RUNNING before recovery rebind")
+        service_binding_updater(new_image, old_image)
+        if PureWindowsPath(service_image_path_probe()) != PureWindowsPath(old_image):
+            raise ToolingUpdateError("tooling recovery SCM reverse readback differs")
+    elif PureWindowsPath(current_image) != PureWindowsPath(old_image):
+        raise ToolingUpdateError("tooling recovery SCM ImagePath is ambiguous")
+    if not service_stopped_probe():
+        raise ToolingUpdateError(
+            "D service became RUNNING before tooling recovery rollback"
+        )
+
+    current_install = _file_sha256_or_absent(paths["install"])
+    if current_install == journal["new_install_sha256"]:
+        if _file_sha256_or_absent(paths["install_prior"]) != journal["old_install_sha256"]:
+            raise ToolingUpdateError("tooling recovery install prior differs")
+        os.replace(paths["install_prior"], paths["install"])
+    elif current_install != journal["old_install_sha256"]:
+        raise ToolingUpdateError("tooling recovery install claim is ambiguous")
+
+    current_tooling = _file_sha256_or_absent(paths["tooling"])
+    if journal["old_tooling_state"] == "absent":
+        if current_tooling == journal["new_tooling_sha256"]:
+            paths["tooling"].unlink()
+        elif current_tooling is not None:
+            raise ToolingUpdateError("tooling recovery bootstrapped claim is ambiguous")
+    elif current_tooling == journal["new_tooling_sha256"]:
+        if _file_sha256_or_absent(paths["tooling_prior"]) != journal["old_tooling_sha256"]:
+            raise ToolingUpdateError("tooling recovery tooling prior differs")
+        os.replace(paths["tooling_prior"], paths["tooling"])
+    elif current_tooling != journal["old_tooling_sha256"]:
+        raise ToolingUpdateError("tooling recovery tooling claim is ambiguous")
+
+    _remove_created_root_bundle(root, journal)
+    current_package = _inventory_sha256_or_absent(paths["package"])
+    prior_package = _inventory_sha256_or_absent(paths["prior"])
+    if current_package == journal["new_package_inventory_sha256"]:
+        if prior_package != journal["old_package_inventory_sha256"]:
+            raise ToolingUpdateError("tooling recovery package prior differs")
+        _remove_tree(paths["package"])
+        os.replace(paths["prior"], paths["package"])
+    elif current_package is None and prior_package == journal["old_package_inventory_sha256"]:
+        os.replace(paths["prior"], paths["package"])
+    elif current_package != journal["old_package_inventory_sha256"]:
+        raise ToolingUpdateError("tooling recovery package state is ambiguous")
+
+    _verify_bundle_sources(root, journal)
+    _verify_root_bundle(root, journal, old_state=True)
+    if (
+        _file_sha256_or_absent(paths["install"])
+        != journal["old_install_sha256"]
+        or (
+            journal["old_tooling_state"] == "present"
+            and _file_sha256_or_absent(paths["tooling"])
+            != journal["old_tooling_sha256"]
+        )
+        or (
+            journal["old_tooling_state"] == "absent"
+            and _file_sha256_or_absent(paths["tooling"]) is not None
+        )
+        or PureWindowsPath(service_image_path_probe()) != PureWindowsPath(old_image)
+    ):
+        raise ToolingUpdateError("tooling recovery exact old state did not close")
+    _cleanup_transaction_artifacts(
+        root,
+        journal,
+        final_package_sha256=str(journal["old_package_inventory_sha256"]),
+    )
+    journal_path.unlink()
+    return "rolled_back_exact_old"
+
+
 def update_vm_tooling(
     *,
     vm_root: Path,
@@ -655,38 +1372,145 @@ def update_vm_tooling(
     attempt_id: str,
     allow_test_root: bool = False,
     service_stopped_probe: Callable[[], bool] = _service_stopped,
+    service_image_path_probe: Callable[[], str] = _service_image_path,
+    service_binding_updater: Callable[[str, str], None] = _rebind_service_executable,
     fail_after_package_to_prior: bool = False,
     fail_after_package_swap: bool = False,
+    fail_before_second_root_bundle_publish: bool = False,
+    fail_after_host_bundle_publish: bool = False,
     fail_after_claims_swap: bool = False,
+    fail_after_service_rebind: bool = False,
+    simulate_process_crash_after_claims_swap: bool = False,
 ) -> Mapping[str, object]:
-    """Install one sealed candidate package and atomically rebind its hashes."""
+    """Install one sealed candidate package under one recoverable transaction."""
 
-    release = _identifier(release_id, "release ID")
-    attempt = _identifier(attempt_id, "attempt ID")
-    expected_manifest = _sha(release_manifest_sha256, "release manifest")
     root = vm_root.resolve(strict=True)
     if not allow_test_root and PureWindowsPath(str(root)) != PRODUCTION_ROOT:
         raise ToolingUpdateError(r"tooling update root must be D:\quant\quant_platform")
     if allow_test_root and PureWindowsPath(str(root)) == PRODUCTION_ROOT:
         raise ToolingUpdateError("test tooling update cannot target production D")
-    if not allow_test_root and service_stopped_probe is not _service_stopped:
-        raise ToolingUpdateError("production service-state probe is not injectable")
+    if not allow_test_root and (
+        service_stopped_probe is not _service_stopped
+        or service_image_path_probe is not _service_image_path
+        or service_binding_updater is not _rebind_service_executable
+    ):
+        raise ToolingUpdateError("production service probes are not injectable")
     if (
         fail_after_package_to_prior
         or fail_after_package_swap
+        or fail_before_second_root_bundle_publish
+        or fail_after_host_bundle_publish
         or fail_after_claims_swap
+        or fail_after_service_rebind
+        or simulate_process_crash_after_claims_swap
     ) and not allow_test_root:
         raise ToolingUpdateError("tooling update fault injection is test-only")
     _guard_chain(root, root)
+    control = _guard_chain(root, root / "control")
+    lock_path = _guard_chain(
+        root, control / "tooling_update.lock", must_exist=False
+    )
+    with _ToolingUpdateLock(lock_path):
+        pending_path = control / "tooling_update_pending.json"
+        pending = (
+            _read_journal(root, pending_path)
+            if os.path.lexists(pending_path)
+            else None
+        )
+        recovery = _recover_pending_transaction(
+            root,
+            service_stopped_probe=service_stopped_probe,
+            service_image_path_probe=service_image_path_probe,
+            service_binding_updater=service_binding_updater,
+        )
+        if (
+            recovery == "completed_exact_new"
+            and pending is not None
+            and pending["attempt_id"] == attempt_id
+            and pending["release_id"] == release_id
+            and pending["release_manifest_sha256"] == release_manifest_sha256
+        ):
+            try:
+                tooling = json.loads(
+                    (control / "exact_runtime_tooling.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ToolingUpdateError(
+                    "recovered exact-new tooling claim is unreadable"
+                ) from error
+            tooling_sha256 = tooling.get("tooling_sha256")
+            if type(tooling_sha256) is not str:
+                raise ToolingUpdateError(
+                    "recovered exact runtime tooling identity differs"
+                )
+            _sha(tooling_sha256, "recovered exact runtime tooling")
+            return {
+                "schema_version": "qrh-tooling-update-result/v2",
+                "status": "updated",
+                "attempt_id": attempt_id,
+                "release_id": release_id,
+                "release_manifest_sha256": release_manifest_sha256,
+                "quant_hub_package_inventory_sha256": pending[
+                    "new_package_inventory_sha256"
+                ],
+                "exact_runtime_tooling_sha256": tooling_sha256,
+                "root_bundle_provenance": pending["root_bundle_provenance"],
+                "restart_recovery": recovery,
+            }
+        return _update_vm_tooling_locked(
+            root=root,
+            release_id=release_id,
+            release_manifest_sha256=release_manifest_sha256,
+            attempt_id=attempt_id,
+            service_stopped_probe=service_stopped_probe,
+            service_image_path_probe=service_image_path_probe,
+            service_binding_updater=service_binding_updater,
+            recovery=recovery,
+            fail_after_package_to_prior=fail_after_package_to_prior,
+            fail_after_package_swap=fail_after_package_swap,
+            fail_before_second_root_bundle_publish=(
+                fail_before_second_root_bundle_publish
+            ),
+            fail_after_host_bundle_publish=fail_after_host_bundle_publish,
+            fail_after_claims_swap=fail_after_claims_swap,
+            fail_after_service_rebind=fail_after_service_rebind,
+            simulate_process_crash_after_claims_swap=(
+                simulate_process_crash_after_claims_swap
+            ),
+        )
+
+
+def _update_vm_tooling_locked(
+    *,
+    root: Path,
+    release_id: str,
+    release_manifest_sha256: str,
+    attempt_id: str,
+    service_stopped_probe: Callable[[], bool],
+    service_image_path_probe: Callable[[], str],
+    service_binding_updater: Callable[[str, str], None],
+    recovery: str | None,
+    fail_after_package_to_prior: bool,
+    fail_after_package_swap: bool,
+    fail_before_second_root_bundle_publish: bool,
+    fail_after_host_bundle_publish: bool,
+    fail_after_claims_swap: bool,
+    fail_after_service_rebind: bool,
+    simulate_process_crash_after_claims_swap: bool,
+) -> Mapping[str, object]:
+    release = _identifier(release_id, "release ID")
+    attempt = _identifier(attempt_id, "attempt ID")
+    expected_manifest = _sha(release_manifest_sha256, "release manifest")
+    if not service_stopped_probe():
+        raise ToolingUpdateError("D service must be STOPPED at tooling update start")
     candidate = _guard_chain(root, root / "incoming" / f"{release}.partial")
     _manifest, expected = _read_candidate_manifest(
         candidate,
         release_id=release,
         manifest_sha256=expected_manifest,
     )
-    if not service_stopped_probe():
-        raise ToolingUpdateError("D service must be STOPPED before tooling update")
-
     source = candidate / "runtime_contract" / "code" / "src" / "quant_hub"
     migration_source = (
         candidate / "runtime_contract" / "migrations" / "research_workspace"
@@ -698,6 +1522,8 @@ def update_vm_tooling(
     package_parent = package.parent
     stage = package_parent / f"quant_hub.update-{attempt}.partial"
     prior = package_parent / f"quant_hub.update-{attempt}.prior"
+    tooling_python = _guard_chain(root, root / "tooling" / "python")
+    host_stage = tooling_python / f".scm-host.update-{attempt}.partial"
     control = _guard_chain(root, root / "control")
     install_path = _guard_chain(root, control / "service_install_candidate.json")
     install_prior = control / f".service_install_candidate.{attempt}.prior"
@@ -711,23 +1537,36 @@ def update_vm_tooling(
     for path in (
         stage,
         prior,
+        host_stage,
         install_prior,
         tooling_prior,
         journal_path,
     ):
         _guard_chain(root, path, must_exist=False)
-        if path.exists():
-            raise ToolingUpdateError("another or interrupted tooling update exists")
+        if os.path.lexists(path):
+            raise ToolingUpdateError("tooling recovery left a transaction artifact")
 
     try:
         install = json.loads(install_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ToolingUpdateError("service install candidate is unreadable") from error
     old_inventory = _regular_files(package)
-    install = _validate_installed_bindings(root, install, package, old_inventory)
+    install, install_generation = _validate_installed_bindings(
+        root, install, package, old_inventory
+    )
+    old_service_executable = str(install["service_executable"])
+    if PureWindowsPath(service_image_path_probe()) != PureWindowsPath(
+        old_service_executable
+    ):
+        raise ToolingUpdateError("Windows service ImagePath differs from install claim")
+    old_tooling_builder = (
+        _build_legacy_tooling_claim
+        if install_generation == "v1"
+        else _build_tooling_claim
+    )
     expected_old_toolings = (
-        _build_tooling_claim(root, old_inventory),
-        _build_tooling_claim(
+        old_tooling_builder(root, old_inventory),
+        old_tooling_builder(
             root,
             old_inventory,
             package_inventory_sha256=_package_inventory_sha256(old_inventory),
@@ -743,101 +1582,201 @@ def update_vm_tooling(
         if tooling_raw != _canonical(tooling) or tooling not in expected_old_toolings:
             raise ToolingUpdateError("exact runtime tooling claim differs from live bytes")
 
-    _copy_package(source, migration_source, stage, expected)
+    host_sources = _host_bundle_sources(root, install_generation)
+    expected_host_records = {
+        name: (path.stat().st_size, _hash_file(path))
+        for name, path in host_sources.items()
+    }
+    if expected_host_records["pythonservice.exe"][1] != install.get(
+        "service_executable_sha256"
+    ):
+        raise ToolingUpdateError("service host source differs from install claim")
+    if install_generation == "v2" and (
+        expected_host_records["python313.dll"][1]
+        != install.get("service_python_runtime_sha256")
+        or expected_host_records["pywintypes313.dll"][1]
+        != install.get("service_pywin32_runtime_sha256")
+    ):
+        raise ToolingUpdateError("service loader source differs from install claim")
+    host_records = expected_host_records
     updated = dict(install)
+    updated["schema_version"] = INSTALL_SCHEMA
+    for field, name in (
+        ("service_executable", "pythonservice.exe"),
+        ("service_python_runtime", "python313.dll"),
+        ("service_pywin32_runtime", "pywintypes313.dll"),
+    ):
+        relative = _INSTALL_PATH_BINDINGS[field]
+        updated[field] = str(root.joinpath(*relative.split("/")).resolve())
+        updated[f"{field}_sha256"] = host_records[name][1]
     updated["quant_hub_package_inventory_sha256"] = (
         _package_inventory_sha256(expected)
     )
     for field, relative in _PACKAGE_BINDINGS.items():
         updated[f"{field}_sha256"] = expected[relative][1]
-    updated_tooling = _build_tooling_claim(root, expected)
-    install_prior.write_bytes(install_path.read_bytes())
-    if tooling_raw is not None:
-        tooling_prior.write_bytes(tooling_raw)
-    journal = {
-        "schema_version": "qrh-tooling-update-pending/v1",
+    python_path = _guard_chain(
+        root, root.joinpath(*_INSTALL_PATH_BINDINGS["service_python"].split("/"))
+    )
+    binary_records = {
+        "python": (python_path.stat().st_size, _hash_file(python_path)),
+        "service_host": host_records["pythonservice.exe"],
+        "service_python_runtime": host_records["python313.dll"],
+        "service_pywin32_runtime": host_records["pywintypes313.dll"],
+    }
+    updated_tooling = _build_tooling_claim(
+        root, expected, binary_records=binary_records
+    )
+    install_raw = install_path.read_bytes()
+    updated_install_raw = _canonical(updated)
+    updated_tooling_raw = _canonical(updated_tooling)
+    provenance = (
+        "derived_from_live_v1"
+        if install_generation == "v1"
+        else "persisted_v2_exact_claim"
+    )
+    source_relatives = {
+        name: path.relative_to(root).as_posix()
+        for name, path in host_sources.items()
+    }
+    journal = _write_journal_new(root, journal_path, {
+        "schema_version": _JOURNAL_SCHEMA,
         "attempt_id": attempt,
         "release_id": release,
         "release_manifest_sha256": expected_manifest,
+        "install_generation": install_generation,
         "old_package_inventory_sha256": _package_inventory_sha256(old_inventory),
         "new_package_inventory_sha256": _package_inventory_sha256(expected),
-        "old_exact_runtime_tooling": "absent" if tooling_bootstrap else "present",
-        "phase": "staged",
+        "old_image_path": old_service_executable,
+        "new_image_path": str(updated["service_executable"]),
+        "old_install_sha256": hashlib.sha256(install_raw).hexdigest(),
+        "new_install_sha256": hashlib.sha256(updated_install_raw).hexdigest(),
+        "old_tooling_state": "absent" if tooling_bootstrap else "present",
+        "old_tooling_sha256": (
+            "absent" if tooling_raw is None else hashlib.sha256(tooling_raw).hexdigest()
+        ),
+        "new_tooling_sha256": hashlib.sha256(updated_tooling_raw).hexdigest(),
+        "root_bundle_provenance": provenance,
+        "root_bundle_members": [
+            {
+                "name": name,
+                "source_relative_path": source_relatives[name],
+                "destination_relative_path": f"tooling/python/{name}",
+                "bytes": host_records[name][0],
+                "sha256": host_records[name][1],
+                "created_by_transaction": (
+                    install_generation == "v1" and name != "python313.dll"
+                ),
+            }
+            for name in ("pythonservice.exe", "python313.dll", "pywintypes313.dll")
+        ],
+        "phase": "intent",
         "authority": "coordination_only",
-    }
-    _write_atomic(journal_path, journal, suffix=attempt)
-    prior_renamed = False
-    package_swapped = False
-    candidate_swapped = False
-    tooling_swapped = False
+    })
     try:
+        _copy_package(source, migration_source, stage, expected)
+        _copy_host_bundle(host_sources, host_stage, expected_host_records)
+        _write_prior_new(install_prior, install_raw)
+        if tooling_raw is not None:
+            _write_prior_new(tooling_prior, tooling_raw)
+        journal = _advance_journal(root, journal_path, journal, "staged")
+        if not service_stopped_probe():
+            raise ToolingUpdateError("D service became RUNNING before package swap")
         os.replace(package, prior)
-        prior_renamed = True
         if fail_after_package_to_prior:
             raise ToolingUpdateError("injected failure after package moved to prior")
         os.replace(stage, package)
-        package_swapped = True
-        journal["phase"] = "package_swapped"
-        _write_atomic(journal_path, journal, suffix=attempt)
+        journal = _advance_journal(root, journal_path, journal, "package_swapped")
         if fail_after_package_swap:
             raise ToolingUpdateError("injected failure after package swap")
+        if install_generation == "v1":
+            published_count = 0
+            for name in ("pythonservice.exe", "pywintypes313.dll"):
+                if fail_before_second_root_bundle_publish and published_count == 1:
+                    raise ToolingUpdateError(
+                        "injected failure before second root bundle publish"
+                    )
+                destination = tooling_python / name
+                _guard_chain(root, destination, must_exist=False)
+                if os.path.lexists(destination):
+                    raise ToolingUpdateError(
+                        "service host bundle destination already exists during v1 migration"
+                    )
+                os.replace(host_stage / name, destination)
+                published_count += 1
+        for name, (size, digest) in host_records.items():
+            destination = _guard_chain(root, tooling_python / name)
+            if (
+                not destination.is_file()
+                or destination.stat().st_size != size
+                or _hash_file(destination) != digest
+            ):
+                raise ToolingUpdateError("published service host bundle differs")
+        journal = _advance_journal(
+            root, journal_path, journal, "host_bundle_published"
+        )
+        if fail_after_host_bundle_publish:
+            raise ToolingUpdateError("injected failure after host bundle publish")
         _write_atomic(install_path, updated, suffix=attempt)
-        candidate_swapped = True
         if tooling_bootstrap:
             _write_atomic_new(tooling_path, updated_tooling, suffix=attempt)
         else:
             _write_atomic(tooling_path, updated_tooling, suffix=attempt)
-        tooling_swapped = True
-        journal["phase"] = "claims_swapped"
-        _write_atomic(journal_path, journal, suffix=attempt)
+        journal = _advance_journal(root, journal_path, journal, "claims_swapped")
+        if simulate_process_crash_after_claims_swap:
+            raise _SimulatedProcessCrash()
         if fail_after_claims_swap:
             raise ToolingUpdateError("injected failure after claims swap")
+        new_service_executable = str(updated["service_executable"])
+        if not service_stopped_probe():
+            raise ToolingUpdateError("D service became RUNNING before SCM rebind")
+        if PureWindowsPath(old_service_executable) != PureWindowsPath(
+            new_service_executable
+        ):
+            service_binding_updater(
+                old_service_executable, new_service_executable
+            )
+        if PureWindowsPath(service_image_path_probe()) != PureWindowsPath(
+            new_service_executable
+        ):
+            raise ToolingUpdateError("Windows service ImagePath final readback differs")
+        journal = _advance_journal(root, journal_path, journal, "service_rebound")
+        if fail_after_service_rebind:
+            raise ToolingUpdateError("injected failure after service rebind")
+        if not service_stopped_probe():
+            raise ToolingUpdateError("D service became RUNNING before final validation")
         if _regular_files(package) != expected:
             raise ToolingUpdateError("installed tooling package changed after swap")
         if json.loads(install_path.read_text(encoding="utf-8")) != updated:
             raise ToolingUpdateError("updated service install candidate differs")
         if json.loads(tooling_path.read_text(encoding="utf-8")) != updated_tooling:
             raise ToolingUpdateError("updated exact runtime tooling claim differs")
-    except BaseException:
-        rollback_error: BaseException | None = None
-        try:
-            if tooling_swapped:
-                if tooling_bootstrap:
-                    if tooling_path.read_bytes() != _canonical(updated_tooling):
-                        raise ToolingUpdateError(
-                            "bootstrapped tooling claim changed before rollback"
-                        )
-                    tooling_path.unlink()
-                else:
-                    os.replace(tooling_prior, tooling_path)
-            if candidate_swapped:
-                os.replace(install_prior, install_path)
-            if package_swapped:
-                _remove_tree(package)
-            if prior_renamed:
-                os.replace(prior, package)
-            _remove_tree(stage)
-            if install_prior.exists():
-                install_prior.unlink()
-            if tooling_prior.exists():
-                tooling_prior.unlink()
-            if journal_path.exists():
-                journal_path.unlink()
-        except BaseException as error:
-            rollback_error = error
-        if rollback_error is not None:
-            raise ToolingUpdateError(
-                "tooling update failed and exact rollback did not close"
-            ) from rollback_error
+        _verify_root_bundle(root, journal, old_state=False)
+        journal = _advance_journal(root, journal_path, journal, "verified")
+    except _SimulatedProcessCrash:
         raise
-
-    _remove_tree(prior)
-    install_prior.unlink()
-    if tooling_prior.exists():
-        tooling_prior.unlink()
-    journal_path.unlink()
+    except BaseException:
+        try:
+            _recover_pending_transaction(
+                root,
+                service_stopped_probe=service_stopped_probe,
+                service_image_path_probe=service_image_path_probe,
+                service_binding_updater=service_binding_updater,
+            )
+        except BaseException as error:
+            raise ToolingUpdateError(
+                "tooling update failed; recoverable journal remains"
+            ) from error
+        raise
+    completion = _recover_pending_transaction(
+        root,
+        service_stopped_probe=service_stopped_probe,
+        service_image_path_probe=service_image_path_probe,
+        service_binding_updater=service_binding_updater,
+    )
+    if completion != "completed_exact_new":
+        raise ToolingUpdateError("tooling update verified completion did not close")
     return {
-        "schema_version": "qrh-tooling-update-result/v1",
+        "schema_version": "qrh-tooling-update-result/v2",
         "status": "updated",
         "attempt_id": attempt,
         "release_id": release,
@@ -846,6 +1785,8 @@ def update_vm_tooling(
             "quant_hub_package_inventory_sha256"
         ],
         "exact_runtime_tooling_sha256": updated_tooling["tooling_sha256"],
+        "root_bundle_provenance": provenance,
+        "restart_recovery": recovery or "not_required",
     }
 
 

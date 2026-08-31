@@ -570,12 +570,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         self._activate("release-r1")
 
     def _write_install_binding(self):
-        executable = (
-            self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"
-            / "pythonservice.exe"
-        )
+        executable = self.root / "tooling" / "python" / "pythonservice.exe"
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(b"reviewed-service-host")
+        (executable.parent / "python313.dll").write_bytes(b"python-runtime")
+        (executable.parent / "pywintypes313.dll").write_bytes(b"pywin32-runtime")
         (self.root / "tooling" / "python" / "python.exe").write_bytes(
             b"reviewed-service-python"
         )
@@ -1275,12 +1274,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                 )
 
     def test_install_candidate_is_hashed_idempotent_and_d_root_configured(self) -> None:
-        executable = (
-            self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"
-            / "pythonservice.exe"
-        )
-        executable.parent.mkdir(parents=True)
+        executable = self.root / "tooling" / "python" / "pythonservice.exe"
+        executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(b"reviewed-service-host")
+        (executable.parent / "python313.dll").write_bytes(b"python-runtime")
+        (executable.parent / "pywintypes313.dll").write_bytes(b"pywin32-runtime")
         service_python = self.root / "tooling" / "python" / "python.exe"
         service_python.write_bytes(b"reviewed-service-python")
         service_host = (
@@ -1322,12 +1320,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         self.assertFalse(evidence["contains_secret"])
 
     def test_scm_binding_requires_exact_executable_class_and_auto_start(self) -> None:
-        executable = (
-            self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"
-            / "pythonservice.exe"
-        )
+        executable = self.root / "tooling" / "python" / "pythonservice.exe"
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(b"reviewed-service-host")
+        (executable.parent / "python313.dll").write_bytes(b"python-runtime")
+        (executable.parent / "pywintypes313.dll").write_bytes(b"pywin32-runtime")
         (self.root / "tooling" / "python" / "python.exe").write_bytes(b"python")
         service_host = (
             self.root / "tooling" / "python" / "Lib" / "site-packages"
@@ -1356,12 +1353,11 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                 self.assertFalse(validate_service_control_binding(candidate, **changed))
 
     def test_install_fails_closed_when_scm_binding_cannot_be_verified(self) -> None:
-        executable = (
-            self.root / "tooling" / "python" / "Lib" / "site-packages" / "win32"
-            / "pythonservice.exe"
-        )
+        executable = self.root / "tooling" / "python" / "pythonservice.exe"
         executable.parent.mkdir(parents=True, exist_ok=True)
         executable.write_bytes(b"reviewed-service-host")
+        (executable.parent / "python313.dll").write_bytes(b"python-runtime")
+        (executable.parent / "pywintypes313.dll").write_bytes(b"pywin32-runtime")
         (self.root / "tooling" / "python" / "python.exe").write_bytes(b"python")
         service_host = (
             self.root / "tooling" / "python" / "Lib" / "site-packages"

@@ -43,6 +43,16 @@ from .identity_graph_fixture import (
     fixed_corpus_document,
     replay_fixed_corpus,
 )
+from .revocation_surface import (
+    AUTHORITY_SCOPE as REVOCATION_AUTHORITY_SCOPE,
+    GATE_ROLE as REVOCATION_GATE_ROLE,
+    PRODUCER_NAME as REVOCATION_PRODUCER_NAME,
+    PRODUCER_VERSION as REVOCATION_PRODUCER_VERSION,
+    REPORT_SCHEMA as REVOCATION_REPORT_SCHEMA,
+    RevocationSurfaceError,
+    replay_production_report as replay_revocation_production_report,
+    validate_report as validate_revocation_report,
+)
 GATE_EVIDENCE_SCHEMA = "qrh-closure-gate-evidence/v2-managed-inputs"
 GATE_OBSERVATION_SCHEMA = "qrh-closure-gate-observation/v2-managed-inputs"
 STAGE5_CERTIFICATE_SCHEMA = "qrh-stage5-release-certificate/v1"
@@ -94,6 +104,7 @@ _MANAGED_RESULT_SCHEMAS = {
 _PRIMARY_RESULT_SCHEMAS = {
     **_MANAGED_RESULT_SCHEMAS,
     IDENTITY_GRAPH_GATE_ROLE: IDENTITY_GRAPH_REPORT_SCHEMA,
+    REVOCATION_GATE_ROLE: REVOCATION_REPORT_SCHEMA,
 }
 _STAGE5_MACHINE_AUTHORITY = "QRH_STAGE5_MANAGED_MACHINE_OBSERVER"
 _INDEPENDENT_AUTHORITY = "QRH_STAGE5_INDEPENDENT_VERIFIER_DISPATCH"
@@ -1674,7 +1685,7 @@ def _nonqualifying_managed_facts_preview(
                 _text(typed["location"], label=f"{label}.finding.location", maximum=1024)
                 counts[str(category)] += 1
         return {
-            "surfaces_scanned": [str(item["id"]) for item in scans],
+            "surfaces_scanned": sorted(str(item["id"]) for item in scans),
             "surface_checks_total": total,
             "surface_checks_passed": passed,
             "periodic_state_copy_tasks": counts["periodic_state_copy_task"],
@@ -1964,7 +1975,66 @@ def _load_managed_result(
     input_refs: Sequence[Mapping[str, object]],
     support_artifacts: Mapping[str, Mapping[str, object]],
     subject: Mapping[str, object],
+    revocation_replay_cache: dict[str, Mapping[str, object]] | None = None,
 ) -> tuple[Mapping[str, object], Mapping[str, object], Mapping[str, object], str]:
+    if (
+        role == REVOCATION_GATE_ROLE
+        and result_ref["artifact_kind"] == "canonical_json"
+        and result_ref["schema_version"] == REVOCATION_REPORT_SCHEMA
+    ):
+        report, _ = _canonical_json_file(root, str(result_ref["relative_path"]))
+        try:
+            report = validate_revocation_report(report)
+            cache_key = str(report["report_sha256"])
+            if revocation_replay_cache is None or cache_key not in revocation_replay_cache:
+                replayed = replay_revocation_production_report(report)
+                if revocation_replay_cache is not None:
+                    revocation_replay_cache[cache_key] = replayed
+        except RevocationSurfaceError as error:
+            raise ReleaseClosureError(
+                "revocation surface report 现场重放失败"
+            ) from error
+        if (
+            report["gate_role"] != REVOCATION_GATE_ROLE
+            or report["authority_scope"] != REVOCATION_AUTHORITY_SCOPE
+            or report["producer"]
+            != {
+                "name": REVOCATION_PRODUCER_NAME,
+                "version": REVOCATION_PRODUCER_VERSION,
+            }
+        ):
+            raise ReleaseClosureError("revocation report identity/scope 漂移")
+        result = report["result"]
+        scans = report["scans"]
+        assert isinstance(result, Mapping) and isinstance(scans, list)
+        return (
+            report,
+            {
+                "surfaces_scanned": sorted(str(scan["id"]) for scan in scans),
+                "surface_checks_total": result["surface_checks_total"],
+                "surface_checks_passed": result["surface_checks_passed"],
+                "periodic_state_copy_tasks": result[
+                    "periodic_state_copy_tasks"
+                ],
+                "outside_d_project_storage": result[
+                    "outside_d_project_storage"
+                ],
+                "legacy_protection_exports": result[
+                    "legacy_protection_exports"
+                ],
+            },
+            {
+                "name": REVOCATION_PRODUCER_NAME,
+                "version": REVOCATION_PRODUCER_VERSION,
+                "independent": False,
+            },
+            _utc_text(
+                _timestamp(
+                    report["produced_at"],
+                    label="revocation report.produced_at",
+                )
+            ),
+        )
     if (
         role == IDENTITY_GRAPH_GATE_ROLE
         and result_ref["artifact_kind"] == "canonical_json"
@@ -2042,7 +2112,11 @@ def _load_managed_result(
 
 
 def _load_gate_observation(
-    root: Path, relative_path: str, *, expected_roles: Sequence[str]
+    root: Path,
+    relative_path: str,
+    *,
+    expected_roles: Sequence[str],
+    revocation_replay_cache: dict[str, Mapping[str, object]] | None = None,
 ) -> tuple[
     Mapping[str, object],
     Mapping[str, object],
@@ -2149,6 +2223,7 @@ def _load_gate_observation(
         input_refs,
         support_by_id,
         subject,
+        revocation_replay_cache,
     )
     if _timestamp(finished_at, label="managed result finished_at") > sealed_at:
         raise ReleaseClosureError("observation 早于 managed execution 完成")
@@ -2216,6 +2291,7 @@ def _validate_gate_evidence(
     root: Path,
     relative_path: str,
     expected_roles: Sequence[str],
+    revocation_replay_cache: dict[str, Mapping[str, object]] | None = None,
 ) -> Mapping[str, object]:
     evidence = _closed(
         value,
@@ -2287,6 +2363,7 @@ def _validate_gate_evidence(
         root,
         str(observation_refs[0]["relative_path"]),
         expected_roles=expected_roles,
+        revocation_replay_cache=revocation_replay_cache,
     )
     expected_artifacts = sorted(
         [observation_ref, *sources],
@@ -2369,15 +2446,18 @@ def produce_gate_evidence_from_observation(
 
     root = _evidence_root(evidence_root)
     relative = _relative_path(observation_path, label="observation path")
+    revocation_replay_cache: dict[str, Mapping[str, object]] = {}
     first = _load_gate_observation(
         root,
         relative,
         expected_roles=(*STAGE5_GATE_ROLES, *STAGE6_GATE_ROLES),
+        revocation_replay_cache=revocation_replay_cache,
     )
     second = _load_gate_observation(
         root,
         relative,
         expected_roles=(*STAGE5_GATE_ROLES, *STAGE6_GATE_ROLES),
+        revocation_replay_cache=revocation_replay_cache,
     )
     first_material = [first[0], first[1], first[2], list(first[3])]
     second_material = [second[0], second[1], second[2], list(second[3])]
@@ -2413,6 +2493,7 @@ def produce_gate_evidence_from_observation(
         root=root,
         relative_path="derived-gate-evidence.json",
         expected_roles=expected_roles,
+        revocation_replay_cache=revocation_replay_cache,
     )
 
 

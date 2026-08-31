@@ -48,7 +48,7 @@ _PRODUCTION_ROOT = r"D:\quant\quant_platform"
 _SERVICE_NAME = "QuantResearchHub"
 _SCM_HOST_EXECUTABLE = (
     _PRODUCTION_ROOT
-    + r"\tooling\python\Lib\site-packages\win32\pythonservice.exe"
+    + r"\tooling\python\pythonservice.exe"
 )
 _SCM_PYTHON_CLASS = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
 _CHILD_EXECUTABLE = _PRODUCTION_ROOT + r"\tooling\python\python.exe"

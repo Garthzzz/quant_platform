@@ -17,7 +17,12 @@ from quant_hub.knowledge.semantic import (
     deprecate_item,
     extract_source_explicit,
 )
-from quant_hub.ops.publish_adapters import HTTPResponse, ReleaseFile
+from quant_hub.ops.publish_adapters import (
+    HTTPResponse,
+    ReleaseFile,
+    sealed_candidate_tooling_update_script,
+    verified_d_tooling_python_script,
+)
 from quant_hub.ops.publish_runtime import (
     EnvironmentSecretProvider,
     GitSnapshot,
@@ -89,6 +94,21 @@ class FakeInvoker:
 
 
 class PublishRuntimeTests(unittest.TestCase):
+    def test_v1_remote_tooling_is_limited_to_candidate_and_update_boundaries(self) -> None:
+        candidate_only = verified_d_tooling_python_script(
+            "deployment_cli_module", allow_legacy=True
+        )
+        activate = verified_d_tooling_python_script("deployment_cli_module")
+        updater = sealed_candidate_tooling_update_script(
+            release_id="release-r1",
+            release_manifest_sha256="a" * 64,
+            attempt_id="tooling-r1",
+        )
+        self.assertIn("$allowLegacy=$true", candidate_only)
+        self.assertIn("$allowLegacy=$true", updater)
+        self.assertIn("$allowLegacy=$false", activate)
+        self.assertIn("legacy_operational_binding_forbidden", activate)
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

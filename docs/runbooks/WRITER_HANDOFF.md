@@ -57,7 +57,13 @@ qrh-vm-bootstrap prepare-v39 `
 R1 candidate-only 传输完成且 D service 保持 `STOPPED` 后，从本地受控 host 入口更新 fixed D
 tooling。host 会先用旧 tooling 验证 D Python/package，再按 R1 manifest 精确验证 candidate 内的
 stdlib-only updater；更新会同步 package、`service_install_candidate.json` 与
-`exact_runtime_tooling.json`，并生成 exact-D write audit：
+`exact_runtime_tooling.json`，并生成 exact-D write audit。首次 v1→v2 更新还会把 SCM 宿主闭合为
+同目录三件套：`tooling\python\pythonservice.exe`、`tooling\python\python313.dll`、
+`tooling\python\pywintypes313.dll`，随后以读回校验的 `sc.exe config` 将服务 `ImagePath`
+从旧的嵌套 `win32\pythonservice.exe` 改绑到新宿主。候选验证和 updater 启动允许严格读取
+旧 v1 或新 v2 合同；任何激活、writer handoff 和稳态启动只接受 v2。包、三件套、两份 claim
+或 SCM 改绑任一步发生可捕获异常时，更新器先尝试恢复原字节与原 `ImagePath`；进程崩溃、断电
+或恢复读回不确定时，则保留可重放 journal 并 fail closed：
 
 ```powershell
 qrh-tooling-update `
@@ -69,6 +75,24 @@ qrh-tooling-update `
   --attempt-id <UNIQUE_TOOLING_ATTEMPT> `
   --json
 ```
+
+固定 tooling 更新由 `<VM_ROOT>\control\tooling_update.lock` 串行化，并在首次副作用前 create-only
+写入 `tooling_update_pending.json`。当前 journal schema 是
+`qrh-tooling-update-pending/v2`；它以 `authority=coordination_only` 标识自己的边界，并绑定
+attempt/release/manifest、v1 或 v2 来源代际、旧新 package inventory、旧新两份 claim 散列、旧新
+SCM `ImagePath`、三件套的来源/目标/大小/SHA-256/本次是否创建、当前 phase 和 journal 自散列。
+合法 phase 为 `intent`、`staged`、`package_swapped`、`host_bundle_published`、`claims_swapped`、
+`service_rebound`、`verified`。
+
+重新执行同一命令时，updater 必须先消费 pending journal，而不是覆盖或人工删除它：只有
+`verified` 且 package、两份 claim、三件套和 SCM 都精确等于新状态时，才完成残留清理并返回
+`completed_exact_new`；其他可判定的中断状态回退为 exact old，再继续本次更新并返回
+`rolled_back_exact_old`。对象既不等于 journal 记录的 old，也不等于 new，服务不为 `STOPPED`，
+或 journal/canonical bytes/自散列漂移时，保留 journal 并阻止继续。成功输出必须是
+`qrh-tooling-update-result/v2`，其中 `restart_recovery` 只能为 `not_required`、
+`rolled_back_exact_old` 或 `completed_exact_new`，并同时返回 package inventory、tooling identity 和
+`root_bundle_provenance`。这个 result 只证明该次 fixed-tooling 事务闭合，不是 writer authority、
+active/prior 或 handoff 成功证明。
 
 R0 与 R1 partial、服务绑定和 D state 均就绪后，执行 `prepare-intent`。它先做完整现场 inspect，
 证明 C 是 8765 唯一 listener、D service 已停止、R0 为 pending bootstrap（或是一次失败重试留下的

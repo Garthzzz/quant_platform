@@ -794,6 +794,8 @@ class _ExactRuntimeToolingScanner:
                 "root": EXACT_RUNTIME_TOOLING_ROOT,
                 "python": binaries["python"],
                 "service_host": binaries["service_host"],
+                "service_python_runtime": binaries["service_python_runtime"],
+                "service_pywin32_runtime": binaries["service_pywin32_runtime"],
                 "package": {
                     "relative_path": EXACT_RUNTIME_PACKAGE_RELATIVE_PATH,
                     "inventory_algorithm": EXACT_RUNTIME_PACKAGE_INVENTORY_ALGORITHM,
