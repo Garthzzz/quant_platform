@@ -14732,24 +14732,62 @@ class LocalDeploymentPersistence:
         candidate_id = str(candidate["release_id"])
         final = self.layout.releases / candidate_id
         quarantine_parent = self.layout.temporary / "f"
-        quarantine_name = hashlib.sha256(
+        quarantine_name = "q"
+        quarantine_digest = hashlib.sha256(
             _identity.canonical_bytes(
                 {
                     "attempt": attempt,
                     "candidate": candidate,
                 }
             )
-        ).hexdigest()[:32]
+        ).hexdigest()
         quarantine = quarantine_parent / quarantine_name
+        legacy_parent = self.layout.temporary / "failure-release-cleanup"
+        legacy_name = f"failure-{quarantine_digest[:48]}.partial"
+        legacy_quarantine = legacy_parent / legacy_name
         final_present = self._safe_root.preflight(
             final, expected_kind="directory", allow_absent=True
         )
         quarantine_present = self._safe_root.preflight(
             quarantine, expected_kind="directory", allow_absent=True
         )
-        if final_present is not None and quarantine_present is not None:
+        legacy_present = self._safe_root.preflight(
+            legacy_quarantine,
+            expected_kind="directory",
+            allow_absent=True,
+        )
+        if sum(
+            item is not None
+            for item in (final_present, quarantine_present, legacy_present)
+        ) > 1:
             raise RetentionPlanningError(
-                "failure candidate exists in releases and quarantine"
+                "failure candidate exists in multiple cleanup namespaces"
+            )
+        if legacy_present is not None:
+            with _BoundDirectory(
+                self._safe_root, self.layout.temporary
+            ) as temporary_guard:
+                if self._safe_root.preflight(
+                    quarantine_parent,
+                    expected_kind="directory",
+                    allow_absent=True,
+                ) is None:
+                    temporary_guard.mkdir(quarantine_parent.name, 0o700)
+                    temporary_guard.flush()
+            with _BoundDirectory(
+                self._safe_root, legacy_parent
+            ) as source_guard, _BoundDirectory(
+                self._safe_root, quarantine_parent
+            ) as destination_guard:
+                destination_guard.replace_from(
+                    source_guard,
+                    source_name=legacy_name,
+                    destination_name=quarantine_name,
+                )
+                source_guard.flush()
+                destination_guard.flush()
+            quarantine_present = self._safe_root.preflight(
+                quarantine, expected_kind="directory", allow_absent=False
             )
         if final_present is not None:
             entry, _manifest = self._scan_release(final)
@@ -14867,6 +14905,23 @@ class LocalDeploymentPersistence:
         with _BoundDirectory(self._safe_root, quarantine_parent) as parent:
             parent.rmdir(quarantine_name)
             parent.flush()
+        with os.scandir(quarantine_parent) as entries:
+            if not any(entries):
+                with _BoundDirectory(
+                    self._safe_root, self.layout.temporary
+                ) as temporary_guard:
+                    temporary_guard.rmdir(quarantine_parent.name)
+                    temporary_guard.flush()
+        if self._safe_root.preflight(
+            legacy_parent, expected_kind="directory", allow_absent=True
+        ) is not None:
+            with os.scandir(legacy_parent) as entries:
+                if not any(entries):
+                    with _BoundDirectory(
+                        self._safe_root, self.layout.temporary
+                    ) as temporary_guard:
+                        temporary_guard.rmdir(legacy_parent.name)
+                        temporary_guard.flush()
         return True
 
     def execute_retention_cleanup(

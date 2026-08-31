@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -916,6 +917,27 @@ class ExactDeploymentControllerTests(unittest.TestCase):
                         lock=lock, attempt_id="activate-r1"
                     )
                 )
+                legacy_digest = hashlib.sha256(
+                    identity.canonical_bytes(
+                        {
+                            "attempt": "activate-r1",
+                            "candidate": failed["candidate"],
+                        }
+                    )
+                ).hexdigest()[:48]
+                legacy_quarantine = (
+                    persistence.layout.temporary
+                    / "failure-release-cleanup"
+                    / f"failure-{legacy_digest}.partial"
+                )
+                self._materialize(legacy_quarantine, r1, b"candidate")
+                self.assertTrue(
+                    persistence.cleanup_failed_candidate(
+                        lock=lock, attempt_id="activate-r1"
+                    )
+                )
+                self.assertFalse(legacy_quarantine.exists())
+                self.assertFalse((persistence.layout.temporary / "f").exists())
             finally:
                 if lock.held:
                     lock.release()
