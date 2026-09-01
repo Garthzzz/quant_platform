@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from dataclasses import fields
 import hashlib
 import http.client
@@ -150,8 +151,12 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
                     calls.append("sync")
                     return "synced"
 
+            class LegacyCollaboration:
+                pass
+
             namespace: dict[str, object] = {
                 "ResearchWorkspace": LegacyWorkspace,
+                "ArchiveCollaboration": LegacyCollaboration,
                 "_SCHEMA": "CREATE TABLE legacy_marker(id INTEGER PRIMARY KEY);",
             }
             exec(
@@ -168,7 +173,9 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
 
             with patch.object(
                 subject, "_install_legacy_writer_lease_adapter"
-            ) as install_adapter:
+            ) as install_adapter, patch.object(
+                subject, "_install_legacy_comment_identity_adapter"
+            ) as install_identity_adapter:
                 result = subject._create_release_application(
                     create_app,
                     LegacySettings,
@@ -179,11 +186,66 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
 
             self.assertIsNone(result)
             install_adapter.assert_called_once()
+            install_identity_adapter.assert_called_once_with(LegacyCollaboration)
             self.assertEqual([], calls)
             self.assertIs(LegacyWorkspace.sync_if_changed, original_workspace_sync)
             self.assertEqual("synced", LegacyWorkspace().sync_if_changed())
             settings.ensure_runtime_directories()
             self.assertEqual(["sync", "ensure"], calls)
+
+    def test_v39_comment_canary_uses_explicit_identity_authority(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        @contextmanager
+        def archive_connection(_settings: object):  # type: ignore[no-untyped-def]
+            raise AssertionError("explicit canary identity must not query Archive")
+            yield
+
+        namespace: dict[str, object] = {"archive_connection": archive_connection}
+        exec(
+            "class LegacyCollaboration:\n"
+            "    def __init__(self, settings, *, comment_database_path=None):\n"
+            "        self.settings = settings\n"
+            "        self.comment_database_path = comment_database_path\n"
+            "    def create_comment(self, research_id, actor, body, *, idempotency_key):\n"
+            "        with archive_connection(self.settings) as archive:\n"
+            "            exists = archive.execute('SELECT 1 FROM research WHERE research_id=?', (research_id,)).fetchone() is not None\n"
+            "        return (exists, research_id, actor, body, idempotency_key)\n",
+            namespace,
+        )
+        legacy_type = namespace["LegacyCollaboration"]
+
+        class Authority:
+            @staticmethod
+            def comment_research_exists(research_id: str) -> bool:
+                calls.append(("exists", research_id))
+                return research_id == "canary-research"
+
+            @staticmethod
+            def validate_comment_target(
+                research_id: str, target: object, material: object
+            ) -> None:
+                calls.append(("target", (research_id, target, material)))
+
+        subject._install_legacy_comment_identity_adapter(legacy_type)  # type: ignore[arg-type]
+        service = legacy_type(  # type: ignore[operator]
+            object(),
+            comment_database_path=Path("comments.sqlite3"),
+            comment_identity_authority=Authority(),
+        )
+
+        self.assertEqual(
+            (True, "canary-research", "actor", "body", "create-1"),
+            service.create_comment(  # type: ignore[attr-defined]
+                "canary-research",
+                "actor",
+                "body",
+                idempotency_key="create-1",
+            ),
+        )
+        self.assertEqual("exists", calls[0][0])
+        self.assertEqual("target", calls[1][0])
+        self.assertIs(namespace["archive_connection"], archive_connection)
 
     def test_expand_only_v2_store_is_accepted_without_writes(self) -> None:
         from quant_hub.collaboration.comment_store import initialize_comment_store

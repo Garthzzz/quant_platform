@@ -745,6 +745,134 @@ def _install_legacy_writer_lease_adapter(
     )
 
 
+class _V39KnownResearchConnection:
+    """Expose only the one immutable existence fact required by the V39 canary."""
+
+    __slots__ = ("_research_id",)
+
+    def __init__(self, research_id: str):
+        self._research_id = research_id
+
+    def execute(self, statement: str, parameters: object = ()) -> object:
+        normalized = " ".join(statement.split())
+        if (
+            normalized != "SELECT 1 FROM research WHERE research_id=?"
+            or parameters != (self._research_id,)
+        ):
+            raise ExactRuntimeServerError(
+                "legacy comment identity adapter received an unexpected query"
+            )
+        return self
+
+    @staticmethod
+    def fetchone() -> tuple[int]:
+        return (1,)
+
+
+def _install_legacy_comment_identity_adapter(
+    collaboration_type: type[object],
+) -> None:
+    """Let the sealed V39 comment service consume the exact canary authority."""
+
+    original_init = getattr(collaboration_type, "__init__", None)
+    original_create = getattr(collaboration_type, "create_comment", None)
+    create_globals = getattr(original_create, "__globals__", None)
+    original_archive_connection = (
+        create_globals.get("archive_connection")
+        if type(create_globals) is dict
+        else None
+    )
+    if (
+        not callable(original_init)
+        or not callable(original_create)
+        or type(create_globals) is not dict
+        or not callable(original_archive_connection)
+    ):
+        raise ExactRuntimeServerError(
+            "legacy comment identity adapter target is unavailable"
+        )
+    if hasattr(collaboration_type, "_exact_runtime_v39_identity_adapter"):
+        raise ExactRuntimeServerError(
+            "legacy comment identity adapter target already exists"
+        )
+
+    def initialize(
+        instance: object,
+        settings: object,
+        *,
+        comment_database_path: Path | None = None,
+        comment_identity_authority: object | None = None,
+    ) -> None:
+        original_init(  # type: ignore[operator]
+            instance,
+            settings,
+            comment_database_path=comment_database_path,
+        )
+        setattr(
+            instance,
+            "_exact_runtime_comment_identity_authority",
+            comment_identity_authority,
+        )
+
+    def create_comment(
+        instance: object,
+        research_id: str,
+        actor: object,
+        body: str,
+        *,
+        idempotency_key: str,
+    ) -> object:
+        authority = getattr(
+            instance, "_exact_runtime_comment_identity_authority", None
+        )
+        if authority is None:
+            return original_create(  # type: ignore[operator]
+                instance,
+                research_id,
+                actor,
+                body,
+                idempotency_key=idempotency_key,
+            )
+        research_exists = getattr(authority, "comment_research_exists", None)
+        validate_target = getattr(authority, "validate_comment_target", None)
+        if not callable(research_exists) or not callable(validate_target):
+            raise ExactRuntimeServerError(
+                "legacy comment identity authority contract is incomplete"
+            )
+        material = {"target_kind": "research", "document_id": None}
+        if (
+            research_exists(research_id) is not True
+            or validate_target(research_id, None, material) is not None
+        ):
+            raise ExactRuntimeServerError(
+                "legacy comment identity authority rejected the canary target"
+            )
+        if create_globals.get("archive_connection") is not original_archive_connection:
+            raise ExactRuntimeServerError(
+                "legacy archive connection binding drifted"
+            )
+
+        @contextmanager
+        def known_research_connection(_settings: object) -> Iterator[object]:
+            yield _V39KnownResearchConnection(research_id)
+
+        create_globals["archive_connection"] = known_research_connection
+        try:
+            return original_create(  # type: ignore[operator]
+                instance,
+                research_id,
+                actor,
+                body,
+                idempotency_key=idempotency_key,
+            )
+        finally:
+            create_globals["archive_connection"] = original_archive_connection
+
+    setattr(collaboration_type, "__init__", initialize)
+    setattr(collaboration_type, "create_comment", create_comment)
+    setattr(collaboration_type, "_exact_runtime_v39_identity_adapter", True)
+
+
 def _create_release_application(
     create_app: object,
     settings_type: type[object],
@@ -763,10 +891,16 @@ def _create_release_application(
         raise ExactRuntimeServerError("legacy application globals are unavailable")
     original_initializer = application_globals.get("initialize_comment_store")
     workspace_type = application_globals.get("ResearchWorkspace")
+    collaboration_type = application_globals.get("ArchiveCollaboration")
     original_workspace_sync = getattr(workspace_type, "sync_if_changed", None)
-    if not isinstance(workspace_type, type) or not callable(original_workspace_sync):
+    if (
+        not isinstance(workspace_type, type)
+        or not isinstance(collaboration_type, type)
+        or not callable(original_workspace_sync)
+    ):
         raise ExactRuntimeServerError("legacy workspace initializer is unavailable")
     _install_legacy_writer_lease_adapter(original_initializer, workspace_type)
+    _install_legacy_comment_identity_adapter(collaboration_type)
     original_ensure = getattr(settings_type, "ensure_runtime_directories", None)
     if not callable(original_ensure):
         raise ExactRuntimeServerError("legacy runtime initializer is unavailable")
