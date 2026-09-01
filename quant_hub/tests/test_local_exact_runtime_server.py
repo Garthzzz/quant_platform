@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import fields
+import hashlib
 import http.client
 import inspect
 import json
@@ -96,6 +97,60 @@ class _FakeRunner:
     def run(self, lease: object, challenge: str) -> _Evidence:
         self.calls.append((lease, challenge))
         return _Evidence(challenge)
+
+
+class LegacyCommentCompatibilityTests(unittest.TestCase):
+    def test_expand_only_v2_store_is_accepted_without_writes(self) -> None:
+        from quant_hub.collaboration.comment_store import initialize_comment_store
+
+        with tempfile.TemporaryDirectory(prefix="qrh-v39-comment-v2-") as directory:
+            database = Path(directory) / "comments.sqlite3"
+            initialize_comment_store(database)
+            before = hashlib.sha256(database.read_bytes()).hexdigest()
+            compatible = subject._legacy_comment_store_v2_compatible_initializer(
+                initialize_comment_store
+            )
+
+            self.assertEqual(
+                {
+                    "actors": 0,
+                    "comments": 0,
+                    "events": 0,
+                    "receipts": 0,
+                    "outbox": 0,
+                },
+                compatible(database),  # type: ignore[operator]
+            )
+            self.assertEqual(before, hashlib.sha256(database.read_bytes()).hexdigest())
+
+    def test_v2_marker_without_v1_objects_fails_closed(self) -> None:
+        from quant_hub.collaboration.comment_store import initialize_comment_store
+
+        with tempfile.TemporaryDirectory(prefix="qrh-v39-comment-invalid-") as directory:
+            database = Path(directory) / "comments.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE comment_store_schema(
+                        version INTEGER PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    );
+                    INSERT INTO comment_store_schema VALUES(1,'test');
+                    INSERT INTO comment_store_schema VALUES(2,'test');
+                    """
+                )
+            finally:
+                connection.close()
+            compatible = subject._legacy_comment_store_v2_compatible_initializer(
+                initialize_comment_store
+            )
+
+            with self.assertRaisesRegex(
+                subject.ExactRuntimeServerError,
+                "comment store validation failed",
+            ):
+                compatible(database)  # type: ignore[operator]
 
 
 class ExactRuntimeServerTests(unittest.TestCase):

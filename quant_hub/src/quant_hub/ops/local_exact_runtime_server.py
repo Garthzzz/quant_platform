@@ -13,6 +13,7 @@ from pathlib import PureWindowsPath
 import re
 import secrets
 import socket
+import sqlite3
 import stat
 import threading
 from typing import Mapping
@@ -55,6 +56,14 @@ _CANONICAL_REQUEST_LINE_RE = re.compile(
 _MAX_CANONICAL_REQUEST_LINE_BYTES = 8192
 _MAX_CANARY_REQUEST_BYTES = 512
 _READ_ONLY_DATABASE_ROOT_ENV = "QUANT_HUB_READ_ONLY_DATABASE_ROOT"
+_V39_BASELINE_RELEASE_ID = "v39-baseline-20260731-hotfix1"
+_V39_BASELINE_MANIFEST_SHA256 = (
+    "6e26dcf34d8323eafb5db4229781579425ff01dad4dcc4a25dd322c3e4eec819"
+)
+_V39_LEGACY_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
+_V39_SOURCE_ARCHIVE_SHA256 = (
+    "92a9c569865113e04b0ae5e864e9d586180941c16b490a1af6551694ddfce5b4"
+)
 
 
 class ExactRuntimeServerError(RuntimeError):
@@ -396,6 +405,203 @@ def _fix_release_read_only_root(runtime: Path) -> None:
     if not resolved.is_dir():
         raise ExactRuntimeServerError("release runtime root is unavailable")
     os.environ[_READ_ONLY_DATABASE_ROOT_ENV] = str(resolved)
+
+
+def _legacy_comment_store_v2_compatible_initializer(initializer: object) -> object:
+    """Let the sealed V39 prior read an expand-only v2 comment store.
+
+    V39 understands the complete v1 comment contract but rejects the later
+    ``[1, 2]`` marker before it can serve the deployment probe.  Version 2 only
+    adds progress tables, so a transient, admission-closed V39 process can
+    safely use its v1 read model.  This adapter is deliberately read-only: it
+    validates the original v1 objects and never removes a marker or migrates
+    shared state backwards.
+    """
+
+    if not callable(initializer):
+        raise ExactRuntimeServerError("legacy comment initializer is unavailable")
+    initializer_globals = getattr(initializer, "__globals__", None)
+    schema = (
+        initializer_globals.get("_SCHEMA")
+        if type(initializer_globals) is dict
+        else None
+    )
+    if type(schema) is not str or not schema.strip():
+        raise ExactRuntimeServerError("legacy comment schema is unavailable")
+
+    expected = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        expected.executescript(schema)
+        expected_objects = {
+            (str(row[0]), str(row[1]), str(row[2]))
+            for row in expected.execute(
+                """
+                SELECT type,name,tbl_name
+                FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        expected_columns = {
+            name: tuple(
+                (str(row[1]), str(row[2]), int(row[3]), int(row[5]))
+                for row in expected.execute(f'PRAGMA table_info("{name}")')
+            )
+            for object_type, name, _table_name in expected_objects
+            if object_type == "table"
+        }
+    finally:
+        expected.close()
+
+    def initialize(
+        database_path: Path,
+        *,
+        legacy_archive_path: Path | None = None,
+    ) -> dict[str, int]:
+        try:
+            resolved = database_path.resolve(strict=True)
+            connection = sqlite3.connect(
+                f"file:{resolved.as_posix()}?mode=ro",
+                uri=True,
+                timeout=10,
+            )
+        except (OSError, sqlite3.Error) as error:
+            raise ExactRuntimeServerError(
+                "legacy comment database is unavailable"
+            ) from error
+        try:
+            versions = tuple(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_store_schema ORDER BY version"
+                )
+            )
+            if versions != (1, 2):
+                return initializer(  # type: ignore[operator]
+                    database_path,
+                    legacy_archive_path=legacy_archive_path,
+                )
+            extension_versions = tuple(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT version FROM comment_target_schema ORDER BY version"
+                )
+            )
+            if extension_versions != (3,):
+                raise ExactRuntimeServerError(
+                    "legacy-compatible comment target marker is invalid"
+                )
+            actual_objects = {
+                (str(row[0]), str(row[1]), str(row[2]))
+                for row in connection.execute(
+                    """
+                    SELECT type,name,tbl_name
+                    FROM sqlite_master
+                    WHERE name NOT LIKE 'sqlite_%'
+                    """
+                )
+            }
+            if not expected_objects.issubset(actual_objects):
+                raise ExactRuntimeServerError(
+                    "legacy v1 comment objects are incomplete in v2 state"
+                )
+            required_extension_tables = {
+                "comment_target",
+                "comment_target_schema",
+                "progress_command_receipt",
+                "progress_topic",
+                "progress_topic_event",
+            }
+            actual_tables = {
+                name for object_type, name, _table_name in actual_objects
+                if object_type == "table"
+            }
+            if not required_extension_tables.issubset(actual_tables):
+                raise ExactRuntimeServerError(
+                    "legacy-compatible comment extensions are incomplete"
+                )
+            for name, columns in expected_columns.items():
+                actual_columns = tuple(
+                    (str(row[1]), str(row[2]), int(row[3]), int(row[5]))
+                    for row in connection.execute(f'PRAGMA table_info("{name}")')
+                )
+                if actual_columns != columns:
+                    raise ExactRuntimeServerError(
+                        f"legacy v1 comment table differs in v2 state: {name}"
+                    )
+            if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ExactRuntimeServerError(
+                    "legacy-compatible comment store integrity check failed"
+                )
+            connection.execute("PRAGMA foreign_keys=ON")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise ExactRuntimeServerError(
+                    "legacy-compatible comment store foreign key check failed"
+                )
+        except sqlite3.Error as error:
+            raise ExactRuntimeServerError(
+                "legacy-compatible comment store validation failed"
+            ) from error
+        finally:
+            connection.close()
+        return {
+            "actors": 0,
+            "comments": 0,
+            "events": 0,
+            "receipts": 0,
+            "outbox": 0,
+        }
+
+    return initialize
+
+
+def _legacy_read_only_runtime_directories(settings: object) -> None:
+    """Validate V39's sealed runtime root without creating new release paths."""
+
+    runtime = getattr(settings, "var_root", None)
+    if type(runtime) is not Path:
+        raise ExactRuntimeServerError("legacy runtime root is unavailable")
+    try:
+        resolved = runtime.resolve(strict=True)
+    except OSError as error:
+        raise ExactRuntimeServerError("legacy runtime root is unavailable") from error
+    if not resolved.is_dir():
+        raise ExactRuntimeServerError("legacy runtime root is not a directory")
+
+
+def _create_release_application(
+    create_app: object,
+    settings_type: type[object],
+    settings: object,
+    config: dict[str, object],
+    *,
+    v39_compatibility: bool,
+) -> object:
+    if not callable(create_app):
+        raise ExactRuntimeServerError("release application factory is unavailable")
+    if not v39_compatibility:
+        return create_app(settings, config)  # type: ignore[operator]
+
+    application_globals = getattr(create_app, "__globals__", None)
+    if type(application_globals) is not dict:
+        raise ExactRuntimeServerError("legacy application globals are unavailable")
+    original_initializer = application_globals.get("initialize_comment_store")
+    original_ensure = getattr(settings_type, "ensure_runtime_directories", None)
+    if not callable(original_ensure):
+        raise ExactRuntimeServerError("legacy runtime initializer is unavailable")
+    application_globals["initialize_comment_store"] = (
+        _legacy_comment_store_v2_compatible_initializer(original_initializer)
+    )
+    setattr(
+        settings_type,
+        "ensure_runtime_directories",
+        _legacy_read_only_runtime_directories,
+    )
+    try:
+        return create_app(settings, config)  # type: ignore[operator]
+    finally:
+        application_globals["initialize_comment_store"] = original_initializer
+        setattr(settings_type, "ensure_runtime_directories", original_ensure)
 
 
 def _trusted_origins() -> tuple[str, ...]:
@@ -978,6 +1184,14 @@ def _build_application(
     source_kind = application.get("source_kind")
     if source_kind not in {"git", "legacy_broadcast"}:
         raise ExactRuntimeServerError("release application source kind is invalid")
+    v39_compatibility = (
+        source_kind == "legacy_broadcast"
+        and closure.manifest_sha256 == _V39_BASELINE_MANIFEST_SHA256
+        and release_ref.get("release_id") == _V39_BASELINE_RELEASE_ID
+        and application.get("legacy_deployment_id") == _V39_LEGACY_DEPLOYMENT_ID
+        and application.get("source_archive_sha256") == _V39_SOURCE_ARCHIVE_SHA256
+        and application.get("build_tool_version") == "qrh-freeze-v39/v1"
+    )
     session_secret = _secret(session)
     state_checkpoint = _RuntimeStateCheckpoint(
         protected_paths=(session, digest),
@@ -1002,7 +1216,13 @@ def _build_application(
         }
         if source_kind == "git":
             config["GENERIC_RESEARCH_RELEASE_ROOT"] = release
-        app = create_app(settings, config)
+        app = _create_release_application(
+            create_app,
+            Settings,
+            settings,
+            config,
+            v39_compatibility=v39_compatibility,
+        )
 
         @app.before_request
         def exact_runtime_request_checkpoint() -> None:
