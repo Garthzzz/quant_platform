@@ -1459,7 +1459,7 @@ def _assert_exact_production_process(
         raise WindowsWriterLeaseHolderError(
             "production writer lease 必须禁用 bytecode 写入"
         )
-    pycache_sentinel = _PYCACHE_PARENT / nonce
+    pycache_sentinel = Path(str(_PYCACHE_PARENT / nonce))
     sentinel_identity = (
         {"boot_nonce": nonce} if steady else {"start_nonce": nonce}
     )
