@@ -776,7 +776,7 @@ def _source_seal_hashes(
     canary: LockedExactRuntimeCanaryInput,
 ) -> dict[str, str]:
     return {
-        name: hashlib.sha256(canary.source_seal(name).canonical_bytes()).hexdigest()
+        name: canary.source_seal(name).seal_sha256
         for name in _DATABASE_ORDER
     }
 

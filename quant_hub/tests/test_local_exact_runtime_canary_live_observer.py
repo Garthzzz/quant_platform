@@ -71,6 +71,18 @@ class _WorkspaceCloseProbe:
 
 
 class ExactRuntimeCanaryLiveObserverContractTests(unittest.TestCase):
+    def test_source_seal_rows_use_the_sealed_protocol_identity(self) -> None:
+        canary = mock.Mock()
+        seals = {
+            "comments": "a" * 64,
+            "research_workspace": "b" * 64,
+        }
+        canary.source_seal.side_effect = lambda name: mock.Mock(
+            seal_sha256=seals[name]
+        )
+
+        self.assertEqual(seals, observer._source_seal_hashes(canary))  # noqa: SLF001
+
     def test_product_surface_is_fixed_exact_sealed_and_non_serializable(self) -> None:
         self.assertEqual(
             [],
