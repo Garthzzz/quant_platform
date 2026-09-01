@@ -668,86 +668,91 @@ def _install_legacy_writer_lease_adapter(
         else None
     )
     workspace_database_globals = getattr(workspace_connection, "__globals__", None)
-    original_connect = (
-        initializer_globals.get("connect_database")
-        if type(initializer_globals) is dict
-        else None
-    )
-    platform_globals = getattr(original_connect, "__globals__", None)
-    configured_read_only = (
-        platform_globals.get("_configured_read_only")
-        if type(platform_globals) is dict
-        else None
-    )
-    validate_paths = (
-        platform_globals.get("_validate_database_paths")
-        if type(platform_globals) is dict
-        else None
-    )
-    ensure_safe = (
-        platform_globals.get("ensure_no_reparse_components")
-        if type(platform_globals) is dict
-        else None
-    )
-    if not all(
-        callable(value)
-        for value in (
-            original_connect,
-            configured_read_only,
-            validate_paths,
-            ensure_safe,
-        )
-    ):
-        raise ExactRuntimeServerError("legacy platform database contract is unavailable")
     if (
         type(initializer_globals) is not dict
         or type(workspace_database_globals) is not dict
-        or type(platform_globals) is not dict
-        or workspace_database_globals.get("connect_database") is not original_connect
     ):
         raise ExactRuntimeServerError("legacy business database adapters are incomplete")
-    if "_exact_runtime_writer_lease_transaction_scope" in platform_globals:
-        raise ExactRuntimeServerError("legacy writer lease adapter target already exists")
 
-    def connect_database(path: Path) -> sqlite3.Connection:
-        lease = _V39_EXACT_RUNTIME_WRITER_LEASE.get()
-        if lease is None:
-            return original_connect(path)  # type: ignore[operator]
-        resolved_path = Path(path).absolute()
-        ensure_safe(resolved_path.parent)  # type: ignore[operator]
-        if configured_read_only(resolved_path):  # type: ignore[operator]
-            return original_connect(resolved_path)  # type: ignore[operator]
-        resolved_path.parent.mkdir(parents=True, exist_ok=True)
-        ensure_safe(resolved_path.parent)  # type: ignore[operator]
-        validate_paths(resolved_path)  # type: ignore[operator]
-        connection = sqlite3.connect(
-            resolved_path,
-            timeout=10.0,
-            isolation_level=None,
-            factory=_V39ExactRuntimeWriterFencedConnection,
+    def install_business_binding(namespace: dict[str, object]) -> None:
+        original_connect = namespace.get("connect_database")
+        platform_globals = getattr(original_connect, "__globals__", None)
+        configured_read_only = (
+            platform_globals.get("_configured_read_only")
+            if type(platform_globals) is dict
+            else None
         )
-        if type(connection) is not _V39ExactRuntimeWriterFencedConnection:
-            sqlite3.Connection.close(connection)
-            raise ExactRuntimeServerError("legacy fenced SQLite factory drifted")
-        try:
-            connection._bind_writer_lease(lease)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("PRAGMA busy_timeout = 10000")
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            validate_paths(resolved_path, require_database=True)  # type: ignore[operator]
-        except BaseException:
-            sqlite3.Connection.close(connection)
-            raise
-        return connection
+        validate_paths = (
+            platform_globals.get("_validate_database_paths")
+            if type(platform_globals) is dict
+            else None
+        )
+        ensure_safe = (
+            platform_globals.get("ensure_no_reparse_components")
+            if type(platform_globals) is dict
+            else None
+        )
+        if not all(
+            callable(value)
+            for value in (
+                original_connect,
+                configured_read_only,
+                validate_paths,
+                ensure_safe,
+            )
+        ) or type(platform_globals) is not dict:
+            raise ExactRuntimeServerError(
+                "legacy platform database contract is unavailable"
+            )
+        existing_scope = platform_globals.get(
+            "_exact_runtime_writer_lease_transaction_scope"
+        )
+        if existing_scope not in {None, _legacy_writer_lease_transaction_scope}:
+            raise ExactRuntimeServerError(
+                "legacy writer lease adapter target already exists"
+            )
 
-    initializer_globals["connect_database"] = connect_database
-    workspace_database_globals["connect_database"] = connect_database
-    platform_globals["connect_database"] = connect_database
-    platform_globals["_exact_runtime_writer_lease_transaction_scope"] = (
-        _legacy_writer_lease_transaction_scope
-    )
+        def connect_database(path: Path) -> sqlite3.Connection:
+            lease = _V39_EXACT_RUNTIME_WRITER_LEASE.get()
+            if lease is None:
+                return original_connect(path)  # type: ignore[operator]
+            resolved_path = Path(path).absolute()
+            ensure_safe(resolved_path.parent)  # type: ignore[operator]
+            if configured_read_only(resolved_path):  # type: ignore[operator]
+                return original_connect(resolved_path)  # type: ignore[operator]
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_safe(resolved_path.parent)  # type: ignore[operator]
+            validate_paths(resolved_path)  # type: ignore[operator]
+            connection = sqlite3.connect(
+                resolved_path,
+                timeout=10.0,
+                isolation_level=None,
+                factory=_V39ExactRuntimeWriterFencedConnection,
+            )
+            if type(connection) is not _V39ExactRuntimeWriterFencedConnection:
+                sqlite3.Connection.close(connection)
+                raise ExactRuntimeServerError("legacy fenced SQLite factory drifted")
+            try:
+                connection._bind_writer_lease(lease)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA busy_timeout = 10000")
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
+                validate_paths(resolved_path, require_database=True)  # type: ignore[operator]
+            except BaseException:
+                sqlite3.Connection.close(connection)
+                raise
+            return connection
+
+        namespace["connect_database"] = connect_database
+        platform_globals["connect_database"] = connect_database
+        platform_globals["_exact_runtime_writer_lease_transaction_scope"] = (
+            _legacy_writer_lease_transaction_scope
+        )
+
+    install_business_binding(initializer_globals)
+    install_business_binding(workspace_database_globals)
 
 
 def _create_release_application(
