@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 
 from quant_hub.ops.release_identity import manifest_sha256
+from quant_hub.ops.local_deployment_persistence import _BoundDirectory, _SafeRoot
 from quant_hub.ops.local_windows_writer_lease_holder import (
     ExactRuntimeLeaseIdentity,
 )
@@ -207,12 +208,18 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                 "validate_production_vm_write_path",
                 side_effect=lambda value, allow_root=False: PureWindowsPath(value),
             ):
-                owner = windows_service_module.prepare_service_host_environment(root)
-                owner.append_status("host_failure_fixture")
-                self.assertFalse(owner._closed)
-                self.assertIsNotNone(owner._log_handle)
-                owner.close()
-                self.assertTrue(owner._closed)
+                controller_root_guard = _BoundDirectory(
+                    _SafeRoot(root, allow_posix_test_only=False),
+                    root,
+                    protect_rename=True,
+                )
+                with controller_root_guard:
+                    owner = windows_service_module.prepare_service_host_environment(root)
+                    owner.append_status("host_failure_fixture")
+                    self.assertFalse(owner._closed)
+                    self.assertIsNotNone(owner._log_handle)
+                    owner.close()
+                    self.assertTrue(owner._closed)
             self.assertEqual(
                 "host_failure_fixture\n",
                 (

@@ -859,20 +859,6 @@ class RootLockAndCasTests(PersistenceFixture):
                 self.root.rename(destination)
         self.assertTrue(self.root.is_dir())
 
-    @unittest.skipUnless(os.name == "nt", "Windows 双保护者语义只在产品 API 执行")
-    def test_two_root_rename_guards_can_coexist_and_still_block_rename(self) -> None:
-        destination = self.root.parent / f"{self.root.name}-held-twice"
-        safe_root = persistence_module._SafeRoot(  # noqa: SLF001
-            self.root, allow_posix_test_only=False
-        )
-        second = persistence_module._BoundDirectory(  # noqa: SLF001
-            safe_root, self.root, protect_rename=True
-        )
-        with self.persistence.global_lock(), second:
-            with self.assertRaises(OSError):
-                self.root.rename(destination)
-        self.assertTrue(self.root.is_dir())
-
     @unittest.skipUnless(os.name == "nt", "真实 no-share-delete 竞态只在 Windows 产品语义执行")
     def test_control_parent_swap_after_preflight_cannot_escape_first_write(self) -> None:
         with tempfile.TemporaryDirectory() as external_text:

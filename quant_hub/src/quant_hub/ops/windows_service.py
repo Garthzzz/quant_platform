@@ -256,7 +256,13 @@ class _ServiceHostDWriteOwner:
                 _BoundDirectory(
                     self._safe_root,
                     physical,
-                    protect_rename=True,
+                    # The deployment controller already owns the exclusive
+                    # root rename guard while SCM constructs the service.
+                    # Re-requesting DELETE/no-share-delete here deadlocks the
+                    # two legitimate owners.  Critical writable descendants
+                    # are each pinned exclusively below before their first
+                    # write and remain pinned for this owner's full lifetime.
+                    protect_rename=False,
                 )
             )
 
