@@ -274,6 +274,62 @@ class ExactRuntimeImportClosureTests(unittest.TestCase):
         self.assertTrue(lines[2].startswith(str(self.release)))
         self.assertTrue(lines[3].startswith(str(self.tooling_package.resolve())))
 
+    def test_legacy_broadcast_uses_guarded_tooling_access_gate(self) -> None:
+        access_gate = (
+            self.release
+            / "runtime_contract"
+            / "code"
+            / "src"
+            / "quant_hub"
+            / "web"
+            / "access_gate.py"
+        )
+        access_gate.unlink()
+        payloads = {
+            relative: raw
+            for relative, raw in self.payloads.items()
+            if not relative.endswith("web/access_gate.py")
+        }
+        document = _manifest("release-r1", payloads)
+        document["application"] = {
+            "source_kind": "legacy_broadcast",
+            "source_archive_sha256": "8" * 64,
+            "legacy_deployment_id": "legacy-v39",
+            "build_tool_version": "exact-import-tests/v1",
+            "provenance": {
+                "builder": "exact-import-tests",
+                "labels": [],
+            },
+        }
+        (self.release / "release_manifest.json").write_bytes(
+            canonical_bytes(document)
+        )
+        source_root = Path(__file__).parents[1] / "src"
+        code = (
+            "import pathlib,sys;"
+            f"sys.path.insert(0,{str(source_root)!r});"
+            "from quant_hub.ops.local_exact_runtime_import_closure import "
+            "TestOnlyExactRuntimeImportClosureAdapter as A;"
+            f"c=A.for_test_only(pathlib.Path({str(self.release)!r}),"
+            f"pathlib.Path({str(self.tooling_package.resolve())!r}));"
+            "c.activate();c.assert_application_sources();"
+            "from quant_hub.web.access_gate import install_access_gate;"
+            "print(pathlib.Path(install_access_gate.__code__.co_filename).resolve());"
+            "c.close()"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", code],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertTrue(
+            Path(completed.stdout.strip()).is_relative_to(
+                self.tooling_package.resolve()
+            )
+        )
+
     def test_product_surface_has_only_lease_input_and_no_dynamic_loader(self) -> None:
         self.assertEqual(
             ["lease"],

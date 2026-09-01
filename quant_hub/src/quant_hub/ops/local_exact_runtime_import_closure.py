@@ -71,8 +71,10 @@ _REQUIRED_APPLICATION_FILES = {
     "runtime_contract/code/src/quant_hub/collaboration/service.py",
     "runtime_contract/code/src/quant_hub/platform/db.py",
     "runtime_contract/code/src/quant_hub/research_workspace/service.py",
-    "runtime_contract/code/src/quant_hub/web/access_gate.py",
 }
+_ACCESS_GATE_APPLICATION_FILE = (
+    "runtime_contract/code/src/quant_hub/web/access_gate.py"
+)
 
 
 class ExactRuntimeImportClosureError(RuntimeError):
@@ -127,8 +129,19 @@ def _expected_inventory(
         for record in inventory["files"]
     )
     paths = {str(record["path"]) for record in records}
-    if not _REQUIRED_APPLICATION_FILES.issubset(paths):
-        missing = sorted(_REQUIRED_APPLICATION_FILES - paths)
+    application = document.get("application")
+    source_kind = (
+        application.get("source_kind") if type(application) is dict else None
+    )
+    required = set(_REQUIRED_APPLICATION_FILES)
+    if source_kind == "git":
+        required.add(_ACCESS_GATE_APPLICATION_FILE)
+    elif source_kind != "legacy_broadcast":
+        raise ExactRuntimeImportClosureError(
+            "exact release application source kind is invalid"
+        )
+    if not required.issubset(paths):
+        missing = sorted(required - paths)
         raise ExactRuntimeImportClosureError(
             "exact release lacks required application files: " + ",".join(missing)
         )
@@ -236,17 +249,17 @@ def _assert_release_snapshot(
     return document, guard_paths
 
 
-def _source_under_release(value: object, release_root: Path, *, label: str) -> None:
+def _source_under_root(value: object, source_root: Path, *, label: str) -> None:
     source_name = inspect.getsourcefile(value)
     if type(source_name) is not str:
         raise ExactRuntimeImportClosureError(f"{label} source is unavailable")
     try:
         source = Path(source_name).resolve(strict=True)
-        source.relative_to(release_root.resolve(strict=True))
+        source.relative_to(source_root.resolve(strict=True))
         info = source.lstat()
     except (OSError, ValueError) as error:
         raise ExactRuntimeImportClosureError(
-            f"{label} was not imported from the exact release"
+            f"{label} was not imported from its exact source root"
         ) from error
     if _is_reparse(info) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise ExactRuntimeImportClosureError(
@@ -514,6 +527,28 @@ class _LockedExactRuntimeImportClosure:
                 raise ExactRuntimeImportClosureError(
                     "package specs do not share the exact search-path objects"
                 )
+            application = self._manifest.get("application")
+            if (
+                type(application) is dict
+                and application.get("source_kind") == "legacy_broadcast"
+            ):
+                import quant_hub.web
+
+                release_web = release_package / "web"
+                tooling_web = tooling_package / "web"
+                web_file = Path(str(quant_hub.web.__file__)).resolve(strict=True)
+                web_path = quant_hub.web.__path__
+                web_spec = quant_hub.web.__spec__
+                if (
+                    web_file != release_web / "__init__.py"
+                    or type(web_path) is not list
+                    or web_spec is None
+                    or web_spec.submodule_search_locations is not web_path
+                ):
+                    raise ExactRuntimeImportClosureError(
+                        "legacy web package was not imported from the exact release"
+                    )
+                web_path[:] = [str(release_web), str(tooling_web)]
         except OSError as error:
             raise ExactRuntimeImportClosureError(
                 "exact package lookup paths are unavailable"
@@ -529,15 +564,24 @@ class _LockedExactRuntimeImportClosure:
         from quant_hub.research_workspace.service import ResearchWorkspace
         from quant_hub.web.access_gate import install_access_gate
 
+        application = self._manifest.get("application")
+        legacy = (
+            type(application) is dict
+            and application.get("source_kind") == "legacy_broadcast"
+        )
         for value, label in (
             (create_app, "create_app"),
             (ActorInput, "ActorInput"),
             (ArchiveCollaboration, "ArchiveCollaboration"),
             (Settings, "Settings"),
             (ResearchWorkspace, "ResearchWorkspace"),
-            (install_access_gate, "install_access_gate"),
         ):
-            _source_under_release(value, self._release_root, label=label)
+            _source_under_root(value, self._release_root, label=label)
+        _source_under_root(
+            install_access_gate,
+            self._tooling_package if legacy else self._release_root,
+            label="install_access_gate",
+        )
         self._assert_live()
 
     def _close_acquired(self) -> None:
