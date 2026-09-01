@@ -713,7 +713,11 @@ class LockedServiceTransientJournalStartFence:
                     f"journal:{name}", _JOURNAL_DIRECTORY / name
                 )
                 document = self._parse_canonical(
-                    raw, validate_deployment_journal, label="journal revision"
+                    raw,
+                    lambda value: validate_deployment_journal(
+                        value, _allow_legacy_scm_plan=True
+                    ),
+                    label="journal revision",
                 )
                 revision = int(revision_text)
                 if document["attempt"] != attempt or document["revision"] != revision:
@@ -747,7 +751,8 @@ class LockedServiceTransientJournalStartFence:
                 )
             try:
                 histories[folded] = validate_journal_history(
-                    [item[1] for item in values]
+                    [item[1] for item in values],
+                    _allow_legacy_scm_plan=True,
                 )
             except (TypeError, ValueError) as error:
                 raise ServiceTransientJournalStartFenceError(
