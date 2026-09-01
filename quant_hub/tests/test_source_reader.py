@@ -5,6 +5,7 @@ import os
 import subprocess
 from unittest.mock import patch
 
+from quant_hub.archive.catalog import ArchiveCatalog
 from quant_hub.archive.source_reader import (
     ReadOnlyArchiveAssetSource,
     ReadOnlyArchiveSource,
@@ -135,6 +136,29 @@ class SourceReaderTests(SettingsTestCase):
                 expected_sha256=sha256_hex(svg_payload),
                 expected_bytes=len(svg_payload),
             )
+
+    def test_catalog_can_use_an_explicit_verified_presentation_asset_root(self) -> None:
+        payload = b"\x89PNG\r\n\x1a\nexternal-presentation-fixture"
+        asset_root = self.root / "presentation-assets"
+        asset = asset_root / "研究" / "figure.png"
+        asset.parent.mkdir(parents=True)
+        asset.write_bytes(payload)
+        catalog = ArchiveCatalog(
+            self.settings,
+            presentation_asset_root=asset_root,
+        )
+        frozen = {
+            "asset_id": "fixture-figure",
+            "source_path": "研究/figure.png",
+            "sha256": sha256_hex(payload),
+            "bytes": len(payload),
+            "media_type": "image/png",
+            "filename": "figure.png",
+        }
+        with patch.object(catalog.presentation, "internal_asset", return_value=frozen):
+            content, identity = catalog.presentation_asset("fixture-figure")
+        self.assertEqual(payload, content)
+        self.assertEqual(frozen, identity)
 
     def test_real_windows_junction_component_is_rejected(self) -> None:
         if os.name != "nt":

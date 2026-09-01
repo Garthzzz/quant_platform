@@ -1,9 +1,11 @@
 # 研究员数据抓取、导入、检索与存储位置指南
 
-> 当前放行状态（2026-08-31）：最近一次 C→exact-D writer handoff 在 D ingress 前安全失败，
-> 旧 C 服务已恢复；D 侧尚无 active/prior，Stage 5 certificate 与 visibility closure 均未签发。
-> 当前现场及后续变更见 [`STAGE5_STAGE6_CLOSURE.md`](STAGE5_STAGE6_CLOSURE.md)。在该记录更新前，
-> 候选、历史本机 delivery、测试 PASS 和失败 handoff receipt 都不是生产放行证明。
+> 当前在线状态（2026-09-02）：Web 已由 VM exact-D 根内的 direct-D 兼容层恢复，入口为
+> `http://10.5.1.240:8765/login`，当前绑定 release
+> `release-2157a1209d85-227b30ef6fbb` 和同一份 D state。该现场恢复不等同于一次新的
+> release-controller writer handoff 或 Stage 5/6 证书签发；正式发布闭合状态仍以
+> [`STAGE5_STAGE6_CLOSURE.md`](STAGE5_STAGE6_CLOSURE.md) 为准。VM 的旧 C 路径和服务继续只读，
+> 候选、历史本机 delivery、测试 PASS 和失败 handoff receipt 都不能替代正式放行证据。
 
 > 适用对象：量化研究员、论文研究员、平台维护人员。  
 > 项目根：`D:\quant\quant_platform`。  
@@ -1254,6 +1256,7 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\control\writer-handoff-intents\*.json` | writer handoff 意图 |
 | `<VM_ROOT>\state\comments.sqlite3` | 当前生产评论与 Dashboard 外置状态 |
 | `<VM_ROOT>\state\research_workspace.sqlite3` | 当前研究树/观察/协作状态 |
+| `<VM_ROOT>\state\archive_presentation_assets\` | 当前 direct-D 兼容层使用的 12 个 Archive 展示 PNG；路径、长度和 SHA-256 仍由 `archive_presentation.json` 冻结，接口逐次验真，不能当作可编辑图片目录 |
 | `<VM_ROOT>\state\viewer_access_password.digest` | 访问口令的单向摘要；不得复制、替换或反推原口令 |
 | `<VM_ROOT>\state\viewer_secret.key` | Flask session 密钥；敏感受控文件，禁止读取、复制或写入文档/日志 |
 | `<VM_ROOT>\state\writer_lease.json` | 当前 writer lease 身份记录；工具维护 |
@@ -1262,6 +1265,7 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 | `<VM_ROOT>\audit\deployment_attempts\` | 部署尝试日志/证据 |
 | `<VM_ROOT>\audit\receipts\` | 幂等和部署收据 |
 | `<VM_ROOT>\audit\events\` | 生产事件审计 |
+| `<VM_ROOT>\audit\hotfix_backups\` | direct-D 兼容修复前的 D-tooling 单版本备份；仅用于精确回退对应修复，不是另一套恢复根 |
 | `<VM_ROOT>\audit\writer-handoff\success\*.json` | writer handoff 成功 receipt；create-only，不能人工补写 |
 | `<VM_ROOT>\audit\writer-handoff\failure\*.json` | writer handoff 失败/official rollback receipt；只证明所记录失败收敛，不授权 handoff |
 | `<VM_ROOT>\audit\release-closure\results\stage5\revocation-surface.json` | revocation 本地功能闭包结果；不是外部信任根 |
@@ -1293,6 +1297,45 @@ release 内密封的迁移和前端运行契约位于 `runtime_contract\...`。�
 准。VM 现有 `C:\quant_platform`、`C:\quant_platform_data` 及其服务在 writer
 handoff 门禁前仅可只读核验；local prior binding 和 audit receipt 也只是绑定/
 审计证据，不能单独授权启动或替换当前 state。
+
+#### 5.4.1 当前 direct-D Web 兼容层
+
+当前生产 Web 由 Windows SCM 服务 `QuantResearchHub` 托管，监听
+`0.0.0.0:8765`；浏览器入口是 `http://10.5.1.240:8765/login`。SCM 宿主和
+应用子进程都位于 `<VM_ROOT>\tooling\python\`，启动类是
+`quant_hub.ops.direct_windows_service.QuantResearchHubDirectWindowsService`。该兼容层不在
+C 盘创建或覆盖项目文件，也不读取另一台主机的恢复根。
+
+Archive 展示 manifest 中 12 个 Q2 实验 PNG 的原始 authority 仍是只读
+`reference\archive\yao\报告与数据\实验报告\reports\assets\`。当前 active release
+未携带这些二进制，因此 direct-D 服务把逐文件复制且验真的镜像放在
+`<VM_ROOT>\state\archive_presentation_assets\`。`service_entry.py` 只接受这个精确 D-state
+位置；`ArchiveCatalog.presentation_asset()` 仍使用 manifest 的 `source_path`、`bytes` 和
+`sha256` 验证后才返回内容。缺失、额外路径引用或内容漂移继续返回 409，不能降级为不验真读取。
+
+Windows 防火墙只开放 TCP 8765，来源限制为公司 `10.0.0.0/8`。VM 当前网卡被识别为
+Public，因此规则必须覆盖当前 profile；只配置 Domain/Private 会造成 VM loopback 为 200、
+研究员浏览器却连接超时。服务日志位于
+`<VM_ROOT>\logs\direct-scm.stdout.log` 和 `direct-scm.stderr.log`。
+
+全站性能门禁以认证态只读 GET 遍历为准：认证回跳、4xx/5xx、异常或任一路径完整响应
+达到 2000 ms 都失败。除 HTTP 全量遍历外，发布后还应从公司 VPN 地址使用真实浏览器，
+至少覆盖首页、研究更新、Evidence、Paper Lab、最大长章节和带 Archive PNG 的补充研究页，
+并以 `networkidle` 完成时间小于 2000 ms 为准。性能证据只能说明所记录 VM、数据规模和
+网络条件下的实测结果，不能外推成永不退化的口头保证；后续每次上线必须重跑门禁。
+
+门禁不是只爬首页可见链接。脚本内的 GET 路由契约必须与 Flask URL map 完全闭合，并强制
+检查 `/deploymentz`、`/healthz`、搜索接口以及 sealed 通用研究快照中的每个“当前版、历史版、
+受控原文”入口。HTML 中的 `href`、`src`、GET 表单 action、citation 和 JSON 中的 URL 字段
+都会继续扩展同源目标。报告必须同时记录并核对预期 release、manifest、knowledge snapshot、
+writer、每个响应的 `X-Quant-Hub-Release`、门禁脚本哈希与最终路径集合哈希；否则不能证明
+测到的是指定生产版本。
+
+通用研究 Markdown 的相对文档和图片只在展示层解析，不会回写正文。解析入口位于
+`generic_research/web.py` 的 `/knowledge/link/...` 受控代理：能够确认的目标进入正式通用研究
+或 Archive 页面；当前 reviewed snapshot 没有收录的文档显示明确说明；缺失图片显示说明性
+SVG。`generic_research/catalog.py` 对不可变 release 页面进行缓存，服务启动由 `app.py` 预热，
+避免超长研究每次点击都重建 IR/HTML。修改这些规则后必须重跑通用研究回归和全站 2 秒门禁。
 
 ### 5.5 MCP 客户端本地态
 
@@ -1372,6 +1415,7 @@ Stage 5 作为 PASS。verifier 要求目录实际文件集合与预期集合完�
 | 论文线索提取 | `quant_hub/src/quant_hub/integration/clues.py` |
 | Archive 解析/引用 marker | `quant_hub/src/quant_hub/archive/markdown.py` |
 | Archive 发现、原文读取与 release 目录 | `quant_hub/src/quant_hub/archive/discovery.py`、`source_reader.py` 与 `catalog.py` |
+| Archive 展示资源位置注入与逐文件验真 | `quant_hub/src/quant_hub/app.py`、`archive/catalog.py` 与 `archive/source_reader.py` |
 | Archive 数据库/业务服务 | `quant_hub/src/quant_hub/archive/database.py` 与 `service.py` |
 | Evidence 入库/服务 | `quant_hub/src/quant_hub/evidence/` |
 | Evidence provider 与权利状态 | `quant_hub/src/quant_hub/evidence/providers.py`、`resources.py` 与 `ingest.py` |
@@ -1402,6 +1446,8 @@ Stage 5 作为 PASS。verifier 要求目录实际文件集合与预期集合完�
 | VM 部署 CLI | `quant_hub/src/quant_hub/ops/vm_deploy_cli.py` |
 | VM 路径/状态实现 | `quant_hub/src/quant_hub/ops/local_deployment_persistence.py` |
 | exact-D 服务装配 | `quant_hub/src/quant_hub/ops/service_entry.py` 与 `quant_hub/src/quant_hub/ops/local_exact_runtime_server.py` |
+| 当前 direct-D SCM 兼容宿主 | `quant_hub/src/quant_hub/ops/direct_windows_service.py` |
+| 认证态全站 2 秒性能门禁 | `quant_hub/tools/authenticated_route_performance_gate.py` |
 | VM 固定工具链原子更新器 | `quant_hub/tools/update_vm_tooling.py` |
 | 本地审核启动器 | `quant_hub/tools/run_local.py` |
 

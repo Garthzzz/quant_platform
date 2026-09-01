@@ -382,6 +382,17 @@ def serve(
         "COMMENT_DATABASE_PATH": comment_db,
         "RESEARCH_WORKSPACE_DATABASE_PATH": workspace_db,
     }
+    direct_asset_root = os.environ.get("QRH_DIRECT_PRESENTATION_ASSET_ROOT")
+    if direct_asset_root:
+        presentation_assets = _regular(Path(direct_asset_root), directory=True)
+        expected_presentation_assets = _regular(
+            root / "state" / "archive_presentation_assets", directory=True
+        )
+        if presentation_assets != expected_presentation_assets:
+            raise ServiceEntryError(
+                "direct presentation asset root differs from reviewed D state"
+            )
+        application_config["ARCHIVE_PRESENTATION_ASSET_ROOT"] = presentation_assets
     generic_release_root = _generic_release_root(release, manifest)
     if generic_release_root is not None:
         application_config["GENERIC_RESEARCH_RELEASE_ROOT"] = generic_release_root

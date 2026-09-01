@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from pathlib import Path
 import re
 import sqlite3
 from typing import Any
@@ -87,11 +88,19 @@ def _object_id_from_urn(value: str) -> str:
 class ArchiveCatalog:
     """Archive 研究、不可变版本、release、页面和搜索的领域服务。"""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        presentation_asset_root: Path | None = None,
+    ):
         self.settings = settings
         self.object_store = ObjectStore(settings.object_root)
         self.presentation = ArchivePresentation.default()
         self.chapter_manifests = ArchiveChapterManifests.default()
+        self.presentation_asset_source = ReadOnlyArchiveAssetSource(
+            presentation_asset_root or settings.archive_root
+        )
         self._archive_link_index_cache: dict[str, dict[str, Any]] | None = None
 
     def initialize(self) -> dict[str, list[int]]:
@@ -2187,7 +2196,7 @@ class ArchiveCatalog:
         asset = self.presentation.internal_asset(asset_id)
         if asset is None:
             raise ArchiveNotFound("presentation asset is not approved")
-        snapshot = ReadOnlyArchiveAssetSource(self.settings.archive_root).read_verified(
+        snapshot = self.presentation_asset_source.read_verified(
             str(asset["source_path"]),
             expected_sha256=str(asset["sha256"]),
             expected_bytes=int(asset["bytes"]),

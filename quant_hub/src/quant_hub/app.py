@@ -54,13 +54,24 @@ def create_app(
         INITIALIZE_ARCHIVE_CATALOG=True,
         COMMENT_DATABASE_PATH=None,
         RESEARCH_WORKSPACE_DATABASE_PATH=None,
+        ARCHIVE_PRESENTATION_ASSET_ROOT=None,
         GENERIC_RESEARCH_CATALOG=None,
         GENERIC_RESEARCH_RELEASE_ROOT=None,
     )
     if config:
         app.config.update(config)
 
-    catalog = ArchiveCatalog(resolved)
+    configured_presentation_asset_root = app.config.get(
+        "ARCHIVE_PRESENTATION_ASSET_ROOT"
+    )
+    catalog = ArchiveCatalog(
+        resolved,
+        presentation_asset_root=(
+            Path(configured_presentation_asset_root)
+            if configured_presentation_asset_root is not None
+            else None
+        ),
+    )
     if app.config["INITIALIZE_ARCHIVE_CATALOG"]:
         catalog.initialize()
     # Link/anchor resolution is a publication artifact.  Warm the verified
@@ -133,6 +144,7 @@ def create_app(
             raise ConfigurationError(
                 "生产 generic research 必须显式配置 release 外 COMMENT_DATABASE_PATH。"
             )
+        generic_catalog.prewarm_pages()
         app.extensions["generic_research_catalog"] = generic_catalog
         if comment_database_path is not None:
             app.extensions["generic_research_collaboration"] = ArchiveCollaboration(

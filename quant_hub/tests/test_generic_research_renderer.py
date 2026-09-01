@@ -143,6 +143,41 @@ class GenericCatalogContractTests(unittest.TestCase):
             page.knowledge_cards[0].evidence_span_ids[0],
         )
 
+    def test_heading_span_can_anchor_accepted_knowledge(self) -> None:
+        source = b"# Evidence heading\n\nBody evidence.\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "heading.md").write_bytes(source)
+            report = ReferenceCompiler().compile(root)
+        assert report.candidate_snapshot is not None
+        snapshot = _ready_snapshot(report.candidate_snapshot)
+        document_id, version_id = next(iter(snapshot.active_membership.items()))
+        heading = next(
+            block
+            for block in snapshot.ir_documents[version_id].blocks
+            if block.kind == "heading"
+        )
+        card = GenericKnowledgeCard(
+            knowledge_id="kn_heading_evidence",
+            kind="summary",
+            title="Heading evidence",
+            statement="The accepted statement is anchored to the heading span.",
+            evidence_span_ids=(heading.source_span.span_id,),
+            acceptance="mechanically_verified",
+        )
+        catalog = GenericResearchCatalog(
+            snapshot,
+            {_sha256_bytes(source): source},
+            accepted_knowledge={version_id: (card,)},
+        )
+
+        page = catalog.page(document_id)
+
+        self.assertEqual(
+            heading.source_span.span_id,
+            page.knowledge_evidence[card.knowledge_id][0].span_id,
+        )
+
     def test_current_and_history_are_selected_from_one_snapshot_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -179,6 +214,78 @@ class GenericCatalogContractTests(unittest.TestCase):
             [second_version, first_version],
             [version.version_id for version in current.versions],
         )
+
+
+class GenericInternalLinkTests(SettingsTestCase):
+    def test_relative_markdown_link_redirects_to_generic_document_page(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "folder"
+            folder.mkdir()
+            first_source = b"# First\n\n[Second](second.md)\n"
+            second_source = b"# Second\n\nResolved target.\n"
+            (folder / "first.md").write_bytes(first_source)
+            (folder / "second.md").write_bytes(second_source)
+            report = ReferenceCompiler().compile(root)
+        assert report.candidate_snapshot is not None
+        snapshot = report.candidate_snapshot
+        by_path = {
+            record.canonical_path: document_id
+            for document_id, record in snapshot.documents.items()
+        }
+        first_id = by_path["folder/first.md"]
+        second_id = by_path["folder/second.md"]
+        first_version_id = snapshot.active_membership[first_id]
+        catalog = GenericResearchCatalog(
+            snapshot,
+            {
+                _sha256_bytes(first_source): first_source,
+                _sha256_bytes(second_source): second_source,
+            },
+        )
+        with _generic_only_legacy_shell():
+            app = create_app(
+                self.settings,
+                {"TESTING": True, "GENERIC_RESEARCH_CATALOG": catalog},
+            )
+        app.extensions["archive_catalog"] = None
+
+        client = app.test_client()
+        page = client.get(f"/knowledge/research/{first_id}/")
+        self.assertEqual(200, page.status_code)
+        self.assertIn(
+            f"/knowledge/link/{first_id}/{first_version_id}",
+            page.get_data(as_text=True),
+        )
+        redirect_response = client.get(
+            f"/knowledge/research/{first_id}/second.md"
+        )
+        self.assertEqual(302, redirect_response.status_code)
+        self.assertTrue(
+            redirect_response.headers["Location"].endswith(
+                f"/knowledge/research/{second_id}/"
+            )
+        )
+        resolved = client.get(
+            f"/knowledge/research/{first_id}/second.md", follow_redirects=True
+        )
+        self.assertEqual(200, resolved.status_code)
+        self.assertIn("Resolved target", resolved.get_data(as_text=True))
+
+        proxied = client.get(
+            f"/knowledge/link/{first_id}/{first_version_id}",
+            query_string={"kind": "href", "target": "second.md"},
+            follow_redirects=True,
+        )
+        self.assertEqual(200, proxied.status_code)
+        self.assertIn("Resolved target", proxied.get_data(as_text=True))
+
+        unavailable_asset = client.get(
+            f"/knowledge/link/{first_id}/{first_version_id}",
+            query_string={"kind": "src", "target": "missing.png"},
+        )
+        self.assertEqual(200, unavailable_asset.status_code)
+        self.assertEqual("image/svg+xml", unavailable_asset.mimetype)
 
 
 class RealQ5GenericRendererAcceptanceTests(SettingsTestCase):

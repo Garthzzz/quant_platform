@@ -435,6 +435,24 @@ class ResearchUpdateTests(SettingsTestCase):
         self.assertEqual(expected, api_ids)
         self.assertIn("最近研究更新", home.get_data(as_text=True))
 
+    def test_hidden_historical_research_has_no_broken_page_link(self) -> None:
+        with archive_connection(self.settings) as connection:
+            connection.execute(
+                "UPDATE research SET canonical_slug=? WHERE research_id=?",
+                (
+                    "archive-governance-and-navigation",
+                    self.published.research_id,
+                ),
+            )
+        update = self.collaboration.list_research_updates(limit=1)[0]
+        self.assertIsNone(update["page_url"])
+
+        history = self.client.get("/research-updates")
+        self.assertEqual(200, history.status_code)
+        html = history.get_data(as_text=True)
+        self.assertNotIn(f'/research/{self.published.research_id}', html)
+        self.assertIn("历史内容已并入当前研究专题", html)
+
     def test_service_idempotency_key_conflict_remains_explicit(self) -> None:
         update_id = self.collaboration.list_research_updates(limit=1)[0]["update_id"]
         created = self.collaboration.annotate_research_update(

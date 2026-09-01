@@ -932,9 +932,10 @@ class ArchiveCollaboration:
         ).fetchall()
         items: list[dict[str, Any]] = []
         for row in rows:
+            canonical_slug = str(row["canonical_slug"])
             title_snapshot = str(row["title_snapshot"])
             title = self.presentation.research_title(
-                str(row["canonical_slug"]), title_snapshot
+                canonical_slug, title_snapshot
             )
             annotation = None
             annotation_revision = 0
@@ -963,7 +964,11 @@ class ArchiveCollaboration:
                     "release_revision": int(row["release_revision"]),
                     "title": title,
                     "activated_at": str(row["activated_at"]),
-                    "page_url": f'/research/{row["research_id"]}',
+                    "page_url": (
+                        None
+                        if canonical_slug in self.presentation.hidden_research_slugs
+                        else f'/research/{row["research_id"]}'
+                    ),
                     "annotation": annotation,
                     "annotation_revision": annotation_revision,
                 }

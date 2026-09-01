@@ -11,6 +11,7 @@ import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import posixpath
 import re
 from types import MappingProxyType
 from typing import Literal, Mapping, Sequence
@@ -189,6 +190,7 @@ class GenericResearchCatalog:
                     "accepted knowledge requires a ready snapshot membership"
                 )
             self._validate_cards(version_id, cards)
+        self._page_cache: dict[tuple[str, str], GenericDocumentPage] = {}
 
     @property
     def base_snapshot(self) -> BaseSnapshot:
@@ -436,10 +438,68 @@ class GenericResearchCatalog:
             raise GenericCatalogError("snapshot source object digest mismatch")
         return source
 
+    def resolve_logical_link(
+        self,
+        target: str,
+        *,
+        source_document_id: str | None = None,
+        source_version_id: str | None = None,
+    ) -> str | None:
+        """Resolve a source Markdown link to a current generic document page."""
+
+        parsed = urlsplit(str(target).strip())
+        if parsed.scheme or parsed.netloc:
+            return None
+
+        def normalized(value: str) -> str | None:
+            candidate = posixpath.normpath(value.replace("\\", "/")).lstrip("/")
+            if candidate in {"", ".", ".."} or candidate.startswith("../"):
+                return None
+            return candidate
+
+        direct = normalized(parsed.path)
+        candidates = [direct] if direct is not None else []
+        if source_document_id is not None:
+            version, _ = self._resolve_version(
+                source_document_id, source_version_id
+            )
+            relative = normalized(
+                posixpath.join(posixpath.dirname(version.logical_path), parsed.path)
+            )
+            if relative is not None and relative not in candidates:
+                candidates.append(relative)
+        aliases = {
+            alias.replace("\\", "/"): document_id
+            for document_id, record in self._snapshot.documents.items()
+            for alias in (record.canonical_path, *record.aliases)
+        }
+        for candidate in candidates:
+            document_id = aliases.get(candidate)
+            if document_id is not None:
+                return document_id
+        return None
+
+    def logical_path(
+        self, document_id: str, version_id: str | None = None
+    ) -> str:
+        version, _ = self._resolve_version(document_id, version_id)
+        return version.logical_path
+
+    def prewarm_pages(self) -> None:
+        """Build immutable page projections before the service accepts traffic."""
+
+        for document_id, record in sorted(self._snapshot.documents.items()):
+            for version_id in record.version_ids:
+                self.page(document_id, version_id)
+
     def page(
         self, document_id: str, version_id: str | None = None
     ) -> GenericDocumentPage:
         version, is_current = self._resolve_version(document_id, version_id)
+        cache_key = (document_id, version.document_version_id)
+        cached = self._page_cache.get(cache_key)
+        if cached is not None:
+            return cached
         source = self.source_bytes(document_id, version.document_version_id)
         expected_ir = self._snapshot.ir_documents[version.document_version_id]
         actual_ir, rendered_html = build_document_ir(
@@ -456,8 +516,7 @@ class GenericResearchCatalog:
 
         all_spans = {
             span.span_id: span
-            for position in self._comment_block_positions(expected_ir)
-            for block in (expected_ir.blocks[position],)
+            for block in expected_ir.blocks
             for span in (block.source_span, *block.spans)
         }
         toc: list[GenericLocator] = []
@@ -544,7 +603,7 @@ class GenericResearchCatalog:
             for block in expected_ir.blocks
             if block.kind != "heading" and block.source_span.byte_end > block.source_span.byte_start
         )
-        return GenericDocumentPage(
+        page = GenericDocumentPage(
             snapshot_id=self._effective_snapshot_id,
             document_id=document_id,
             research_id=version.research_id,
@@ -565,6 +624,8 @@ class GenericResearchCatalog:
             versions=versions,
             comment_anchor_options=comment_anchor_options,
         )
+        self._page_cache[cache_key] = page
+        return page
 
 
 __all__ = [
