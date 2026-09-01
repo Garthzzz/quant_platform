@@ -141,7 +141,14 @@ class SteadyExactRuntimeServerTests(unittest.TestCase):
 
         def application(environ: dict[str, object], start_response: object):
             calls.append(environ)
-            start_response("200 OK", [])
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "application/json"),
+                    ("Content-Length", "11"),
+                    ("Cache-Control", "no-store"),
+                ],
+            )
             return [b"application"]
 
         wrapper = _TransientAdmissionWsgiGate(application, gate)
@@ -183,7 +190,14 @@ class SteadyExactRuntimeServerTests(unittest.TestCase):
 
         def application(environ: dict[str, object], start_response: object):
             calls.append(environ)
-            start_response("200 OK", [])
+            start_response(
+                "200 OK",
+                [
+                    ("Content-Type", "application/json"),
+                    ("Content-Length", "11"),
+                    ("Cache-Control", "no-store"),
+                ],
+            )
             return [b"application"]
 
         wrapper = _SteadyAdmissionWsgiGate(application, gate)

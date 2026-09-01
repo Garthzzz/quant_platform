@@ -308,6 +308,38 @@ class ExactRuntimeServerTests(unittest.TestCase):
             "HTTP/1.1", subject._ExactRuntimeRequestHandler.protocol_version
         )
 
+    def test_exact_wsgi_response_removes_application_security_headers(self) -> None:
+        captured: list[tuple[object, object]] = []
+
+        narrowed = subject._exact_response_start_response(
+            lambda status, headers: captured.append((status, headers))
+        )
+        narrowed(
+            "200 OK",
+            [
+                ("Content-Type", "application/json"),
+                ("Content-Length", "2"),
+                ("Cache-Control", "no-store"),
+                ("Content-Security-Policy", "default-src 'none'"),
+                ("Referrer-Policy", "same-origin"),
+                ("X-Content-Type-Options", "nosniff"),
+            ],
+        )
+
+        self.assertEqual(
+            [
+                (
+                    "200 OK",
+                    [
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", "2"),
+                        ("Cache-Control", "no-store"),
+                    ],
+                )
+            ],
+            captured,
+        )
+
     def setUp(self) -> None:
         install_public_archive_presentation(self)
         self.app = Flask(__name__)

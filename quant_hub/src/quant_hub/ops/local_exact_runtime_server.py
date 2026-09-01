@@ -58,6 +58,9 @@ _CANONICAL_REQUEST_LINE_RE = re.compile(
 )
 _MAX_CANONICAL_REQUEST_LINE_BYTES = 8192
 _MAX_CANARY_REQUEST_BYTES = 512
+_EXACT_APPLICATION_RESPONSE_HEADERS = frozenset(
+    {"cache-control", "content-length", "content-type"}
+)
 _READ_ONLY_DATABASE_ROOT_ENV = "QUANT_HUB_READ_ONLY_DATABASE_ROOT"
 _V39_BASELINE_RELEASE_ID = "v39-baseline-20260731-hotfix1"
 _V39_BASELINE_MANIFEST_SHA256 = (
@@ -1287,6 +1290,45 @@ def _register_steady_endpoint(
         )
 
 
+def _exact_response_start_response(start_response: object) -> object:
+    """Strip application middleware headers from the fixed probe surface."""
+
+    if not callable(start_response):
+        raise ExactRuntimeServerError("exact start_response is unavailable")
+
+    def narrowed(
+        status: object,
+        headers: object,
+        exc_info: object = None,
+    ) -> object:
+        if type(headers) is not list:
+            raise ExactRuntimeServerError("exact response headers are not a list")
+        selected: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in headers:
+            if (
+                type(item) is not tuple
+                or len(item) != 2
+                or type(item[0]) is not str
+                or type(item[1]) is not str
+            ):
+                raise ExactRuntimeServerError("exact response header shape drifted")
+            name = item[0].casefold()
+            if name not in _EXACT_APPLICATION_RESPONSE_HEADERS:
+                continue
+            if name in seen:
+                raise ExactRuntimeServerError("exact response header duplicated")
+            seen.add(name)
+            selected.append(item)
+        if seen != _EXACT_APPLICATION_RESPONSE_HEADERS:
+            raise ExactRuntimeServerError("exact response headers are incomplete")
+        if exc_info is None:
+            return start_response(status, selected)  # type: ignore[operator]
+        return start_response(status, selected, exc_info)  # type: ignore[operator]
+
+    return narrowed
+
+
 class _TransientAdmissionWsgiGate:
     """Outermost gate: transient serves only exact identity/canary probes."""
 
@@ -1356,7 +1398,9 @@ class _TransientAdmissionWsgiGate:
         if self._gate.state == "closed_pending_promotion" and self._exact_probe(
             environ
         ):
-            return self._application(environ, start_response)
+            return self._application(
+                environ, _exact_response_start_response(start_response)
+            )
         raw = canonical_bytes(
             {
                 "code": "starting_not_admitted",
@@ -1421,8 +1465,12 @@ class _SteadyAdmissionWsgiGate:
         if type(environ) is not dict or not callable(start_response):
             raise ExactRuntimeServerError("steady WSGI environ/start_response 无效")
         state = self._gate.state
-        if state == "admitted" or self._exact_probe(environ):
+        if state == "admitted":
             return self._application(environ, start_response)
+        if self._exact_probe(environ):
+            return self._application(
+                environ, _exact_response_start_response(start_response)
+            )
         raw = canonical_bytes(
             {
                 "code": "starting_not_admitted",
