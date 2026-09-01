@@ -349,6 +349,7 @@ class ExactRuntimeServerTests(unittest.TestCase):
         self.assertEqual(str(len(response.data)), response.headers["Content-Length"])
         self.assertIsNone(response.headers.get("Content-Encoding"))
         self.assertIsNone(response.headers.get("Transfer-Encoding"))
+        self.assertIsNone(response.headers.get("Connection"))
         document = response.get_json()
         self.assertEqual(self.challenge, document["probe_challenge"])
         self.assertEqual("0.0.0.0", document["listener"]["local_address"])
@@ -1038,6 +1039,7 @@ finally:
             environ_base={"REMOTE_ADDR": "127.0.0.1"},
         )
         self.assertEqual(200, response.status_code)
+        self.assertIsNone(response.headers.get("Connection"))
         self.assertEqual(
             canonical_bytes(
                 {

@@ -947,7 +947,6 @@ def _json_response(document: dict[str, object], status: int) -> Response:
     raw = canonical_bytes(document)
     response = Response(raw, status=status, content_type="application/json")
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Connection"] = "close"
     return response
 
 
@@ -1251,7 +1250,6 @@ def _register_exact_endpoints(
             _checkpoint(lease, closure)
             response = Response(raw, status=200, content_type="application/json")
             response.headers["Cache-Control"] = "no-store"
-            response.headers["Connection"] = "close"
             return response
         finally:
             canary_lock.release()
@@ -1372,7 +1370,6 @@ class _TransientAdmissionWsgiGate:
                 ("Content-Type", "application/json"),
                 ("Content-Length", str(len(raw))),
                 ("Cache-Control", "no-store"),
-                ("Connection", "close"),
             ],
         )
         return [raw]
@@ -1439,7 +1436,6 @@ class _SteadyAdmissionWsgiGate:
                 ("Content-Type", "application/json"),
                 ("Content-Length", str(len(raw))),
                 ("Cache-Control", "no-store"),
-                ("Connection", "close"),
             ],
         )
         return [raw]
