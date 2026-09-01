@@ -911,8 +911,10 @@ class _BoundDirectory:
         handle = kernel32.CreateFileW(
             str(path),
             0x00000080
-            | (0x00010000 if protect_rename or allow_self_rename else 0),
-            # FILE_READ_ATTRIBUTES；root 内组件另持 DELETE access 以阻断 rename。
+            | (0x00010000 if allow_self_rename else 0),
+            # FILE_READ_ATTRIBUTES；保护方通过不共享 FILE_SHARE_DELETE
+            # 阻断 rename/delete，无需同时申请 DELETE access。同时申请
+            # DELETE 会使两个都不共享 delete 的正当保护者互相冲突。
             0x00000001 | 0x00000002 | (0 if protect_rename else 0x00000004),
             # 被保护目录 intentionally no SHARE_DELETE；只读祖先允许复用 owner 的 root guard。
             None,
