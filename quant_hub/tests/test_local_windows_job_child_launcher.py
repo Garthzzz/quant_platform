@@ -267,13 +267,16 @@ class WindowsJobChildLauncherTests(unittest.TestCase):
             target.high = 0
             return True
 
+        close_targets: list[object] = []
+
         def duplicate(
             _source_process: object,
             source: object,
-            _target_process: object,
+            target_process: object,
             *_rest: object,
         ) -> bool:
             closed.append(value(source))
+            close_targets.append(target_process)
             return True
 
         def exit_code(_process: object, output: object) -> bool:
@@ -368,6 +371,8 @@ class WindowsJobChildLauncherTests(unittest.TestCase):
         self.assertEqual((101,), attributes[launcher_module._PROC_THREAD_ATTRIBUTE_JOB_LIST])
         self.assertEqual([(102, 104, 104)], startup_facts)
         self.assertEqual([107, 102, 106], closed)
+        self.assertTrue(close_targets)
+        self.assertTrue(all(target is None for target in close_targets))
         self.assertEqual(1, len(sentinel_writes))
         self.assertIn(b'"boot_nonce":"' + b"0" * 48 + b'"', sentinel_writes[0])
         self.assertEqual(0, lifecycle._handles["admission_read"])

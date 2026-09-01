@@ -1033,7 +1033,7 @@ class LockedServiceTransientJournalStartFence:
                 if not self._api.DuplicateHandle(
                     current,
                     wintypes.HANDLE(pin.handle),
-                    current,
+                    None,
                     None,
                     0,
                     False,

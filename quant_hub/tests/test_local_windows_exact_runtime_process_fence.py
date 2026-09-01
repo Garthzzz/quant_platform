@@ -53,6 +53,22 @@ class WindowsExactRuntimeProcessFenceTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             instance.assert_absent_before_launch({})
 
+    def test_close_source_has_no_target_process_or_duplicate_handle(self) -> None:
+        api = object.__new__(subject._FenceApi)
+        observed: list[tuple[object, ...]] = []
+        object.__setattr__(
+            api,
+            "DuplicateHandle",
+            lambda *arguments: observed.append(arguments) or True,
+        )
+        object.__setattr__(
+            api, "GetCurrentProcess", lambda: ctypes.c_void_p(-1).value
+        )
+        api.close_handle(101)
+        self.assertEqual(1, len(observed))
+        self.assertIsNone(observed[0][2])
+        self.assertIsNone(observed[0][3])
+
     def test_close_source_false_is_not_treated_as_success(self) -> None:
         api = object.__new__(subject._FenceApi)
         object.__setattr__(api, "DuplicateHandle", lambda *_: False)

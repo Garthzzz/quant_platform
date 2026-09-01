@@ -550,7 +550,7 @@ class _ProductionJobApi:
                     self.DuplicateHandle(
                         current,
                         wintypes.HANDLE(value),
-                        current,
+                        None,
                         None,
                         0,
                         False,
@@ -939,7 +939,7 @@ class LockedServiceChildLaunchLifecycle:
             closed = bool(self._api.DuplicateHandle(
                 current,
                 wintypes.HANDLE(value),
-                current,
+                None,
                 None,
                 0,
                 False,

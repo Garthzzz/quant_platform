@@ -129,7 +129,7 @@ class _FenceApi:
             closed = bool(self.DuplicateHandle(
                 current,
                 wintypes.HANDLE(handle),
-                current,
+                None,
                 None,
                 0,
                 False,
