@@ -523,15 +523,13 @@ class _ProductionJobApi:
             int(native_machine.value),
             ctypes.sizeof(ctypes.c_void_p) * 8,
         )
-        self._host_in_outer_job = bool(in_outer_job.value)
-        # `_host_in_outer_job` also selects the post-create suspended-assignment
-        # path. Some SCM hosts report no outer Job yet still reject JOB_LIST at
-        # CreateProcess time, so the real capability probe is authoritative.
-        if not self._host_in_outer_job:
-            try:
-                self._probe_nested_job_compatibility()
-            except _CreationTimeJobListRejected:
-                self._host_in_outer_job = True
+        # Production must not create a System32 probe child: the immediately
+        # following all-machine process fence can still observe a fully exited
+        # probe while the kernel retires its process-table entry.  Use the
+        # failure-closed suspended-assignment path for every SCM host.  The
+        # observed outer-Job bit remains part of the Win32 preflight above, but
+        # it does not weaken or bypass private Job ownership.
+        self._host_in_outer_job = True
 
     def _probe_nested_job_compatibility(self) -> None:
         """Prove JOB_LIST creation works from the service host's actual outer Job."""
