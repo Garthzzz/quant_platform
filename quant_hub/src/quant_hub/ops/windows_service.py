@@ -270,6 +270,8 @@ class _ServiceHostDWriteOwner:
                 parent: _BoundDirectory,
                 path: Path,
                 name: str,
+                *,
+                protect_rename: bool = True,
             ) -> _BoundDirectory:
                 validate_production_vm_write_path(str(path), allow_root=False)
                 observed = self._safe_root.preflight(
@@ -288,12 +290,18 @@ class _ServiceHostDWriteOwner:
                     _BoundDirectory(
                         self._safe_root,
                         path,
-                        protect_rename=True,
+                        protect_rename=protect_rename,
                     )
                 )
 
             tmp_root = physical / "tmp"
-            tmp_root_bound = enter_or_create(root_bound, tmp_root, "tmp")
+            # Candidate qualification already pins the shared tmp parent.
+            # Repeating its exclusive DELETE/no-share-delete claim inside the
+            # SCM process conflicts with the legitimate controller owner.
+            # The service-host child becomes this process's exclusive boundary.
+            tmp_root_bound = enter_or_create(
+                root_bound, tmp_root, "tmp", protect_rename=False
+            )
             service_host_bound = enter_or_create(
                 tmp_root_bound,
                 self.tmp,

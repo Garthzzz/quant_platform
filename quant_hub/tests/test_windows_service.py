@@ -208,12 +208,19 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                 "validate_production_vm_write_path",
                 side_effect=lambda value, allow_root=False: PureWindowsPath(value),
             ):
+                (root / "tmp").mkdir()
+                safe_root = _SafeRoot(root, allow_posix_test_only=False)
                 controller_root_guard = _BoundDirectory(
-                    _SafeRoot(root, allow_posix_test_only=False),
+                    safe_root,
                     root,
                     protect_rename=True,
                 )
-                with controller_root_guard:
+                controller_tmp_guard = _BoundDirectory(
+                    safe_root,
+                    root / "tmp",
+                    protect_rename=True,
+                )
+                with controller_root_guard, controller_tmp_guard:
                     owner = windows_service_module.prepare_service_host_environment(root)
                     owner.append_status("host_failure_fixture")
                     self.assertFalse(owner._closed)
