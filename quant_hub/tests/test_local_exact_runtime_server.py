@@ -100,6 +100,31 @@ class _FakeRunner:
 
 
 class LegacyCommentCompatibilityTests(unittest.TestCase):
+    def test_v39_fenced_connection_checks_each_write_and_commit(self) -> None:
+        class Lease:
+            def __init__(self) -> None:
+                self.checkpoints = 0
+
+            def _canary_checkpoint(self) -> None:
+                self.checkpoints += 1
+
+        with tempfile.TemporaryDirectory(prefix="qrh-v39-fenced-db-") as directory:
+            database = Path(directory) / "state.sqlite3"
+            connection = sqlite3.connect(
+                database,
+                isolation_level=None,
+                factory=subject._V39ExactRuntimeWriterFencedConnection,
+            )
+            lease = Lease()
+            connection._bind_writer_lease(lease)
+            connection.execute("CREATE TABLE state(value INTEGER NOT NULL)")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("INSERT INTO state VALUES(1)")
+            connection.commit()
+            connection.close()
+
+            self.assertGreaterEqual(lease.checkpoints, 11)
+
     def test_windows_path_runtime_root_is_accepted_without_creating_children(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qrh-v39-runtime-root-") as directory:
             runtime = Path(directory)
@@ -141,15 +166,19 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
             settings = LegacySettings()
             original_workspace_sync = LegacyWorkspace.sync_if_changed
 
-            result = subject._create_release_application(
-                create_app,
-                LegacySettings,
-                settings,
-                {},
-                v39_compatibility=True,
-            )
+            with patch.object(
+                subject, "_install_legacy_writer_lease_adapter"
+            ) as install_adapter:
+                result = subject._create_release_application(
+                    create_app,
+                    LegacySettings,
+                    settings,
+                    {},
+                    v39_compatibility=True,
+                )
 
             self.assertIsNone(result)
+            install_adapter.assert_called_once()
             self.assertEqual([], calls)
             self.assertIs(LegacyWorkspace.sync_if_changed, original_workspace_sync)
             self.assertEqual("synced", LegacyWorkspace().sync_if_changed())

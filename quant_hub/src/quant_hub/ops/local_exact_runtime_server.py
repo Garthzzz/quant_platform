@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 from http import HTTPStatus
 import json
@@ -63,6 +66,9 @@ _V39_BASELINE_MANIFEST_SHA256 = (
 _V39_LEGACY_DEPLOYMENT_ID = "quant-hub-v39-company-broadcast-20260731-hotfix1"
 _V39_SOURCE_ARCHIVE_SHA256 = (
     "92a9c569865113e04b0ae5e864e9d586180941c16b490a1af6551694ddfce5b4"
+)
+_V39_EXACT_RUNTIME_WRITER_LEASE: ContextVar[object | None] = ContextVar(
+    "quant_hub_v39_exact_runtime_writer_lease", default=None
 )
 
 
@@ -575,6 +581,175 @@ def _legacy_skip_startup_workspace_sync(_workspace: object) -> None:
     return None
 
 
+class _V39ExactRuntimeWriterFencedConnection(sqlite3.Connection):
+    """Add the exact writer lease checkpoints absent from sealed V39."""
+
+    __slots__ = ("_writer_lease",)
+
+    def _bind_writer_lease(self, lease: object) -> None:
+        if hasattr(self, "_writer_lease"):
+            raise ExactRuntimeServerError("legacy writer lease is already bound")
+        self._writer_lease = lease
+        self._checkpoint()
+
+    def _checkpoint(self) -> None:
+        self._writer_lease._canary_checkpoint()  # type: ignore[attr-defined]
+
+    def execute(self, sql: str, parameters: object = (), /) -> sqlite3.Cursor:
+        self._checkpoint()
+        cursor = super().execute(sql, parameters)  # type: ignore[arg-type]
+        self._checkpoint()
+        return cursor
+
+    def executemany(self, sql: str, parameters: object, /) -> sqlite3.Cursor:
+        self._checkpoint()
+        cursor = super().executemany(sql, parameters)  # type: ignore[arg-type]
+        self._checkpoint()
+        return cursor
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        self._checkpoint()
+        cursor = super().executescript(sql_script)
+        self._checkpoint()
+        return cursor
+
+    def commit(self) -> None:
+        self._checkpoint()
+        super().commit()
+        self._checkpoint()
+
+    def close(self) -> None:
+        checkpoint_error: BaseException | None = None
+        try:
+            self._checkpoint()
+        except BaseException as error:
+            checkpoint_error = error
+        try:
+            super().close()
+        finally:
+            if checkpoint_error is not None:
+                raise checkpoint_error
+        self._checkpoint()
+
+
+@contextmanager
+def _legacy_writer_lease_transaction_scope(
+    lease: object, *, production: bool
+) -> Iterator[None]:
+    from .local_windows_writer_lease_holder import (
+        LockedWindowsWriterLease,
+        _TestOnlyLockedWriterLease,
+    )
+
+    expected = LockedWindowsWriterLease if production else _TestOnlyLockedWriterLease
+    if type(lease) is not expected:
+        raise TypeError("legacy exact runtime writer lease provenance is invalid")
+    if _V39_EXACT_RUNTIME_WRITER_LEASE.get() is not None:
+        raise RuntimeError("legacy exact runtime writer lease scope cannot nest")
+    lease._canary_checkpoint()  # type: ignore[attr-defined]
+    token = _V39_EXACT_RUNTIME_WRITER_LEASE.set(lease)
+    try:
+        yield
+    finally:
+        _V39_EXACT_RUNTIME_WRITER_LEASE.reset(token)
+
+
+def _install_legacy_writer_lease_adapter(
+    original_initializer: object, workspace_type: type[object]
+) -> None:
+    """Bridge V39 application connections to the exact canary lease."""
+
+    initializer_globals = getattr(original_initializer, "__globals__", None)
+    workspace_connection_method = getattr(workspace_type, "_connection", None)
+    workspace_globals = getattr(workspace_connection_method, "__globals__", None)
+    workspace_connection = (
+        workspace_globals.get("research_workspace_connection")
+        if type(workspace_globals) is dict
+        else None
+    )
+    workspace_database_globals = getattr(workspace_connection, "__globals__", None)
+    original_connect = (
+        initializer_globals.get("connect_database")
+        if type(initializer_globals) is dict
+        else None
+    )
+    platform_globals = getattr(original_connect, "__globals__", None)
+    configured_read_only = (
+        platform_globals.get("_configured_read_only")
+        if type(platform_globals) is dict
+        else None
+    )
+    validate_paths = (
+        platform_globals.get("_validate_database_paths")
+        if type(platform_globals) is dict
+        else None
+    )
+    ensure_safe = (
+        platform_globals.get("ensure_no_reparse_components")
+        if type(platform_globals) is dict
+        else None
+    )
+    if not all(
+        callable(value)
+        for value in (
+            original_connect,
+            configured_read_only,
+            validate_paths,
+            ensure_safe,
+        )
+    ):
+        raise ExactRuntimeServerError("legacy platform database contract is unavailable")
+    if (
+        type(initializer_globals) is not dict
+        or type(workspace_database_globals) is not dict
+        or type(platform_globals) is not dict
+        or workspace_database_globals.get("connect_database") is not original_connect
+    ):
+        raise ExactRuntimeServerError("legacy business database adapters are incomplete")
+    if "_exact_runtime_writer_lease_transaction_scope" in platform_globals:
+        raise ExactRuntimeServerError("legacy writer lease adapter target already exists")
+
+    def connect_database(path: Path) -> sqlite3.Connection:
+        lease = _V39_EXACT_RUNTIME_WRITER_LEASE.get()
+        if lease is None:
+            return original_connect(path)  # type: ignore[operator]
+        resolved_path = Path(path).absolute()
+        ensure_safe(resolved_path.parent)  # type: ignore[operator]
+        if configured_read_only(resolved_path):  # type: ignore[operator]
+            return original_connect(resolved_path)  # type: ignore[operator]
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_safe(resolved_path.parent)  # type: ignore[operator]
+        validate_paths(resolved_path)  # type: ignore[operator]
+        connection = sqlite3.connect(
+            resolved_path,
+            timeout=10.0,
+            isolation_level=None,
+            factory=_V39ExactRuntimeWriterFencedConnection,
+        )
+        if type(connection) is not _V39ExactRuntimeWriterFencedConnection:
+            sqlite3.Connection.close(connection)
+            raise ExactRuntimeServerError("legacy fenced SQLite factory drifted")
+        try:
+            connection._bind_writer_lease(lease)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+            validate_paths(resolved_path, require_database=True)  # type: ignore[operator]
+        except BaseException:
+            sqlite3.Connection.close(connection)
+            raise
+        return connection
+
+    initializer_globals["connect_database"] = connect_database
+    workspace_database_globals["connect_database"] = connect_database
+    platform_globals["connect_database"] = connect_database
+    platform_globals["_exact_runtime_writer_lease_transaction_scope"] = (
+        _legacy_writer_lease_transaction_scope
+    )
+
+
 def _create_release_application(
     create_app: object,
     settings_type: type[object],
@@ -596,6 +771,7 @@ def _create_release_application(
     original_workspace_sync = getattr(workspace_type, "sync_if_changed", None)
     if not isinstance(workspace_type, type) or not callable(original_workspace_sync):
         raise ExactRuntimeServerError("legacy workspace initializer is unavailable")
+    _install_legacy_writer_lease_adapter(original_initializer, workspace_type)
     original_ensure = getattr(settings_type, "ensure_runtime_directories", None)
     if not callable(original_ensure):
         raise ExactRuntimeServerError("legacy runtime initializer is unavailable")
