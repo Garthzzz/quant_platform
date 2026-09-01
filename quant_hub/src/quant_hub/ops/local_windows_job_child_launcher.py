@@ -1,7 +1,8 @@
-"""Windows service-host 的 creation-time Job child launcher。
+"""Windows service-host 的 fail-closed Job child launcher。
 
-产品路径固定使用 STARTUPINFOEXW 的 JOB_LIST + HANDLE_LIST；不使用 Popen，
-不提供 post-create AssignProcessToJobObject fallback。
+优先使用 STARTUPINFOEXW 的 JOB_LIST + HANDLE_LIST；当 SCM host 实测拒绝
+creation-time JOB_LIST 时，child 保持 suspended，加入私有 Job 并核验后才恢复。
+产品路径不使用 Popen。
 """
 
 from __future__ import annotations
@@ -81,6 +82,10 @@ class WindowsJobChildLauncherError(RuntimeError):
 
 class WindowsJobChildOwnerCrashRequired(WindowsJobChildLauncherError):
     """Win32 outcome unknown；service host 必须退出交由 OS 回收。"""
+
+
+class _CreationTimeJobListRejected(WindowsJobChildLauncherError):
+    """SCM host 实测拒绝 creation-time JOB_LIST。"""
 
 
 class _FILETIME(ctypes.Structure):
@@ -519,12 +524,14 @@ class _ProductionJobApi:
             ctypes.sizeof(ctypes.c_void_p) * 8,
         )
         self._host_in_outer_job = bool(in_outer_job.value)
-        # An SCM host may itself be inside a host-managed Job whose policy
-        # rejects PROC_THREAD_ATTRIBUTE_JOB_LIST at CreateProcess time. The
-        # fallback still creates the child suspended, assigns it to the exact
-        # KILL_ON_JOB_CLOSE Job, verifies membership, and only then resumes.
+        # `_host_in_outer_job` also selects the post-create suspended-assignment
+        # path. Some SCM hosts report no outer Job yet still reject JOB_LIST at
+        # CreateProcess time, so the real capability probe is authoritative.
         if not self._host_in_outer_job:
-            self._probe_nested_job_compatibility()
+            try:
+                self._probe_nested_job_compatibility()
+            except _CreationTimeJobListRejected:
+                self._host_in_outer_job = True
 
     def _probe_nested_job_compatibility(self) -> None:
         """Prove JOB_LIST creation works from the service host's actual outer Job."""
@@ -624,7 +631,9 @@ class _ProductionJobApi:
             startup.lpAttributeList = attribute_pointer
             information = _PROCESS_INFORMATION()
             created = False
+            creation_error = 0
             try:
+                ctypes.set_last_error(0)
                 created = bool(
                     self.CreateProcessW(
                         executable,
@@ -642,11 +651,13 @@ class _ProductionJobApi:
                     )
                 )
             finally:
+                creation_error = ctypes.get_last_error()
                 process = int(information.hProcess or 0)
                 thread = int(information.hThread or 0)
             if not created or process <= 0 or thread <= 0:
-                raise WindowsJobChildLauncherError(
-                    "service host outer Job is incompatible with creation-time JOB_LIST"
+                raise _CreationTimeJobListRejected(
+                    "service host rejects creation-time JOB_LIST: "
+                    f"winerror={creation_error}"
                 )
             in_job = wintypes.BOOL()
             if not self.IsProcessInJob(
