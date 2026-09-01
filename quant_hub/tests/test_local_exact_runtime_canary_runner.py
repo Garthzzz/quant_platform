@@ -109,6 +109,20 @@ class ExactRuntimeCanaryRunnerTests(unittest.TestCase):
             migration_root=migrations,
         )
 
+    def test_production_settings_use_frozen_runtime_contract_migrations(self) -> None:
+        release = self.root / "release"
+
+        settings = runner_module._settings(
+            base=self.root,
+            release_path=release,
+            production=True,
+        )
+
+        self.assertEqual(
+            release / "runtime_contract" / "migrations" / "platform",
+            settings.migration_root,
+        )
+
     def _prepare_databases(self) -> None:
         comments = self.state / "comments.sqlite3"
         initialize_comment_store(comments)

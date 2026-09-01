@@ -565,7 +565,9 @@ def _settings(*, base: Path, release_path: Path, production: bool) -> object:
 
     runtime = base / "tmp" / "application-runtime"
     if production:
-        migration_root = release_path / "migrations" / "platform"
+        migration_root = (
+            release_path / "runtime_contract" / "migrations" / "platform"
+        )
     else:
         migration_root = Path(__file__).resolve().parents[3] / "migrations" / "platform"
     return Settings(
