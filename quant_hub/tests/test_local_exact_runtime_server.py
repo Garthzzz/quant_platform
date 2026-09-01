@@ -1106,7 +1106,6 @@ finally:
                 initialize_research_workspace_database(
                     settings, database_path=workspace
                 )
-                (state / "viewer_secret.key").write_text("a" * 64, "ascii")
                 (state / "viewer_access_password.digest").write_text(
                     derive_password_digest("exact-app-password").hex(), "ascii"
                 )
@@ -1168,6 +1167,10 @@ finally:
                     self.assertEqual(200, response.status_code)
                 finally:
                     guards.close()
+                self.assertRegex(
+                    (state / "viewer_secret.key").read_text("ascii").strip(),
+                    r"^[0-9a-f]{64}$",
+                )
                 after_sidecars = sorted(
                     path.relative_to(runtime).as_posix()
                     for path in runtime.rglob("*")

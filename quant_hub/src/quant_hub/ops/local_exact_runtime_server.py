@@ -978,6 +978,7 @@ def _build_application(
     source_kind = application.get("source_kind")
     if source_kind not in {"git", "legacy_broadcast"}:
         raise ExactRuntimeServerError("release application source kind is invalid")
+    session_secret = _secret(session)
     state_checkpoint = _RuntimeStateCheckpoint(
         protected_paths=(session, digest),
         database_paths=(comment_database, workspace_database),
@@ -989,7 +990,7 @@ def _build_application(
     try:
         state_checkpoint.checkpoint()
         config: dict[str, object] = {
-            "SECRET_KEY": _secret(session),
+            "SECRET_KEY": session_secret,
             "TRUSTED_ORIGINS": _trusted_origins(),
             "SESSION_COOKIE_SECURE": False,
             "SESSION_COOKIE_HTTPONLY": True,
