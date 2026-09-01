@@ -308,7 +308,7 @@ def _final_dos_path(value: str, *, label: str) -> str:
         value = "\\\\" + value[8:]
     elif value.startswith("\\\\?\\"):
         value = value[4:]
-    if not value.startswith(_PRODUCTION_ROOT + "\\"):
+    if not value.casefold().startswith((_PRODUCTION_ROOT + "\\").casefold()):
         raise WindowsScmProcessObserverError(
             f"{label} final path 不在 exact D root"
         )
@@ -821,8 +821,8 @@ def _process_document(
         or probe.pid < 1
         or parent_pid < 1
         or probe.creation_time_100ns < 1
-        or probe.executable_final_path != expected_executable
-        or file_probe.executable_final_path != expected_executable
+        or probe.executable_final_path.casefold() != expected_executable.casefold()
+        or file_probe.executable_final_path.casefold() != expected_executable.casefold()
         or probe.command_line != _windows_command_line(expected_argv)
     ):
         raise WindowsScmProcessObserverError(
