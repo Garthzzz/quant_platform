@@ -20,7 +20,11 @@ import urllib.parse
 import urllib.request
 
 from quant_hub.ops.release_identity import manifest_sha256
-from quant_hub.ops.local_deployment_persistence import _BoundDirectory, _SafeRoot
+from quant_hub.ops.local_deployment_persistence import (
+    UnsafeLocalPath,
+    _BoundDirectory,
+    _SafeRoot,
+)
 from quant_hub.ops.local_windows_writer_lease_holder import (
     ExactRuntimeLeaseIdentity,
 )
@@ -233,6 +237,23 @@ class WindowsServiceTopologyTests(unittest.TestCase):
                     root / "logs" / "quant-research-hub-service.log"
                 ).read_text(encoding="ascii"),
             )
+
+    def test_service_host_environment_preserves_exact_binding_failure_detail(self) -> None:
+        failure = UnsafeLocalPath(
+            r"cannot bind D:\quant\quant_platform\tmp\service-host: Windows error 32"
+        )
+        with mock.patch.object(
+            windows_service_module,
+            "_ServiceHostDWriteOwner",
+            side_effect=failure,
+        ):
+            with self.assertRaisesRegex(
+                WindowsServiceError,
+                r"UnsafeLocalPath: .*service-host: Windows error 32",
+            ):
+                windows_service_module.prepare_service_host_environment(
+                    Path(r"D:\quant\quant_platform")
+                )
 
     def test_service_status_owner_overrides_base_run_and_interrogate(self) -> None:
         source = (

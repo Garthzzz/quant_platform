@@ -435,7 +435,8 @@ def prepare_service_host_environment(root: Path) -> _ServiceHostDWriteOwner:
         owner = _ServiceHostDWriteOwner(root)
     except (UnsafeLocalPath, OSError) as error:
         raise WindowsServiceError(
-            "service host D-write environment cannot be bound"
+            "service host D-write environment cannot be bound: "
+            f"{type(error).__name__}: {error}"
         ) from error
     os.environ.update(
         {
