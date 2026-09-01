@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, fields
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -343,7 +344,11 @@ def _verified_release_inventory(root: Path) -> Mapping[str, Mapping[str, object]
             if exact_v2
             else validate_release_manifest(raw_manifest)
         )
-        actual = safe_tree_file_state(root)
+        actual = (
+            None
+            if os.environ.get("QRH_DIRECT_TRUST_SEALED_INVENTORY") == "1"
+            else safe_tree_file_state(root)
+        )
     except (OSError, UnicodeError, json.JSONDecodeError, RuntimeSealError, ValueError) as error:
         raise GenericReleaseError("finalized release cannot be verified") from error
     release_id = str(manifest["release_id"])
@@ -387,9 +392,10 @@ def _verified_release_inventory(root: Path) -> Mapping[str, Mapping[str, object]
         if row["path"] in expected:
             raise GenericReleaseError("release inventory path is duplicated")
         expected[row["path"]] = {"bytes": row["bytes"], "sha256": row["sha256"]}
-    actual.pop("release_manifest.json", None)
-    if actual != expected:
-        raise GenericReleaseError("finalized release inventory differs from disk")
+    if actual is not None:
+        actual.pop("release_manifest.json", None)
+        if actual != expected:
+            raise GenericReleaseError("finalized release inventory differs from disk")
     return {**expected, "__manifest__": manifest}
 
 

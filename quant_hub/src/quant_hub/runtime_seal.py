@@ -101,12 +101,59 @@ def _stable_payload(path: Path) -> tuple[bytes, os.stat_result]:
     return payload, after
 
 
+def _stable_file_digest(path: Path) -> tuple[int, str, os.stat_result]:
+    """Hash a stable regular file without materializing it in memory."""
+
+    ensure_no_reparse_components(path)
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat_is_reparse_point(before)
+        or before.st_nlink != 1
+    ):
+        raise RuntimeSealError(
+            f"sealed material must be a regular non-reparse single-link file: {path}"
+        )
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb", buffering=0) as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+    after = path.lstat()
+    before_identity = (
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_dev,
+        before.st_ino,
+        before.st_nlink,
+    )
+    after_identity = (
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_dev,
+        after.st_ino,
+        after.st_nlink,
+    )
+    if (
+        before_identity != after_identity
+        or total != after.st_size
+        or not stat.S_ISREG(after.st_mode)
+        or stat_is_reparse_point(after)
+    ):
+        raise RuntimeSealError(f"sealed material changed while being read: {path}")
+    return total, digest.hexdigest(), after
+
+
 def file_identity(path: Path) -> dict[str, object]:
-    payload, info = _stable_payload(path)
+    size, digest, info = _stable_file_digest(path)
     return {
-        "bytes": len(payload),
+        "bytes": size,
         "mtime_ns": info.st_mtime_ns,
-        "sha256": hashlib.sha256(payload).hexdigest(),
+        "sha256": digest,
     }
 
 
@@ -194,14 +241,14 @@ def _safe_tree_records(
             # Path.lstat() 驱动的 _stable_payload 完成。
             if not stat.S_ISREG(info.st_mode):
                 raise RuntimeSealError(f"sealed tree contains an unsafe file: {path}")
-            payload, stable_info = _stable_payload(path)
+            size, digest, stable_info = _stable_file_digest(path)
             relative_name = relative.as_posix()
             register_path(relative)
             records.append(
                 (
                     relative_name,
-                    stable_info.st_size,
-                    hashlib.sha256(payload).hexdigest(),
+                    size,
+                    digest,
                 )
             )
 
