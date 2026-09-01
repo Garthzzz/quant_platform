@@ -303,6 +303,11 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
 class ExactRuntimeServerTests(unittest.TestCase):
     challenge = "1" * 48
 
+    def test_exact_request_handler_responds_with_http_11(self) -> None:
+        self.assertEqual(
+            "HTTP/1.1", subject._ExactRuntimeRequestHandler.protocol_version
+        )
+
     def setUp(self) -> None:
         install_public_archive_presentation(self)
         self.app = Flask(__name__)

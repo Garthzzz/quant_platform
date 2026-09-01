@@ -94,6 +94,7 @@ def _canonical_request_line(raw: object) -> tuple[bytes, bytes] | None:
 class _ExactRuntimeRequestHandler(WSGIRequestHandler):
     """Preserve the request target before BaseHTTPRequestHandler rewrites it."""
 
+    protocol_version = "HTTP/1.1"
     _exact_raw_request_target = b""
 
     def parse_request(self) -> bool:
