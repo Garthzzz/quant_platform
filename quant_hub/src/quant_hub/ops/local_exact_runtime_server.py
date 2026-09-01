@@ -559,7 +559,7 @@ def _legacy_read_only_runtime_directories(settings: object) -> None:
     """Validate V39's sealed runtime root without creating new release paths."""
 
     runtime = getattr(settings, "var_root", None)
-    if type(runtime) is not Path:
+    if not isinstance(runtime, Path):
         raise ExactRuntimeServerError("legacy runtime root is unavailable")
     try:
         resolved = runtime.resolve(strict=True)

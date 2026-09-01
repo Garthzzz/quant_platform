@@ -100,6 +100,15 @@ class _FakeRunner:
 
 
 class LegacyCommentCompatibilityTests(unittest.TestCase):
+    def test_windows_path_runtime_root_is_accepted_without_creating_children(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qrh-v39-runtime-root-") as directory:
+            runtime = Path(directory)
+            settings = type("LegacySettings", (), {"var_root": runtime})()
+
+            subject._legacy_read_only_runtime_directories(settings)
+
+            self.assertEqual([], list(runtime.iterdir()))
+
     def test_expand_only_v2_store_is_accepted_without_writes(self) -> None:
         from quant_hub.collaboration.comment_store import initialize_comment_store
 
