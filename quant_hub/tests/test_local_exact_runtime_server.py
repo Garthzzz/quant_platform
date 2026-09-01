@@ -109,6 +109,53 @@ class LegacyCommentCompatibilityTests(unittest.TestCase):
 
             self.assertEqual([], list(runtime.iterdir()))
 
+    def test_v39_factory_skips_only_startup_workspace_sync(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qrh-v39-startup-sync-") as directory:
+            calls: list[str] = []
+
+            class LegacySettings:
+                def __init__(self) -> None:
+                    self.var_root = Path(directory)
+
+                def ensure_runtime_directories(self) -> None:
+                    calls.append("ensure")
+
+            class LegacyWorkspace:
+                def sync_if_changed(self) -> str:
+                    calls.append("sync")
+                    return "synced"
+
+            namespace: dict[str, object] = {
+                "ResearchWorkspace": LegacyWorkspace,
+                "_SCHEMA": "CREATE TABLE legacy_marker(id INTEGER PRIMARY KEY);",
+            }
+            exec(
+                "def initialize_comment_store(path):\n"
+                "    return None\n"
+                "def create_app(settings, config):\n"
+                "    settings.ensure_runtime_directories()\n"
+                "    return ResearchWorkspace().sync_if_changed()\n",
+                namespace,
+            )
+            create_app = namespace["create_app"]
+            settings = LegacySettings()
+            original_workspace_sync = LegacyWorkspace.sync_if_changed
+
+            result = subject._create_release_application(
+                create_app,
+                LegacySettings,
+                settings,
+                {},
+                v39_compatibility=True,
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual([], calls)
+            self.assertIs(LegacyWorkspace.sync_if_changed, original_workspace_sync)
+            self.assertEqual("synced", LegacyWorkspace().sync_if_changed())
+            settings.ensure_runtime_directories()
+            self.assertEqual(["sync", "ensure"], calls)
+
     def test_expand_only_v2_store_is_accepted_without_writes(self) -> None:
         from quant_hub.collaboration.comment_store import initialize_comment_store
 

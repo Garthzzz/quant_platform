@@ -569,6 +569,12 @@ def _legacy_read_only_runtime_directories(settings: object) -> None:
         raise ExactRuntimeServerError("legacy runtime root is not a directory")
 
 
+def _legacy_skip_startup_workspace_sync(_workspace: object) -> None:
+    """Keep the admission-closed V39 bootstrap probe from mutating shared state."""
+
+    return None
+
+
 def _create_release_application(
     create_app: object,
     settings_type: type[object],
@@ -586,6 +592,10 @@ def _create_release_application(
     if type(application_globals) is not dict:
         raise ExactRuntimeServerError("legacy application globals are unavailable")
     original_initializer = application_globals.get("initialize_comment_store")
+    workspace_type = application_globals.get("ResearchWorkspace")
+    original_workspace_sync = getattr(workspace_type, "sync_if_changed", None)
+    if not isinstance(workspace_type, type) or not callable(original_workspace_sync):
+        raise ExactRuntimeServerError("legacy workspace initializer is unavailable")
     original_ensure = getattr(settings_type, "ensure_runtime_directories", None)
     if not callable(original_ensure):
         raise ExactRuntimeServerError("legacy runtime initializer is unavailable")
@@ -597,10 +607,16 @@ def _create_release_application(
         "ensure_runtime_directories",
         _legacy_read_only_runtime_directories,
     )
+    setattr(
+        workspace_type,
+        "sync_if_changed",
+        _legacy_skip_startup_workspace_sync,
+    )
     try:
         return create_app(settings, config)  # type: ignore[operator]
     finally:
         application_globals["initialize_comment_store"] = original_initializer
+        setattr(workspace_type, "sync_if_changed", original_workspace_sync)
         setattr(settings_type, "ensure_runtime_directories", original_ensure)
 
 
