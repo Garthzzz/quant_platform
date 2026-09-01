@@ -931,7 +931,7 @@ class LockedServiceTransientJournalStartFence:
             "authorization_sha256": identity.authorization_sha256,
             "journal_latest_sha256": latest["journal_sha256"],
             "directories": {
-                key: list(value)
+                key: [list(item) for item in value]
                 for key, value in sorted(self._directory_snapshots.items())
             },
             "pins": {
