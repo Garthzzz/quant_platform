@@ -593,7 +593,7 @@ class _ProductionWindowsApi:
         status = int(
             self.reg_query_value_ex_w(
                 handle,
-                "PythonClass",
+                None,
                 None,
                 ctypes.byref(value_type),
                 None,
@@ -612,7 +612,7 @@ class _ProductionWindowsApi:
         status = int(
             self.reg_query_value_ex_w(
                 handle,
-                "PythonClass",
+                None,
                 None,
                 ctypes.byref(value_type),
                 ctypes.cast(buffer, ctypes.c_void_p),
@@ -1606,6 +1606,7 @@ class _WindowsScmProcessObservationRunner:
             registry_key = (
                 "SYSTEM\\CurrentControlSet\\Services\\"
                 + expected_inputs.service_name
+                + "\\PythonClass"
             )
             tracking._capture_registry_output_handle(
                 "python_class_registry",

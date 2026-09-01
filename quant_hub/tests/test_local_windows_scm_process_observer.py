@@ -58,6 +58,7 @@ from tests import test_local_deployment_persistence as persistence_tests
 
 class _FixedObserverApi:
     def __init__(self, inputs: object, *, mutation: str | None = None):
+        self.service_name = str(inputs.service_name)
         self.service_executable = str(inputs.service_executable)
         self.child_executable = str(inputs.child_executable)
         self.python_class = str(inputs.python_class)
@@ -82,6 +83,12 @@ class _FixedObserverApi:
         return 102
 
     def reg_open_key_ex_w(self, *arguments: object) -> int:
+        if arguments[1] != (
+            "SYSTEM\\CurrentControlSet\\Services\\"
+            + self.service_name
+            + "\\PythonClass"
+        ):
+            raise AssertionError("wrong PythonClass registry key")
         output = arguments[-1]
         ctypes.cast(output, ctypes.POINTER(ctypes.c_void_p)).contents.value = 103
         return 0
@@ -549,6 +556,43 @@ class WindowsScmProcessObserverTests(PersistenceFixture):
                 int(winreg.HKEY_LOCAL_MACHINE),
                 wintypes.HANDLE(_HKEY_LOCAL_MACHINE).value,
             )
+
+    def test_python_class_reads_pywin32_subkey_default_value(self) -> None:
+        expected = "quant_hub.ops.windows_service.QuantResearchHubWindowsService"
+        raw = (expected + "\0").encode("utf-16le")
+
+        class RegistryApi:
+            def __init__(self) -> None:
+                self.names: list[object] = []
+
+            def reg_query_value_ex_w(
+                self,
+                handle: object,
+                name: object,
+                reserved: object,
+                value_type: object,
+                data: object,
+                size: object,
+            ) -> int:
+                del handle, reserved
+                self.names.append(name)
+                ctypes.cast(
+                    value_type, ctypes.POINTER(ctypes.c_ulong)
+                ).contents.value = 1
+                size_pointer = ctypes.cast(size, ctypes.POINTER(ctypes.c_ulong))
+                if data is None:
+                    size_pointer.contents.value = len(raw)
+                else:
+                    ctypes.memmove(data, raw, len(raw))
+                    size_pointer.contents.value = len(raw)
+                return 0
+
+        api = RegistryApi()
+        self.assertEqual(
+            expected,
+            _ProductionWindowsApi.query_python_class(api, 103),  # type: ignore[arg-type]
+        )
+        self.assertEqual([None, None], api.names)
 
     def test_production_surfaces_are_immutable_and_test_adapter_is_not_exported(
         self,
