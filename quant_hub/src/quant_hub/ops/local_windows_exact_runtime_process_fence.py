@@ -245,6 +245,29 @@ class ProductionWindowsExactRuntimeProcessFence:
         process = _handle(raw_process, label=f"python process {pid}")
         primary: BaseException | None = None
         try:
+            # The machine-wide snapshot intentionally sees unrelated Python
+            # processes.  Read their raw image first and discard non-project
+            # executables before calling the exact-D observer, whose path
+            # contract correctly rejects every path outside the production
+            # root.
+            capacity = 32768
+            image = ctypes.create_unicode_buffer(capacity)
+            length = wintypes.DWORD(capacity)
+            ctypes.set_last_error(0)
+            if not api.scm.query_full_process_image_name_w(
+                process, 0, image, ctypes.byref(length)
+            ):
+                raise WindowsExactRuntimeProcessFenceError(
+                    "QueryFullProcessImageNameW failed while filtering Python "
+                    f"process: winerror={ctypes.get_last_error()}"
+                )
+            raw_executable = image.value[: int(length.value)]
+            if raw_executable.startswith("\\\\?\\UNC\\"):
+                raw_executable = "\\\\" + raw_executable[8:]
+            elif raw_executable.startswith("\\\\?\\"):
+                raw_executable = raw_executable[4:]
+            if PureWindowsPath(raw_executable) != _CHILD_EXECUTABLE:
+                return
             probe = api.scm.query_process(process, pid)
             executable = PureWindowsPath(probe.executable_final_path)
             if executable != _CHILD_EXECUTABLE:
