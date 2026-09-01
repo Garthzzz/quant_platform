@@ -11,6 +11,7 @@ from ctypes import wintypes
 from pathlib import Path
 from pathlib import PureWindowsPath
 import re
+import secrets
 import socket
 import stat
 import threading
@@ -340,6 +341,47 @@ def _regular_file(path: Path) -> Path:
 
 
 def _secret(path: Path) -> str:
+    if not os.path.lexists(path):
+        parent = path.parent.absolute()
+        try:
+            parent_info = parent.lstat()
+            resolved_parent = parent.resolve(strict=True)
+            resolved_info = resolved_parent.lstat()
+        except OSError as error:
+            raise ExactRuntimeServerError(
+                "session secret parent is unavailable"
+            ) from error
+        same_parent = (
+            PureWindowsPath(str(resolved_parent)) == PureWindowsPath(str(parent))
+            if os.name == "nt"
+            else resolved_parent == parent
+        )
+        if (
+            not same_parent
+            or stat.S_ISLNK(parent_info.st_mode)
+            or bool(getattr(parent_info, "st_file_attributes", 0) & 0x400)
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_dev != resolved_info.st_dev
+            or parent_info.st_ino != resolved_info.st_ino
+        ):
+            raise ExactRuntimeServerError("session secret parent is unsafe")
+        value = secrets.token_hex(32)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(
+                descriptor, "w", encoding="ascii", newline="\n"
+            ) as stream:
+                stream.write(value + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as error:
+            raise ExactRuntimeServerError(
+                "session secret could not be created exclusively"
+            ) from error
     try:
         value = _regular_file(path).read_text(encoding="ascii").strip()
     except (OSError, UnicodeError) as error:

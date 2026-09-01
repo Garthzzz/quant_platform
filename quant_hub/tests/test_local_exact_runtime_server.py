@@ -981,6 +981,15 @@ finally:
             ):
                 checkpoint.checkpoint()
 
+    def test_session_secret_is_exclusively_created_once(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qrh-runtime-secret-create-") as directory:
+            path = Path(directory).resolve(strict=True) / "viewer_secret.key"
+            first = subject._secret(path)
+            second = subject._secret(path)
+            self.assertEqual(first, second)
+            self.assertRegex(first, r"^[0-9a-f]{64}$")
+            self.assertEqual(first + "\n", path.read_text(encoding="ascii"))
+
     @unittest.skipUnless(os.name == "nt", "mutable state guard is a Win32 contract")
     def test_mutable_state_guard_allows_write_but_blocks_replacement(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qrh-runtime-db-guard-") as directory:
