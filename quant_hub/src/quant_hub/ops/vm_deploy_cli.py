@@ -1700,6 +1700,16 @@ class WindowsServiceRuntime:
                 "live authorization differs from the exact SCM start identity"
             )
         self._service("stop", allow_failure=True)
+        # SERVICE_STOPPED is the hand-off boundary: the service host reports it
+        # only after closing its fixed-D write owner and log handle.  Do not ask
+        # SCM to start the replacement while the retiring host is STOP_PENDING.
+        stop_deadline = time.monotonic() + 30
+        while time.monotonic() < stop_deadline:
+            if self._query_service_state() == "STOPPED":
+                break
+            time.sleep(0.25)
+        else:
+            return False
         if not self._service(
             "start", exact_start_arguments=identity.service_start_arguments
         ):

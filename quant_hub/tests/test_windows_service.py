@@ -291,6 +291,15 @@ class WindowsServiceTopologyTests(unittest.TestCase):
         self.assertIn("self.stop_event", constructor)
         self.assertIn("self._tracked_service_state", interrogate)
         self.assertNotIn("super().SvcInterrogate", interrogate)
+        self.assertLess(
+            svc_run.index("self._host_environment.close()"),
+            svc_run.index("win32service.SERVICE_STOPPED"),
+        )
+        close_failure = svc_run[
+            svc_run.index("self._host_environment.close()") :
+            svc_run.index("win32service.SERVICE_STOPPED")
+        ]
+        self.assertIn("_terminate_service_host_owner_crash()", close_failure)
 
     def test_ordinary_production_start_cannot_reach_legacy_popen_path(self) -> None:
         source = (

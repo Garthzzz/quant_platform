@@ -1642,19 +1642,25 @@ try:  # Windows-only service host; imports stay optional for non-Windows CI.
                     self._host_environment.append_status(
                         f"host_failure_{type(error).__name__.casefold()}",
                     )
-            finally:
-                if not owner_crash and not self._status_outcome_unknown:
-                    try:
-                        self._report_tracked_status(win32service.SERVICE_STOPPED)
-                    except WindowsServiceStatusOwnerCrashRequired:
-                        _terminate_service_host_owner_crash()
             try:
                 if return_code:
                     self._host_environment.append_status(
                         f"child_exit_{return_code}"
                     )
-            finally:
                 self._host_environment.close()
+            except BaseException:
+                # SCM must not observe STOPPED while this process can still
+                # own no-share-delete D-root descendants or the service log.
+                # A finalization failure therefore retires the whole host;
+                # process exit is the only authoritative handle cleanup.
+                _terminate_service_host_owner_crash()
+            if not owner_crash and not self._status_outcome_unknown:
+                try:
+                    # This is deliberately the last successful action: a
+                    # subsequent SCM start cannot overlap the retired D owner.
+                    self._report_tracked_status(win32service.SERVICE_STOPPED)
+                except WindowsServiceStatusOwnerCrashRequired:
+                    _terminate_service_host_owner_crash()
 
         def SvcInterrogate(self):
             try:
