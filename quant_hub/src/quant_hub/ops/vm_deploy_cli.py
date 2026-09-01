@@ -1700,9 +1700,25 @@ class WindowsServiceRuntime:
                 "live authorization differs from the exact SCM start identity"
             )
         self._service("stop", allow_failure=True)
-        return self._service(
+        if not self._service(
             "start", exact_start_arguments=identity.service_start_arguments
-        )
+        ):
+            return False
+        # ``sc start`` only acknowledges that SCM accepted the request; the
+        # service can still be START_PENDING.  The observer's first sealed
+        # snapshot requires SERVICE_RUNNING, so do not expose a successful
+        # transient start authorization until SCM reaches that exact state.
+        # This remains a read-only SCM wait: no endpoint request or journal
+        # transition occurs before the controller performs live observation.
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            state = self._query_service_state()
+            if state == "RUNNING":
+                return True
+            if state == "STOPPED":
+                return False
+            time.sleep(0.25)
+        return False
 
     def _query_service_state(self) -> str | None:
         """Return the exact SCM state without using the HTTP child as authority."""

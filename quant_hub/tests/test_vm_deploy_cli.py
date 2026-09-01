@@ -637,11 +637,20 @@ class VMDeployCLITests(unittest.TestCase):
                     "_service",
                     autospec=True,
                     side_effect=service,
-                ):
+                ), mock.patch.object(
+                    WindowsServiceRuntime,
+                    "_query_service_state",
+                    autospec=True,
+                    side_effect=["START_PENDING", "RUNNING"],
+                ) as query_state, mock.patch(
+                    "quant_hub.ops.vm_deploy_cli.time.sleep"
+                ) as sleep:
                     self.assertTrue(runtime.start_exact_transient(authorization))
                 self.assertEqual("stop", calls[0][0])
                 self.assertEqual("start", calls[1][0])
                 self.assertIsNone(calls[1][1])
+                self.assertEqual(2, query_state.call_count)
+                sleep.assert_called_once_with(0.25)
                 exact_arguments = calls[1][2]
                 self.assertIsInstance(exact_arguments, tuple)
                 self.assertEqual("exact-runtime", exact_arguments[0])
