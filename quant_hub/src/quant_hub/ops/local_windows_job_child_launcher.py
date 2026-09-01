@@ -677,6 +677,20 @@ class _ProductionJobApi:
                     raise WindowsJobChildOwnerCrashRequired(
                         "nested-job probe TerminateJobObject failed"
                     )
+                waited = int(
+                    self.WaitForSingleObject(wintypes.HANDLE(process), 30_000)
+                )
+                exit_code = wintypes.DWORD()
+                if (
+                    waited != _WAIT_OBJECT_0
+                    or not self.GetExitCodeProcess(
+                        wintypes.HANDLE(process), ctypes.byref(exit_code)
+                    )
+                    or int(exit_code.value) == _STILL_ACTIVE
+                ):
+                    raise WindowsJobChildOwnerCrashRequired(
+                        "nested-job probe child termination not proven"
+                    )
             except BaseException as error:
                 if isinstance(error, WindowsJobChildOwnerCrashRequired):
                     cleanup_error = error
