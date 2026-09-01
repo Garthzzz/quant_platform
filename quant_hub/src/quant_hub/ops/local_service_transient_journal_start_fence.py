@@ -61,6 +61,8 @@ _LAUNCH_BIND_TOKEN = object()
 _GENERIC_READ = 0x80000000
 _FILE_LIST_DIRECTORY = 0x0001
 _FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
 _OPEN_EXISTING = 3
 _FILE_ATTRIBUTE_NORMAL = 0x00000080
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -478,7 +480,14 @@ class LockedServiceTransientJournalStartFence:
             int(information.attributes),
         )
 
-    def _open_pin(self, label: str, path: PureWindowsPath, *, directory: bool) -> None:
+    def _open_pin(
+        self,
+        label: str,
+        path: PureWindowsPath,
+        *,
+        directory: bool,
+        cooperative_controller_owner: bool = False,
+    ) -> None:
         if label in self._pins:
             raise ServiceTransientJournalStartFenceError(
                 "existing-only pin slot is already occupied"
@@ -487,11 +496,19 @@ class LockedServiceTransientJournalStartFence:
         flags = _FILE_FLAG_OPEN_REPARSE_POINT | (
             _FILE_FLAG_BACKUP_SEMANTICS if directory else _FILE_ATTRIBUTE_NORMAL
         )
+        share_mode = _FILE_SHARE_READ
+        if cooperative_controller_owner:
+            # The same authorized controller transaction deliberately keeps
+            # DELETE guards on its root/workspace directories and live write
+            # handles on isolated canary databases. The service fence observes
+            # those owners while its four checkpoints prove identities,
+            # namespaces, and bytes. Journal/evidence stays read-share-only.
+            share_mode |= _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
         handle = _handle(
             self._api.CreateFileW(
                 str(path),
                 access,
-                _FILE_SHARE_READ,
+                share_mode,
                 None,
                 _OPEN_EXISTING,
                 flags,
@@ -614,8 +631,19 @@ class LockedServiceTransientJournalStartFence:
             )
         return validated
 
-    def _pin_directory(self, label: str, path: PureWindowsPath) -> tuple[tuple[str, int], ...]:
-        self._open_pin(label, path, directory=True)
+    def _pin_directory(
+        self,
+        label: str,
+        path: PureWindowsPath,
+        *,
+        cooperative_controller_owner: bool = False,
+    ) -> tuple[tuple[str, int], ...]:
+        self._open_pin(
+            label,
+            path,
+            directory=True,
+            cooperative_controller_owner=cooperative_controller_owner,
+        )
         first = self._enumerate(path)
         second = self._enumerate(path)
         if first != second:
@@ -625,8 +653,19 @@ class LockedServiceTransientJournalStartFence:
         self._directory_snapshots[label] = first
         return first
 
-    def _pin_file(self, label: str, path: PureWindowsPath) -> bytes:
-        self._open_pin(label, path, directory=False)
+    def _pin_file(
+        self,
+        label: str,
+        path: PureWindowsPath,
+        *,
+        cooperative_controller_owner: bool = False,
+    ) -> bytes:
+        self._open_pin(
+            label,
+            path,
+            directory=False,
+            cooperative_controller_owner=cooperative_controller_owner,
+        )
         pin = self._pins[label]
         raw = self._read_handle(pin.handle)
         if hashlib.sha256(raw).hexdigest() != pin.raw_sha256:
@@ -637,15 +676,19 @@ class LockedServiceTransientJournalStartFence:
 
     def _pin_initial_state(self) -> None:
         identity = self._identity
-        for label, path in (
-            ("root", _PRODUCTION_ROOT),
-            ("control", _PRODUCTION_ROOT / "control"),
-            ("audit", _PRODUCTION_ROOT / "audit"),
-            ("tmp", _PRODUCTION_ROOT / "tmp"),
-            ("journal_directory", _JOURNAL_DIRECTORY),
-            ("workspace_parent", _WORKSPACE_PARENT),
+        for label, path, cooperative in (
+            ("root", _PRODUCTION_ROOT, True),
+            ("control", _PRODUCTION_ROOT / "control", True),
+            ("audit", _PRODUCTION_ROOT / "audit", False),
+            ("tmp", _PRODUCTION_ROOT / "tmp", True),
+            ("journal_directory", _JOURNAL_DIRECTORY, False),
+            ("workspace_parent", _WORKSPACE_PARENT, True),
         ):
-            self._pin_directory(label, path)
+            self._pin_directory(
+                label,
+                path,
+                cooperative_controller_owner=cooperative,
+            )
 
         journal_entries = self._directory_snapshots["journal_directory"]
         grouped: dict[str, list[tuple[int, Mapping[str, object]]]] = {}
@@ -803,7 +846,9 @@ class LockedServiceTransientJournalStartFence:
 
         component = f"{identity.attempt_id}-{identity.nonce}"
         workspace = _WORKSPACE_PARENT / component
-        workspace_entries = self._pin_directory("workspace", workspace)
+        workspace_entries = self._pin_directory(
+            "workspace", workspace, cooperative_controller_owner=True
+        )
         if {name for name, _ in workspace_entries} != {
             "workspace_binding.json",
             "runtime-canary",
@@ -828,21 +873,27 @@ class LockedServiceTransientJournalStartFence:
                 "attempt workspace binding differs from durable identity"
             )
         canary = workspace / "runtime-canary"
-        canary_entries = self._pin_directory("runtime_canary", canary)
+        canary_entries = self._pin_directory(
+            "runtime_canary", canary, cooperative_controller_owner=True
+        )
         roles = {name for name, attributes in canary_entries if attributes & _FILE_ATTRIBUTE_DIRECTORY}
         if identity.role not in roles or len(roles) != len(canary_entries):
             raise ServiceTransientJournalStartFenceError(
                 "runtime-canary role namespace is not closed"
             )
         role_path = canary / identity.role
-        role_entries = self._pin_directory("runtime_canary_role", role_path)
+        role_entries = self._pin_directory(
+            "runtime_canary_role", role_path, cooperative_controller_owner=True
+        )
         if {name for name, _ in role_entries} != {"request.json", "state", "tmp"}:
             raise ServiceTransientJournalStartFenceError(
                 "current runtime-canary role is not in pre-result state"
             )
         self._pin_file("runtime_canary_request", role_path / "request.json")
         state_path = role_path / "state"
-        state_entries = self._pin_directory("runtime_canary_state", state_path)
+        state_entries = self._pin_directory(
+            "runtime_canary_state", state_path, cooperative_controller_owner=True
+        )
         if {name for name, _ in state_entries} != {
             "comments.sqlite3",
             "research_workspace.sqlite3",
@@ -851,9 +902,17 @@ class LockedServiceTransientJournalStartFence:
                 "runtime-canary state namespace is not closed"
             )
         for name, _attributes in state_entries:
-            self._pin_file(f"runtime_canary_state:{name}", state_path / name)
+            self._pin_file(
+                f"runtime_canary_state:{name}",
+                state_path / name,
+                cooperative_controller_owner=True,
+            )
         temporary_path = role_path / "tmp"
-        if self._pin_directory("runtime_canary_tmp", temporary_path):
+        if self._pin_directory(
+            "runtime_canary_tmp",
+            temporary_path,
+            cooperative_controller_owner=True,
+        ):
             raise ServiceTransientJournalStartFenceError(
                 "runtime-canary tmp must be empty before child launch"
             )

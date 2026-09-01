@@ -1639,8 +1639,13 @@ try:  # Windows-only service host; imports stay optional for non-Windows CI.
                 if owner_crash:
                     _terminate_service_host_owner_crash()
                 else:
+                    detail = re.sub(
+                        r"[^a-z0-9]+",
+                        "_",
+                        f"{type(error).__name__}_{error}".casefold(),
+                    ).strip("_")[:220]
                     self._host_environment.append_status(
-                        f"host_failure_{type(error).__name__.casefold()}",
+                        f"host_failure_{detail or 'unknown'}",
                     )
             try:
                 if return_code:
