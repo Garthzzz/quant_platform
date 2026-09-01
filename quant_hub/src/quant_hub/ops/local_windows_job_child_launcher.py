@@ -233,6 +233,8 @@ class _ProductionJobApi:
         "UpdateProcThreadAttribute",
         "DeleteProcThreadAttributeList",
         "CreateProcessW",
+        "AssignProcessToJobObject",
+        "TerminateProcess",
         "ResumeThread",
         "IsProcessInJob",
         "GetProcessTimes",
@@ -383,6 +385,15 @@ class _ProductionJobApi:
             ctypes.POINTER(_PROCESS_INFORMATION),
         )
         self.CreateProcessW.restype = wintypes.BOOL
+        self.AssignProcessToJobObject = kernel32.AssignProcessToJobObject
+        self.AssignProcessToJobObject.argtypes = (
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        )
+        self.AssignProcessToJobObject.restype = wintypes.BOOL
+        self.TerminateProcess = kernel32.TerminateProcess
+        self.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        self.TerminateProcess.restype = wintypes.BOOL
         self.ResumeThread = kernel32.ResumeThread
         self.ResumeThread.argtypes = (wintypes.HANDLE,)
         self.ResumeThread.restype = wintypes.DWORD
@@ -508,7 +519,12 @@ class _ProductionJobApi:
             ctypes.sizeof(ctypes.c_void_p) * 8,
         )
         self._host_in_outer_job = bool(in_outer_job.value)
-        self._probe_nested_job_compatibility()
+        # An SCM host may itself be inside a host-managed Job whose policy
+        # rejects PROC_THREAD_ATTRIBUTE_JOB_LIST at CreateProcess time. The
+        # fallback still creates the child suspended, assigns it to the exact
+        # KILL_ON_JOB_CLOSE Job, verifies membership, and only then resumes.
+        if not self._host_in_outer_job:
+            self._probe_nested_job_compatibility()
 
     def _probe_nested_job_compatibility(self) -> None:
         """Prove JOB_LIST creation works from the service host's actual outer Job."""
@@ -1793,8 +1809,9 @@ class ProductionWindowsJobChildLauncher:
 
         size = ctypes.c_size_t()
         ctypes.set_last_error(0)
+        attribute_count = 1 if api._host_in_outer_job else 2
         sizing_result = api.InitializeProcThreadAttributeList(
-            None, 2, 0, ctypes.byref(size)
+            None, attribute_count, 0, ctypes.byref(size)
         )
         if (
             sizing_result
@@ -1806,20 +1823,23 @@ class ProductionWindowsJobChildLauncher:
         object.__setattr__(lifecycle, "_attribute_buffer", attribute_buffer)
         attribute_pointer = ctypes.cast(attribute_buffer, wintypes.LPVOID)
         if not api.InitializeProcThreadAttributeList(
-            attribute_pointer, 2, 0, ctypes.byref(size)
+            attribute_pointer, attribute_count, 0, ctypes.byref(size)
         ):
             raise WindowsJobChildLauncherError("attribute-list 初始化失败")
         object.__setattr__(lifecycle, "_attribute_initialized", True)
         job_list = (wintypes.HANDLE * 1)(job)
         handle_list = (wintypes.HANDLE * 2)(read_handle, log_handle)
-        if not api.UpdateProcThreadAttribute(
-            attribute_pointer,
-            0,
-            _PROC_THREAD_ATTRIBUTE_JOB_LIST,
-            ctypes.cast(job_list, wintypes.LPVOID),
-            ctypes.sizeof(job_list),
-            None,
-            None,
+        if (
+            not api._host_in_outer_job
+            and not api.UpdateProcThreadAttribute(
+                attribute_pointer,
+                0,
+                _PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                ctypes.cast(job_list, wintypes.LPVOID),
+                ctypes.sizeof(job_list),
+                None,
+                None,
+            )
         ) or not api.UpdateProcThreadAttribute(
             attribute_pointer,
             0,
@@ -1881,6 +1901,35 @@ class ProductionWindowsJobChildLauncher:
             raise WindowsJobChildLauncherError("CreateProcessW 失败")
         process_handle = lifecycle._handles["process"]  # noqa: SLF001
         thread_handle = lifecycle._handles["thread"]  # noqa: SLF001
+        if api._host_in_outer_job:
+            ctypes.set_last_error(0)
+            if not api.AssignProcessToJobObject(
+                wintypes.HANDLE(job), wintypes.HANDLE(process_handle)
+            ):
+                assignment_error = ctypes.get_last_error()
+                try:
+                    terminated = bool(
+                        api.TerminateProcess(wintypes.HANDLE(process_handle), 97)
+                    )
+                    waited = int(
+                        api.WaitForSingleObject(
+                            wintypes.HANDLE(process_handle), 30_000
+                        )
+                    )
+                except BaseException as error:
+                    lifecycle._retire_numeric_authority()  # noqa: SLF001
+                    raise WindowsJobChildOwnerCrashRequired(
+                        "unassigned suspended child termination outcome is unknown"
+                    ) from error
+                if not terminated or waited != _WAIT_OBJECT_0:
+                    lifecycle._retire_numeric_authority()  # noqa: SLF001
+                    raise WindowsJobChildOwnerCrashRequired(
+                        "unassigned suspended child could not be retired"
+                    )
+                raise WindowsJobChildLauncherError(
+                    "outer-Job suspended child assignment failed: "
+                    f"winerror={assignment_error}"
+                )
         in_job = wintypes.BOOL()
         if not api.IsProcessInJob(
             wintypes.HANDLE(process_handle),
@@ -1888,7 +1937,7 @@ class ProductionWindowsJobChildLauncher:
             ctypes.byref(in_job),
         ) or not bool(in_job.value):
             raise WindowsJobChildLauncherError(
-                "child 未在 creation-time private Job 中"
+                "child is not in the exact private Job before resume"
             )
         # GetCurrentProcess 返回的是约定值 -1，而不是可按普通 HANDLE 规则
         # 校验/关闭的真实内核句柄；它只用于本进程 GetProcessTimes 调用。

@@ -88,10 +88,22 @@ class WindowsJobChildLauncherTests(unittest.TestCase):
         self.assertIn("IsProcessInJob", attributes)
         self.assertIn("ResumeThread", attributes)
         self.assertNotIn("Popen", attributes)
-        self.assertNotIn("AssignProcessToJobObject", attributes)
+        self.assertIn("AssignProcessToJobObject", attributes)
+        self.assertIn("TerminateProcess", attributes)
         self.assertIn("_PROC_THREAD_ATTRIBUTE_JOB_LIST", source)
         self.assertIn("_PROC_THREAD_ATTRIBUTE_HANDLE_LIST", source)
         self.assertIn("_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", source)
+        launch_source = inspect.getsource(
+            ProductionWindowsJobChildLauncher._launch
+        )
+        self.assertLess(
+            launch_source.index("api.CreateProcessW"),
+            launch_source.index("api.AssignProcessToJobObject"),
+        )
+        self.assertLess(
+            launch_source.index("api.AssignProcessToJobObject"),
+            launch_source.index("api.ResumeThread"),
+        )
 
     def test_exact_capabilities_reject_subclass_pickle_and_mapping(self) -> None:
         for exact in (LockedServiceChildLaunchLifecycle, LockedServiceChildLifetime):
